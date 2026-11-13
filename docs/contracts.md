@@ -1,4 +1,4 @@
-# Habit Tally: contracts (v1.1)
+# Habit Tally: contracts (v1.2)
 
 The interfaces where two packages meet. Owned by the lead; a developer who needs a change asks the lead. Read
 `docs/architecture.md` first. Anything not fixed here is the owning package's choice.
@@ -38,9 +38,9 @@ with dynamic `import()` only when `BACKEND !== 'demo'`.
 
 Pure functions, no DOM, no Firebase, runs unchanged in the browser and in Node. Both stores, every screen and the
 job must use these instead of re-implementing them: `LIMITS`, `keyOf`, `addDays`, `weekStart`, `weekKeys`,
-`countOn`, `periodCount`, `isHit`, `streak`, `stats`, `summary`, `recentDays`, `calendarWeeks`, `cleanHabit`,
+`countOn`, `startDay`, `periodCount`, `isHit`, `streak`, `stats`, `summary`, `recentDays`, `calendarWeeks`, `cleanHabit`,
 `validateHabit`, `sortHabits`, `snapTime`, `cleanTimes`, `everyHours`, `localParts`, `planRun`, `dueTimes`,
-`dueHabits`, `reminderText`. Their behaviour is defined by the doc comments and `test/logic.test.mjs`.
+`dueWindows`, `dueHabits`, `reminderText`. Their behaviour is defined by the doc comments and `test/logic.test.mjs`.
 
 `LIMITS = { nameMax: 60, unitMax: 20, targetMin: 1, targetMax: 50, timesMax: 48, habitsMax: 50, backDays: 7 }`.
 "Last 7 days" (R6) means today plus the 7 days before it: `recentDays(today)`.
@@ -54,7 +54,8 @@ Habit   { id: string,               // set by the store: 20 chars of [A-Za-z0-9]
           target: integer,          // 1..50
           unit: string,             // 0..20 chars
           times: string[],          // 'HH:MM' on :00 or :30, unique, sorted, at most 48
-          created: 'YYYY-MM-DD',    // set by the store to the device's today; moves back on back-fill
+          created: 'YYYY-MM-DD',    // set by the store to the device's today on create; never changed.
+                                    // The first day that counts is derived: startDay(habit, logs)
           archived: boolean,        // always false in v1 (no UI), kept for later
           deletedAt: null | number, // ms since epoch when soft-deleted
           order: number,            // set by the store on create: highest existing order + 1
@@ -98,15 +99,15 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
 |---|---|
 | `getState(): State` | Current state |
 | `subscribe(fn): () => void` | Calls `fn(state)` at once and after every change; returns an unsubscribe function |
-| `signUp(email, password): Promise<void>` | Creates the account and signs in. On first sign-in the store creates the user record with the device's zone |
-| `signIn(email, password): Promise<void>` | |
+| `signUp(email, password): Promise<void>` | Creates the account and signs in. Resolves once the status is `ready` or `waiting` |
+| `signIn(email, password): Promise<void>` | Resolves once the status is `ready` or `waiting` |
 | `resetPassword(email): Promise<void>` | Always resolves for a well-formed email (no account enumeration) |
 | `signOut(): Promise<void>` | Status becomes `signedOut`; habits and logs are cleared from state |
 | `retry(): void` | In `waiting`: checks again whether the account is now allowed |
 | `saveHabit(input): string` | `input` is editor data, with `id` to edit or without to create. The store runs `cleanHabit` and `validateHabit`; on problems it throws `StoreError('invalid', problems[0], problems)`. On create it sets `id`, `created` (device today), `order`, `archived: false`, `deletedAt: null`. Editing never changes `id`, `created`, `order`. Creating beyond `LIMITS.habitsMax` live habits throws `StoreError('too-many', ...)`. Returns the id |
 | `deleteHabit(id): void` | Soft delete: sets `deletedAt`. The habit leaves `state.habits`; its counts stay in `logs` |
 | `restoreHabit(id): void` | Clears `deletedAt` (Undo) |
-| `addCount(dayKey, habitId, delta): void` | `delta` is `+1` or `-1`. Ignored when `delta` is `-1` and `countOn` is 0, when `dayKey` is in the future, or older than `LIMITS.backDays` days before today. If `dayKey` is before the habit's `created`, `created` is moved back to `dayKey` |
+| `addCount(dayKey, habitId, delta): void` | `delta` is `+1` or `-1`. Ignored when `delta` is `-1` and `countOn` is 0, when `dayKey` is in the future, or older than `LIMITS.backDays` days before today. Never changes the habit itself: a count on a day before `created` is picked up by `startDay()` |
 | `setTimeZone(tz): void` | Changes `user.tz` (only called after the person says yes) |
 | `saveDevice(fid): Promise<void>` | Writes `devices/{fid}` for the signed-in user. Demo: resolves, does nothing |
 | `removeDevice(fid): Promise<void>` | Deletes `devices/{fid}`. Demo: resolves, does nothing |
@@ -117,6 +118,9 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
 - Counts are written with `increment(delta)` through `setDoc(..., { merge: true })` with nested objects
   (`{ days: { [dayKey]: { [habitId]: increment(delta) } } }`), never with dotted field paths.
 - "Today" is always the device's local day: `keyOf(now())`.
+- The user record: whenever an allowed account has no `users/{uid}` record (first sign-in, or the first time it
+  is let in after being invited, including after `retry()`), the store creates it with the device's zone before
+  the status becomes `ready`. Sign-up alone cannot create it, because a new account is not invited yet.
 - The object passed to listeners is the same object `getState()` returns at that moment.
 - While the status is not `ready`: `saveHabit` throws `StoreError('not-ready', ...)`; `deleteHabit`,
   `restoreHabit`, `addCount` and `setTimeZone` do nothing.
@@ -148,14 +152,18 @@ The message is a plain sentence the UI can show as is.
 ## 6. Push (`src/push.js`) and the Settings screen
 
 ```
-createPush({ store, swRegistration }): Push        // swRegistration: () => Promise<ServiceWorkerRegistration>
+createPush({ store, swRegistration }): Push        // swRegistration: () => Promise<ServiceWorkerRegistration | null>
 push.getStatus(): 'demo' | 'unsupported' | 'off' | 'blocked' | 'on'
 push.subscribe(fn): () => void                     // fn(status) at once and on change
-push.enable(): Promise<status>     // call only from a tap handler: asks permission, registers, saves the device
-push.disable(): Promise<void>      // removes the device record (waits at most 3 s), then unregisters from FCM
-push.resume(): Promise<void>       // call when the store becomes 'ready': if this browser had reminders on and
-                                   // permission is still granted, register again so the device record points at
-                                   // the account that is signed in now
+push.enable(): Promise<status>     // call only from a tap handler: asks permission, registers, saves the device.
+                                   // Never rejects: resolves with the status it ended in
+push.disable(): Promise<void>      // the person turns reminders off: forgets the choice, removes the device
+                                   // record, unregisters from FCM
+push.detach(): Promise<void>       // for sign-out: keeps the choice, sets the signed-out flag (below), removes the
+                                   // device record and unregisters. Waits at most 3 s and never rejects
+push.resume(): Promise<void>       // call when the store becomes 'ready': clears the signed-out flag; if this
+                                   // browser has reminders on and permission is still granted, registers again
+                                   // so the device record points at the account that is signed in now
 ```
 
 - `demo`: `BACKEND` is not `'firebase'`. `unsupported`: no service worker, Notification or PushManager, or
@@ -163,9 +171,15 @@ push.resume(): Promise<void>       // call when the store becomes 'ready': if th
 - Registration uses only `register(messaging, { vapidKey, serviceWorkerRegistration })`, `onRegistered`,
   `onUnregistered`, `unregister` from `firebase/messaging`. `getToken` and `deleteToken` are deprecated and must
   not be used. `vapidKey` comes from `src/firebase-config.js` (`vapidKey`; when empty, the option is left out).
-- The person's choice is remembered per browser in `localStorage['habit-tally:push']` (`'on'` or absent).
+- Remembered per browser in `localStorage`: `habit-tally:push` (`'on'` or absent, the person's choice) and
+  `habit-tally:push-fid` (the installation ID last saved, so a changed ID can replace the old record).
+- **Signed-out flag.** Unregistering needs the network, so an offline sign-out could leave the previous person's
+  reminders arriving. `detach()` therefore first stores a flag the service worker can read: a `Response('1')` in
+  the Cache Storage cache `habit-tally-flags` under the request URL `/__flags/signed-out`. `resume()` deletes it.
+  While the flag exists the service worker shows only the generic notification text (section 7). In demo mode
+  both are no-ops.
 - **Sign-out sequence** (in `src/main.js`, one function used by every sign-out button):
-  `await push.disable()` then `await store.signOut()`.
+  `await push.detach()` then `await store.signOut()`.
 
 ## 7. Push message and service worker (`public/sw.js`)
 
@@ -189,13 +203,15 @@ showNotification(title, { body, tag, renotify: true, icon: '/icons/icon-192.png'
                           data: { url } })
 ```
 
-If the payload is missing or unreadable: title `Habit Tally`, body `Time to check your habits.`, tag `habit-tally`,
-url `/`. `notificationclick` closes the notification, focuses an open app window if there is one, otherwise opens
+If the payload is missing or unreadable, or the signed-out flag of section 6 is set: title `Habit Tally`, body
+`Time to check your habits.`, tag `habit-tally`, url `/`. `notificationclick` closes the notification, focuses an open app window if there is one, otherwise opens
 `url`. The service worker contains no Firebase code.
 
-Precache: `vite.config.js` rewrites two tokens in the built `sw.js`: `'__SW_VERSION__'` becomes a hash of the
-build and `'__SW_PRECACHE__'` becomes a JSON array string of every built file path. In dev the tokens stay as
-they are, and the worker must then precache nothing. Icons live in `public/icons/`: `icon-192.png`,
+Precache: the build puts one line at the top of the built `sw.js`:
+`self.__BUILD = { version: '<hash of the build>', files: ['/', '/assets/...', ...] };` (every built file except
+`sw.js` itself). In dev there is no such line: the worker must treat a missing `self.__BUILD` as "precache
+nothing". A demo build leaves Firebase chunks out of `files`. Service worker checks are run on the demo build
+(or with `?demo`), since the real build needs a sign-in. Icons live in `public/icons/`: `icon-192.png`,
 `icon-512.png`, `maskable-512.png`, `badge-96.png`.
 
 ## 8. Security rules and the invite list (`firestore.rules`)
@@ -212,6 +228,8 @@ they are, and the worker must then precache nothing. Icons live in `public/icons
 - `devices/{fid}`: create and update only when `allowed()`, the new data is exactly `{ uid, ua, updatedAt }` and
   `uid == request.auth.uid`; get and delete only when the stored `uid == request.auth.uid` (so a get or delete of a missing or taken-over
   record is refused, and the store treats that as done); no list.
+- Size limits so one account cannot bloat what others' reminders depend on: `days` has at most 31 keys; a
+  device id is 1 to 64 characters of `[A-Za-z0-9_-]`; `ua` at most 500 characters; `tz` 1 to 64.
 - Everything else is denied, including collection-group queries and `system/**`.
 
 ## 9. Reminder job (`scripts/send-reminders.mjs`, `scripts/lib/google.mjs`)
@@ -220,16 +238,25 @@ they are, and the worker must then precache nothing. Icons live in `public/icons
   emulator: `FIRESTORE_EMULATOR_HOST` (then Firestore calls go to `http://<host>/v1/...` with
   `Authorization: Bearer owner` and no token is requested for Firestore), `FCM_BASE_URL` (stand-in push
   service), `GCLOUD_PROJECT` (default: the key's `project_id`).
-- `send-reminders.mjs` exports `run({ google, now, log }): Promise<{ slot, sent, skipped, failed, removed }>`
+- `send-reminders.mjs` exports `run({ google, now, log, force }): Promise<{ slot, sent, skipped, failed, removed }>`
   for tests, and when executed directly builds `google` from the environment, calls `run`, prints a short
-  summary (never a key, token, email or habit name) and exits 0, or 1 if anything failed or the key is missing
-  or malformed.
-- The run follows architecture section 4 exactly: read `system/reminders`; `planRun`; claim with a precondition
-  (`currentDocument.updateTime`, or `currentDocument.exists=false` on the first run); list users; per user
-  `dueTimes` then habits, logs, `dueHabits`, devices, `reminderText`, send.
-- A user record without a valid `tz` is treated as `UTC`.
-- Exit codes: a lost claim (another run has the slot) is success. FCM 404 UNREGISTERED: delete that device
-  record, count it as `removed`, not as a failure.
+  summary and exits 0, or 1 if anything failed or the key is missing or malformed.
+- Order of a run (architecture section 4): read `system/reminders`; `planRun`; **read everything first**: list
+  users; per user `dueWindows(from, slot, tz)`, then habits, logs, and for each window entry
+  `dueHabits(habits, logs, entry.day, entry.times)`; a habit due in more than one entry is sent once, with the
+  text of the latest day; then devices. Only then **claim** the slot with a precondition
+  (`ifUpdateTime`, or `ifMissing` on the first run), and send. The claim is written even when there is nothing
+  to send. A failed read before the claim fails the run without claiming, so the next run retries the slot.
+- Only a `PreconditionError` means "another run has the slot" (success, nothing sent). Any other error on the
+  claim, including a timeout, fails the run without sending.
+- `force: true` (environment `REMINDERS_FORCE=1`, set by the workflow's manual-run checkbox): ignore the
+  bookmark, use the window of the current slot only, send without claiming and without changing the bookmark.
+  For testing on a real phone.
+- A user record without a valid `tz` is treated as `UTC`. Per user the job considers at most 100 habits and the
+  10 most recently updated devices.
+- FCM 404 UNREGISTERED: delete that device record, count it as `removed`, not as a failure.
+- The Actions log of a public repository is public. The job never prints a key, token, email, uid, device or
+  installation ID, habit name, or any response body: only counts, the slot time, HTTP statuses and error codes.
 
 ## 10. UI rules every screen follows
 
@@ -237,3 +264,13 @@ they are, and the worker must then precache nothing. Icons live in `public/icons
 - System font stack; no request to any other origin; colours as CSS custom properties with light and dark values.
 - Touch targets at least 44 px; no sideways scrolling at 360 px wide.
 - Screens never talk to Firebase; they use the store and push interfaces only.
+
+## 11. Time-zone prompt
+
+Owned by the Settings package (A5), shown by the app shell above any screen. When the status is `ready` and the
+device zone (`Intl.DateTimeFormat().resolvedOptions().timeZone`) differs from `state.user.tz`, a notice asks
+"Your reminders use <old zone> time. Switch to <device zone>?" with Switch and Keep. Switch calls
+`store.setTimeZone(deviceZone)`. Keep stores the declined zone in `localStorage['habit-tally:tz-declined']`, and
+the notice stays away until the device reports yet another zone. Settings always shows the reminder zone with a
+button to switch to the device's zone. The shell asks `src/ui/settings.js` for the notice through an exported
+`notice(state, ctx): string` (empty string = nothing to show).

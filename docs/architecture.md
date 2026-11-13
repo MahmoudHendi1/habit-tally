@@ -60,8 +60,11 @@ Rules of the model:
   "Use Africa/Cairo for reminders?" and changes it only on a yes. Nothing else stores a zone.
 - Deleting a habit sets `deletedAt` (soft delete, with Undo in the app); counts stay in the logs. Rules require the
   full habit shape on every write, so a stale partial write cannot create a ghost habit.
-- Logging on a day before `created` moves `created` back to that day, so streaks and totals agree.
-- A device document belongs to whoever signed in last on that browser. Sign-out deletes it and unregisters from FCM.
+- A habit's first day is derived: its `created` date, or the earliest back-filled day with a count. Nothing is
+  rewritten when a past day is logged, so undoing a mistaken tap leaves no trace.
+- A device document belongs to whoever signed in last on that browser. Sign-out deletes it and unregisters from
+  FCM; if that cannot finish (offline), a local flag makes the service worker show only a generic reminder text
+  until someone signs in again.
 - No composite indexes. The job's `devices where uid == X` query uses the automatic single-field index.
 
 ## 4. Reminder flow
@@ -74,27 +77,31 @@ Rules of the model:
    the previous slot, or one slot earlier if one or more runs were missed (catch-up is limited to one missed
    slot, so nothing older than 60 minutes is ever sent). If the document does not exist (first run), the window is
    the current slot only.
-4. It **claims** the slot: writes `lastSlot` with a precondition on the document's last update time (or "must not
-   exist" on the first run). If the precondition fails another run got there first, and it exits cleanly.
-5. It lists `users`. For each user, `dueTimes(from, slot, tz)` gives the local day and the half-hour times that
-   fall in the local window (previous slot, this slot]. Matching a window instead of an exact `HH:MM` makes zones
-   with 45-minute offsets work, sends times skipped by spring-forward at the next slot, and limits the autumn
-   change to one duplicate reminder a year.
-6. For users with any time in the window it lists their habits, keeps those with a matching time, reads the one or
+4. It reads what it needs **before** claiming, so a failed read does not cost the slot. It lists `users`. For each
+   user, `dueWindows(from, slot, tz)` gives, per local day, the half-hour times that fall in the local window
+   (previous slot, this slot]. Matching a window instead of an exact `HH:MM` makes zones with 45-minute offsets
+   work, sends times skipped by spring-forward at the next slot, and limits the autumn change to one duplicate
+   reminder a year. A catch-up window that crosses the user's midnight is judged day by day.
+5. For users with any time in the window it lists their habits, keeps those with a matching time, reads the one or
    two month logs that cover the current week, and applies `dueHabits` (drops archived and deleted habits, habits
-   whose target is hit, and weekly habits already logged today).
-7. For each remaining habit it sends one FCM data message per device of that user (`devices where uid == X`):
+   whose target is hit, and weekly habits already logged today). For users with a due habit it reads their
+   devices (`devices where uid == X`).
+6. It **claims** the slot: writes `lastSlot` with a precondition on the document's last update time (or "must not
+   exist" on the first run). If the precondition fails another run got there first, and it exits cleanly. Any
+   other error on the claim fails the run without sending.
+7. It sends one FCM data message per due habit per device:
    `data: { title, body, tag: habitId, url: "/" }`, web push headers `TTL: 1800`, `Urgency: high`.
    A send that fails with 429 or 5xx is retried once. A device FCM reports as 404 UNREGISTERED is deleted; nothing
    is deleted on any other error.
 8. One user's failure does not stop the others. If any send or read failed, the script finishes the rest and exits
-   non-zero, so the run shows red and GitHub emails the owner.
+   non-zero, so the run shows red and GitHub emails the owner. Its log never names a person, a device or a habit.
 9. On the phone, Chrome wakes the service worker, which always shows a notification (`tag: habitId`,
    `renotify: true`, so a later reminder for the same habit replaces the earlier one and buzzes again). Tapping it
    opens or focuses the app.
 
-Trade-off, stated plainly: because the slot is claimed before sending, a run that crashes midway drops that slot's
-remaining reminders instead of repeating them. The red run makes that visible.
+Trade-off, stated plainly: because the slot is claimed before sending, a run that crashes while sending drops that
+slot's remaining reminders instead of repeating them. The red run makes that visible. A manual run with the
+"force" box ticked sends the current slot again without touching the bookmark, for testing on a real phone.
 
 ## 5. Security and privacy
 
