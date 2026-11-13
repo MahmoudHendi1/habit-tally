@@ -167,11 +167,52 @@ test('firestore: getDoc (null on 404), listDocs with pagination, queryEqual and 
     from: [{ collectionId: 'devices' }],
     where: { fieldFilter: { field: { fieldPath: 'uid' }, op: 'EQUAL', value: { stringValue: 'u1' } } },
   } });
-  for (const bad of ['', 'users/', '/users/u1', 'users/u1/habits', 'users/../system', null]) {
+  for (const bad of ['', 'users/', '/users/u1', 'users/u1/habits', null, 'users/..', 'users/u1/../x', './u1', 'users/.']) {
     await assert.rejects(google.getDoc(bad), TypeError);
   }
-  await assert.rejects(google.listDocs('users/u1'), TypeError);
+  for (const bad of ['users/u1', '..', '.', 'users/u1/..', 'users/../habits', 'users//habits']) {
+    await assert.rejects(google.listDocs(bad), TypeError);
+  }
+  await assert.rejects(google.deleteDoc('devices/..'), TypeError);
+  await assert.rejects(google.setDoc('system/..', { lastSlot: 1 }), TypeError);
+  await assert.rejects(google.queryEqual('..', 'uid', 'u1'), TypeError);
   assert.equal(api().length, sent.length); // a malformed path never reaches the network
+});
+
+test('firestore: listDocs honours a limit and gives up on a list that never ends', async () => {
+  const page = (ids, nextPageToken) => [200, { documents: ids.map((id) => raw(`users/${id}`)), nextPageToken }];
+  const { google, api } = setup([page(['u1', 'u2'], 'more'), page(['u1', 'u2'], 'more'), page(['u3', 'u4'], 'more'),
+    page(['u1'], 'again'), page(['u2'], 'again')]);
+  assert.deepEqual((await google.listDocs('users', { limit: 2 })).map((d) => d.id), ['u1', 'u2']);
+  assert.deepEqual((await google.listDocs('users', { limit: 3 })).map((d) => d.id), ['u1', 'u2', 'u3']);
+  assert.deepEqual(api().map((c) => c.url.slice(ROOT.length)), // asks only for what is still wanted, then stops
+    ['/users?pageSize=2', '/users?pageSize=3', '/users?pageSize=1&pageToken=more']);
+  const repeated = await failing(() => google.listDocs('users'));
+  assert.ok(repeated instanceof GoogleError);
+  assert.deepEqual([repeated.code, api().length], ['BAD_RESPONSE', 5]);
+  for (const limit of [0, -1, 1.5, '2', NaN]) await assert.rejects(google.listDocs('users', { limit }), TypeError);
+  await assert.rejects(google.listDocs('users', null), TypeError);
+  assert.equal(api().length, 5);
+
+  const endless = setup(Array.from({ length: 250 }, (_, i) => page([`u${i}`], `token-${i}`)));
+  const tooLong = await failing(() => endless.google.listDocs('users'));
+  assert.deepEqual([tooLong.code, endless.api().length], ['BAD_RESPONSE', 200]); // 200 pages, then no more
+});
+
+test('firestore: a document without an update time is refused, so no claim can be built on it', async () => {
+  const noTime = { name: `${NAME}/system/reminders`, fields: {} };
+  const { google } = setup([[200, noTime], [200, { ...noTime, updateTime: '' }], [200, { documents: [noTime] }],
+    [200, [{ document: { ...noTime, updateTime: 5 }, readTime: T2 }]], [200, { writeResults: [{}], commitTime: T2 }],
+    [200, { writeResults: [{ updateTime: 5 }] }], [200, { fields: {}, updateTime: T1 }]]);
+  const calls = [() => google.getDoc('system/reminders'), () => google.getDoc('system/reminders'),
+    () => google.listDocs('system'), () => google.queryEqual('system', 'lastSlot', 1),
+    () => google.setDoc('system/reminders', { lastSlot: 1 }), () => google.setDoc('system/reminders', { lastSlot: 1 }),
+    () => google.getDoc('system/reminders')];
+  for (const fn of calls) {
+    const err = await failing(fn);
+    assert.ok(err instanceof GoogleError && !(err instanceof PreconditionError));
+    assert.equal(err.code, 'BAD_RESPONSE');
+  }
 });
 
 test('firestore: setDoc overwrites with the right precondition; a failed one is a PreconditionError', async () => {
@@ -180,7 +221,8 @@ test('firestore: setDoc overwrites with the right precondition; a failed one is 
   const { google, api, sleeps } = setup([done, done, done,
     refusal(400, 'FAILED_PRECONDITION', 'the stored version does not match the required base version'),
     refusal(409, 'ALREADY_EXISTS'), aborted, refusal(400, 'FAILED_PRECONDITION'), aborted, done,
-    aborted, aborted, aborted, refusal(404, 'NOT_FOUND'), refusal(403, 'PERMISSION_DENIED')]);
+    aborted, aborted, aborted, refusal(404, 'NOT_FOUND'), refusal(403, 'PERMISSION_DENIED'),
+    refusal(400, 'FAILED_PRECONDITION'), refusal(409, 'ALREADY_EXISTS'), refusal(404, 'NOT_FOUND'), done]);
   const data = { lastSlot: 1794562200000, updatedAt: 1794561960000 };
   const doc = { id: 'reminders', path: 'system/reminders', data, updateTime: T2 };
   assert.deepEqual(await google.setDoc('system/reminders', data, { ifUpdateTime: T1 }), doc);
@@ -215,9 +257,26 @@ test('firestore: setDoc overwrites with the right precondition; a failed one is 
     assert.ok(err instanceof GoogleError && !(err instanceof PreconditionError));
     assert.deepEqual([err.name, err.status], ['GoogleError', status]);
   }
-  await assert.rejects(google.setDoc('system/reminders', data, { ifUpdateTime: T1, ifMissing: true }), TypeError);
+  // A write without a condition cannot fail a condition, whatever the server answers.
+  for (const status of [400, 409, 404]) {
+    const err = await failing(() => google.setDoc('system/reminders', data));
+    assert.ok(err instanceof GoogleError && !(err instanceof PreconditionError));
+    assert.deepEqual([err.name, err.status], ['GoogleError', status]);
+  }
+  assert.equal(api().length, 17);
+
+  // A condition that is asked for but unusable is an error before any request, never an unconditional write.
+  const unusable = [{ ifUpdateTime: '' }, { ifUpdateTime: undefined }, { ifUpdateTime: null }, { ifUpdateTime: 1794562200000 },
+    { ifUpdateTime: 'yesterday' }, { ifUpdateTime: new Date(0) }, { ifUpdateTime: T1, ifMissing: true },
+    { ifUpdateTime: undefined, ifMissing: true }, { ifMissing: 1 }, { ifMissing: 'true' }, { ifMissing: null }, null, 'x'];
+  for (const options of unusable) {
+    await assert.rejects(google.setDoc('system/reminders', data, options), TypeError);
+  }
   await assert.rejects(google.setDoc('system/reminders', { lastSlot: undefined }), TypeError);
   await assert.rejects(google.setDoc('system', data), TypeError);
+  assert.equal(api().length, 17);
+  assert.deepEqual(await google.setDoc('system/reminders', data, { ifMissing: false }), doc); // false = no condition
+  assert.deepEqual(json(api()[17]), { writes: [{ update }] });
 });
 
 test('emulator: Firestore uses the emulator address and "Bearer owner", no token; the push address can be replaced', async () => {
@@ -235,10 +294,15 @@ test('emulator: Firestore uses the emulator address and "Bearer owner", no token
   assert.throws(() => createGoogle({ serviceAccount: KEY, firestoreEmulatorHost: 'http://127.0.0.1:8181' }), ConfigError);
 });
 
-test('sendPush: the body is exactly the contract message; 404 from FCM means unregistered', async () => {
+test('sendPush: the body is exactly the contract message; only 404 with FCM code UNREGISTERED is unregistered', async () => {
   const replies = [[200, { name: 'projects/demo-habit-tally/messages/1' }],
     refusal(404, 'NOT_FOUND', 'Requested entity was not found.', fcmError('UNREGISTERED')),
-    refusal(404, 'NOT_FOUND'), [404, '<html>Not Found</html>']];
+    refusal(404, 'NOT_FOUND', 'Method not found.'), // Google's generic 404: a wrong address or project
+    refusal(404, 'NOT_FOUND', 'x', [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', errorCode: 'UNREGISTERED' }]),
+    refusal(404, 'UNREGISTERED'), refusal(404, 'NOT_FOUND', 'x', fcmError('INVALID_ARGUMENT')),
+    [404, '<html>Not Found</html>'],
+    refusal(400, 'INVALID_ARGUMENT', 'x', fcmError('UNREGISTERED')), refusal(403, 'PERMISSION_DENIED', 'x', fcmError('UNREGISTERED')),
+    refusal(400, 'UNREGISTERED'), refusal(410, 'NOT_FOUND', 'x', fcmError('UNREGISTERED'))];
   const { google, api, sleeps } = setup(replies);
   assert.equal(await google.sendPush('fid-1', PUSH), 'sent');
   const [call] = api();
@@ -252,10 +316,15 @@ test('sendPush: the body is exactly the contract message; 404 from FCM means unr
     webpush: { headers: { TTL: '1800', Urgency: 'high' } },
   } });
   assert.equal(await google.sendPush('fid-2', PUSH), 'unregistered');
-  assert.equal(await google.sendPush('fid-3', PUSH), 'unregistered');
-  const bare = await failing(() => google.sendPush('fid-4', PUSH)); // a 404 that is not FCM's own (wrong address)
-  assert.deepEqual([bare.status, bare.code], [404, 'HTTP_404']);
-  assert.deepEqual([api().length, sleeps.length], [4, 0]);
+  // Every other 404, and UNREGISTERED at any other status, throws: the job must not delete a device for these.
+  const expected = [[404, 'NOT_FOUND'], [404, 'NOT_FOUND'], [404, 'UNREGISTERED'], [404, 'INVALID_ARGUMENT'],
+    [404, 'HTTP_404'], [400, 'UNREGISTERED'], [403, 'UNREGISTERED'], [400, 'UNREGISTERED'], [410, 'UNREGISTERED']];
+  for (const pair of expected) {
+    const err = await failing(() => google.sendPush('fid-3', PUSH));
+    assert.ok(err instanceof GoogleError);
+    assert.deepEqual([err.status, err.code], pair);
+  }
+  assert.deepEqual([api().length, sleeps.length], [11, 0]);
   await assert.rejects(google.sendPush('fid-5', { ...PUSH, tag: 5 }), TypeError);
   await assert.rejects(google.sendPush('', PUSH), TypeError);
 });
@@ -268,6 +337,7 @@ test('sendPush: one retry on 429 or 5xx; other failures throw with their status;
     refusal(400, 'INVALID_ARGUMENT', 'The registration token is not a valid FCM registration token',
       fcmError('INVALID_ARGUMENT')),
     refusal(403, 'PERMISSION_DENIED', 'refused', fcmError('SENDER_ID_MISMATCH')),
+    [429, { error: { code: 429, status: 'RESOURCE_EXHAUSTED' } }, { 'retry-after': '3600' }], [200, {}],
   ]);
   assert.equal(await google.sendPush('fid-1', PUSH), 'sent');
   assert.deepEqual([api().length, sleeps], [2, [1000]]);
@@ -283,6 +353,43 @@ test('sendPush: one retry on 429 or 5xx; other failures throw with their status;
   assert.deepEqual([invalid.status, invalid.code, api().length], [400, 'INVALID_ARGUMENT', 8]); // no retry
   const mismatch = await failing(() => google.sendPush('fid-1', PUSH));
   assert.deepEqual([mismatch.status, mismatch.code], [403, 'SENDER_ID_MISMATCH']);
+  assert.equal(await google.sendPush('fid-1', PUSH), 'sent');
+  assert.deepEqual(sleeps, [1000, 3000, 1000, 5000]); // an hour of Retry-After is cut to 5 s
+});
+
+test('timeout: a request that gets no answer ends as a GoogleError with status 0', { timeout: 10000 }, async (t) => {
+  const never = () => new Promise(() => {});
+  const emulator = { firestoreEmulatorHost: '127.0.0.1:8181', timeoutMs: 20 };
+  const stuckBody = async () => ({ status: 200, ok: true, headers: new Headers(), text: never });
+  let signal;
+  const polite = (url, init) => new Promise((_, reject) => { // a fetch that honours the abort signal, like the real one
+    signal = init.signal;
+    signal.addEventListener('abort', () => reject(signal.reason));
+  });
+  const tooSlow = new Promise((_, reject) => { setTimeout(() => reject(new Error('too slow')), 2000).unref(); });
+  const errors = await Promise.all([
+    () => setup([], { ...emulator, fetch: never }).google.getDoc('users/u1'),
+    () => setup([], { ...emulator, fetch: stuckBody }).google.listDocs('users'),
+    () => setup([], { ...emulator, fetch: polite }).google.deleteDoc('users/u1'),
+    () => setup([], { fetch: never, timeoutMs: 20 }).google.sendPush('fid-1', PUSH), // stuck in the token request
+  ].map((fn) => failing(() => Promise.race([fn(), tooSlow]))));
+  assert.ok(signal.aborted);
+  for (const err of errors) {
+    assert.ok(err instanceof GoogleError);
+    assert.deepEqual([err.status, err.code], [0, 'TIMEOUT']);
+  }
+  assert.equal(errors[3].message, 'token request failed: no answer in time');
+
+  t.mock.timers.enable({ apis: ['setTimeout'] }); // the default limit is 20 s
+  let settled = false;
+  const waiting = failing(() => setup([], { fetch: never }).google.getDoc('users/u1')).finally(() => { settled = true; });
+  const turn = () => new Promise((done) => { setImmediate(done); });
+  await turn();
+  t.mock.timers.tick(19999);
+  await turn();
+  assert.equal(settled, false);
+  t.mock.timers.tick(1);
+  assert.equal((await waiting).code, 'TIMEOUT');
 });
 
 test('readServiceAccount: returns the key; a missing or malformed one is a ConfigError showing no part of it', () => {
