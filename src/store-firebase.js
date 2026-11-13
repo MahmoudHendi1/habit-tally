@@ -17,19 +17,19 @@
 // - When the server refuses it, the op is dropped and `lastError` is set; the view is then Firestore's.
 // - Habit and account snapshots replace `base`. They may already contain some of our unanswered ops, but
 //   those are plain assignments, so laying `ops` over them again gives the same result.
-// - Count snapshots are different, because +1 laid over a snapshot that already holds that +1 counts twice.
-//   A month's snapshot is therefore used only when it cannot hold an unanswered op of ours: when it has no
-//   pending writes at all (it is the server's truth, and all of `ops` goes on top), or when we have no op
-//   waiting in that month. Otherwise it is skipped: the server's confirmation moves the op into `base`
-//   instead, and the snapshot that follows the last confirmation brings in whatever other devices did.
-//   That is why the logs are watched with includeMetadataChanges: the change from "pending" to "confirmed"
-//   must arrive even when the numbers are the same.
+// - Count snapshots are different: +1 laid over a snapshot that already holds that +1 would count twice,
+//   and a snapshot does not say which of our taps it holds. So while an op of ours is waiting in a month,
+//   that month's snapshots are not used at all: the server's confirmations move the ops into `base` one by
+//   one, and the first snapshot after the last confirmation brings in whatever other devices did meanwhile.
+//   That snapshot often differs from the one before only in "pending" having become "confirmed", which is
+//   why the logs are watched with includeMetadataChanges.
 //
-// This relies on one documented order in the SDK: a write's promise settles before the snapshot that
-// contains its confirmation is delivered ("so that they consistently happen before listen events",
-// sync_engine). The emulator tests would fail if that changed (rapid taps would end above the true count).
-// Known limit: while this tab has unanswered taps in a month, taps from another tab of the same browser show
-// only once ours are confirmed (offline: once back online).
+// Consequences: a count never moves except by a tap here, a refusal, or a change from elsewhere. While taps
+// made here are waiting in a month (a fraction of a second online; offline, until back online), taps from
+// other devices or other tabs for that month wait too. The SDK settles a write's promise before it
+// delivers the snapshot holding the confirmation, so nothing is ever counted twice; were a snapshot made
+// before a tap delivered only after that tap's confirmation (timers frozen in a hidden tab), the count
+// would dip until the next snapshot, which is already queued behind it.
 import { initializeApp, getApps } from 'firebase/app';
 import {
   initializeAuth, getAuth, indexedDBLocalPersistence, browserLocalPersistence, connectAuthEmulator, onAuthStateChanged,
@@ -273,11 +273,8 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     }, failed));
     s.stops.push(onSnapshot(collection(userRef, 'logs'), { includeMetadataChanges: true }, (snap) => {
       if (session !== s) return;
-      const months = snap.docs.map((d) => {
-        // See the top of this file: a month that may already hold an unanswered tap of ours is skipped.
-        const skip = d.metadata.hasPendingWrites && s.ops.some((op) => op.month === d.id);
-        return [d.id, skip ? s.base.logs[d.id] : readDays(d.data())];
-      });
+      // See the top of this file: a month in which a tap of ours is still waiting keeps what `base` has.
+      const months = snap.docs.map((d) => [d.id, s.ops.some((op) => op.month === d.id) ? s.base.logs[d.id] : readDays(d.data())]);
       s.base = { ...s.base, logs: Object.fromEntries(months.filter(([, days]) => days)) };
       s.has.logs = true;
       refresh();

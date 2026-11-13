@@ -359,7 +359,7 @@ test('taps up and down across two months, with snapshots arriving in between: th
   assert.deepEqual(await stored(`users/${uid}/logs/2026-10`), { days: { [lastMonth]: { [id]: expected[lastMonth] } } });
 });
 
-test('taps on another device arriving while local taps are pending never make the count go down', async () => {
+test('a tap on another device in the middle of a burst of local taps: the count never goes down and ends with all of them', async () => {
   const a = await readyStore();
   const id = a.store.saveHabit(WATER);
   await a.settle();
@@ -367,17 +367,19 @@ test('taps on another device arriving while local taps are pending never make th
   await b.store.signIn(a.email, a.password);
   const seen = [];
   a.store.subscribe((state) => seen.push(countOn(state.logs, id, TODAY)));
-  for (let i = 1; i <= 12; i++) {
+  // 30 taps, 2 ms apart, so there is always one waiting for the server; the other device taps once early
+  // on, and nothing changes after the burst: its tap must still show once the burst has been confirmed.
+  for (let i = 1; i <= 30; i++) {
     a.store.addCount(TODAY, id, 1);
-    if (i % 4 === 0) b.store.addCount(TODAY, id, 1);
-    await sleep(i % 4);
+    if (i === 5) b.store.addCount(TODAY, id, 1);
+    await sleep(2);
   }
-  await Promise.all([a, b].map(({ store }) => until(store, (state) => countOn(state.logs, id, TODAY) === 15, 'all 15 taps counted')));
+  await Promise.all([a, b].map(({ store }) => until(store, (state) => countOn(state.logs, id, TODAY) === 31, 'all 31 taps counted')));
   await a.settle();
   await b.settle();
   neverDown(seen);
-  assert.deepEqual([seen.at(-1), countOn(b.store.getState().logs, id, TODAY)], [15, 15]);
-  assert.deepEqual(await stored(`users/${a.uid}/logs/2026-11`), { days: { [TODAY]: { [id]: 15 } } });
+  assert.deepEqual([seen.at(-1), countOn(b.store.getState().logs, id, TODAY)], [31, 31]);
+  assert.deepEqual(await stored(`users/${a.uid}/logs/2026-11`), { days: { [TODAY]: { [id]: 31 } } });
 });
 
 test('offline: changes show at once and stay; with cached data and no connection sign-in still reaches ready; then it all syncs', async () => {
