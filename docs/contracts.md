@@ -1,4 +1,4 @@
-# Habit Tally: contracts (v1)
+# Habit Tally: contracts (v1.1)
 
 The interfaces where two packages meet. Owned by the lead; a developer who needs a change asks the lead. Read
 `docs/architecture.md` first. Anything not fixed here is the owning package's choice.
@@ -117,6 +117,17 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
 - Counts are written with `increment(delta)` through `setDoc(..., { merge: true })` with nested objects
   (`{ days: { [dayKey]: { [habitId]: increment(delta) } } }`), never with dotted field paths.
 - "Today" is always the device's local day: `keyOf(now())`.
+- The object passed to listeners is the same object `getState()` returns at that moment.
+- While the status is not `ready`: `saveHabit` throws `StoreError('not-ready', ...)`; `deleteHabit`,
+  `restoreHabit`, `addCount` and `setTimeZone` do nothing.
+- Unknown ids and bad input: `saveHabit` with an `id` that does not exist throws `StoreError('not-found', ...)`;
+  editing a soft-deleted habit is allowed and it stays deleted. `deleteHabit`, `restoreHabit` and `addCount` on an
+  unknown id do nothing, as does `addCount` on a deleted habit, with a delta other than `+1`/`-1`, or with a
+  malformed day key. `setTimeZone` ignores an invalid or unchanged zone.
+- `order`: the first habit gets 1; deleted habits count towards the highest.
+- `lastError` is `{ code: 'not-saved', message }` when a write could not be saved (the backend refused it, or
+  browser storage failed). The optimistic state stays as it is; the next write that succeeds clears `lastError`.
+- `removeDevice` resolves even when the record does not exist or now belongs to someone else.
 
 ### Errors
 
@@ -129,7 +140,7 @@ The message is a plain sentence the UI can show as is.
 
 - Starts **signed in** as `demo@habit-tally.example` with no habits; with `sample: true` (from `?demo=sample`) and
   empty storage it loads the sample fixture (16 weeks, one daily and one weekly habit).
-- Sign-out shows the sign-in screen; any well-formed email with a password of 6 or more characters signs in or up.
+- Sign-out shows the sign-in screen and is remembered across reloads; any well-formed email with a password of 6 or more characters signs in or up.
   There is one data set per browser, whatever the email.
 - Everything is kept in `storage` (default `localStorage`) under the single key `habit-tally:v1`. Missing or
   damaged data starts clean without an error.
@@ -194,10 +205,13 @@ they are, and the worker must then precache nothing. Icons live in `public/icons
 - `allowed()` = signed in and `request.auth.uid in invited()`.
 - `users/{uid}`, `users/{uid}/habits/{id}`, `users/{uid}/logs/{month}`: only `allowed()` and
   `request.auth.uid == uid`. Habit writes need exactly the ten stored fields with the types and ranges of
-  section 4 (rules cannot check each time string; `times` must be a list of at most 48). User writes need exactly
+  section 4, including every reminder time (each item `HH:MM` on :00 or :30, no duplicates, at most 48). The
+  habit id must be 20 letters or digits and a log document id `YYYY-MM`. Rules cannot check sorting, what is
+  inside `days`, or the 50-habit limit; the stores do. User writes need exactly
   `tz`, `createdAt`, `updatedAt`. Log writes may only contain `days` (a map).
 - `devices/{fid}`: create and update only when `allowed()`, the new data is exactly `{ uid, ua, updatedAt }` and
-  `uid == request.auth.uid`; get and delete only when the stored `uid == request.auth.uid`; no list.
+  `uid == request.auth.uid`; get and delete only when the stored `uid == request.auth.uid` (so a get or delete of a missing or taken-over
+  record is refused, and the store treats that as done); no list.
 - Everything else is denied, including collection-group queries and `system/**`.
 
 ## 9. Reminder job (`scripts/send-reminders.mjs`, `scripts/lib/google.mjs`)
