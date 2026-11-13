@@ -13,7 +13,7 @@ One line per package. States: not started, in progress, in review, changes reque
 | A6 | Install and offline shell, notification display | Dev A | not started | |
 | A7 | Demo walk-through test and screenshots | Dev A | not started | |
 | B2 | Security rules | Dev B | in progress | |
-| B3 | Google API client for the job | Dev B | in progress | |
+| B3 | Google API client for the job | Dev B | merged | Reviewed, fix round done; `npm test` 65 of 65 on main |
 | B1 | Firebase store | Dev B | not started | |
 | B4 | Reminder job | Dev B | not started | |
 | B5 | Push registration | Dev B | not started | |

@@ -28,7 +28,7 @@ Used mostly on an Android phone (installed from the browser, no Play Store) and 
 - Reminder sender: a scheduled GitHub Actions job every 30 minutes in the public repo MahmoudHendi1/habit-tally
   (standard runners are free for public repositories). The job must finish in well under 60 seconds.
 - First version is invite only: anyone can create an account, only approved accounts can store data
-  (pending the owner's confirmation). Opening sign-up later is a one-line change.
+  (confirmed by the owner, 13 Nov 2026). Opening sign-up later is a one-line change.
 - Reminders may arrive 5 to 20 minutes late (GitHub does not guarantee schedule timing).
 
 ## Later (not in the first version)

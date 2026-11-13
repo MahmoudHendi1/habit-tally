@@ -265,6 +265,13 @@ nothing". A demo build leaves Firebase chunks out of `files`. Service worker che
 - System font stack; no request to any other origin; colours as CSS custom properties with light and dark values.
 - Touch targets at least 44 px; no sideways scrolling at 360 px wide.
 - Screens never talk to Firebase; they use the store and push interfaces only.
+- How a screen plugs into the shell (exports, `ctx`, re-rendering with `patch()`, sheets, toasts, the CSS class and
+  colour-token vocabulary) is defined by the header comment of `src/ui/common.js`. Screen CSS files are linked
+  from `index.html`, not imported by the modules, so the modules can be loaded by Node tests.
+- `index.html` belongs to the shell (A2). The install package (A6) may edit only the block marked for the
+  manifest and icon links.
+- In demo and emulator builds the shell exposes the `ctx` object as `window.habitTally` for browser tests; it is
+  absent in the real build.
 
 ## 11. Time-zone prompt
 
@@ -274,4 +281,5 @@ device zone (`Intl.DateTimeFormat().resolvedOptions().timeZone`) differs from `s
 `store.setTimeZone(deviceZone)`. Keep stores the declined zone in `localStorage['habit-tally:tz-declined']`, and
 the notice stays away until the device reports yet another zone. Settings always shows the reminder zone with a
 button to switch to the device's zone. The shell asks `src/ui/settings.js` for the notice through an exported
-`notice(state, ctx): string` (empty string = nothing to show).
+`notice(state, ctx): string` (empty string = nothing to show) and attaches its clicks once at start-up through an
+exported `bindNotice(root, ctx)`.
