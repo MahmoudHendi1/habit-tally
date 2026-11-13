@@ -1,0 +1,26 @@
+{
+  "about": "What stats() must give for sampleData(today) from src/sample-data.js. Worked out by hand from the two tables in that file; test/store-local.test.mjs asserts them. To see exactly this data in the app, open ?demo=sample with the clock set to noon on `today`.",
+  "today": "2026-11-13",
+  "firstDay": "2026-07-27",
+  "habits": [
+    {
+      "id": "sampleWaterHabit0001", "name": "Drink water", "period": "day", "target": 6,
+      "expected": { "total": 480, "periods": 110, "hitPeriods": 71, "best": 13, "streak": 10 },
+      "why": "110 days (15 full weeks + Monday to Friday). Best run: 31 Aug to 12 Sep. Current run: 3 to 12 Nov; today (2 of 6) is still in progress."
+    },
+    {
+      "id": "sampleRunHabit000001", "name": "Go for a run", "period": "week", "target": 3,
+      "expected": { "total": 40, "periods": 16, "hitPeriods": 10, "best": 3, "streak": 3 },
+      "why": "16 weeks. Weeks hit: 2, 3, 5, 6, 7, 10, 11, 13, 14, 15. This week (2 of 3) is still in progress."
+    }
+  ],
+  "counts": [
+    ["2026-07-27", "sampleWaterHabit0001", 6],
+    ["2026-07-30", "sampleWaterHabit0001", 0],
+    ["2026-09-09", "sampleWaterHabit0001", 7],
+    ["2026-11-13", "sampleWaterHabit0001", 2],
+    ["2026-09-13", "sampleRunHabit000001", 1],
+    ["2026-11-11", "sampleRunHabit000001", 1],
+    ["2026-11-13", "sampleRunHabit000001", 0]
+  ]
+}
