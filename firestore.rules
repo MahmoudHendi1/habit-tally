@@ -40,7 +40,7 @@ service cloud.firestore {
     function validHabit(h) {
       return hasExactly(h, ['name', 'period', 'target', 'unit', 'times', 'created', 'archived', 'deletedAt',
                             'order', 'updatedAt'])
-        && h.name is string && h.name.size() >= 1 && h.name.size() <= 60
+        && h.name is string && h.name.trim().size() >= 1 && h.name.size() <= 60 // not blank
         && h.period in ['day', 'week']
         && h.target is int && h.target >= 1 && h.target <= 50
         && h.unit is string && h.unit.size() <= 20
@@ -60,8 +60,12 @@ service cloud.firestore {
         && u.updatedAt is number;
     }
 
-    // One month of counts: only the key 'days', a map. (Rules cannot look inside a map with unknown keys.)
-    function validLog(l) { return hasExactly(l, ['days']) && l.days is map; }
+    // One month of counts: only the key 'days', a map of at most 31 days.
+    // (Rules cannot look inside a map with unknown keys, so the day keys and counts are not checked.)
+    function validLog(l) { return hasExactly(l, ['days']) && l.days is map && l.days.size() <= 31; }
+
+    // A device id (Firebase installation id): 1 to 64 letters, digits, '_' or '-'.
+    function isDeviceId(id) { return id.matches('^[A-Za-z0-9_-]{1,64}$'); }
 
     // A browser install that gets reminders. It can only ever be written with the writer's own uid.
     function validDevice(d) {
@@ -93,7 +97,7 @@ service cloud.firestore {
     // (signing in on a shared browser takes the device over). No listing.
     match /devices/{fid} {
       allow get, delete: if allowed() && resource.data.uid == request.auth.uid;
-      allow create, update: if allowed() && validDevice(request.resource.data);
+      allow create, update: if allowed() && isDeviceId(fid) && validDevice(request.resource.data);
     }
 
     // There is deliberately no rule for system/**, for collection-group queries or for any other path:
