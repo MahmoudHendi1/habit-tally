@@ -3,11 +3,60 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#EEF2F0" />
+    <meta name="description" content="A personal habit tracker: set a target per day or per week and tap once each time you do it." />
     <title>Habit Tally</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230B7A63'/%3E%3Cpath d='M8.5 8v16M13.5 8v16M18.5 8v16M23.5 8v16M5 20.5l22-9' stroke='%23fff' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <!-- Package A6: the manifest link and the PNG icon links go here. -->
+    <script>
+      // A chosen theme is applied before the first paint; without one the system setting is used (src/ui/common.js).
+      try {
+        var theme = localStorage.getItem('habit-tally:theme');
+        if (theme === 'light' || theme === 'dark') document.documentElement.setAttribute('data-theme', theme);
+      } catch (e) {}
+    </script>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <!-- One stylesheet per package, linked here so the screen modules stay loadable in Node tests. -->
+    <link rel="stylesheet" href="/src/ui/editor.css" />
+    <link rel="stylesheet" href="/src/ui/progress.css" />
+    <link rel="stylesheet" href="/src/ui/account.css" />
   </head>
   <body>
-    <!-- Placeholder. Package A2 (app skeleton) replaces this file. -->
-    <div id="app"></div>
+    <div id="app" class="app" data-view="loading">
+      <header class="top">
+        <p class="brand">
+          <svg width="28" height="20" viewBox="0 0 28 20" aria-hidden="true"><path d="M5.7 2.5l-1.4 15M10.5 2.5l1 15M17.4 2.5l-.8 15M22.4 2.5l1.2 15M1.5 15l25-10" /></svg>
+          Habit Tally
+        </p>
+        <nav id="tabs" class="tabs" aria-label="Main" hidden>
+          <a href="#/today">
+            <svg class="icon" width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5v14M9.5 5v14M14 5v14M18.5 5v14M2.5 16l19-8" /></svg>
+            Today
+          </a>
+          <a href="#/progress">
+            <svg class="icon" width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20v-6M12 20V9M19 20V4" /></svg>
+            Progress
+          </a>
+          <a href="#/settings">
+            <svg class="icon" width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h8M18 8h2M4 16h2M12 16h8" /><circle cx="15" cy="8" r="2.5" /><circle cx="9" cy="16" r="2.5" /></svg>
+            Settings
+          </a>
+        </nav>
+      </header>
+      <div id="notices" class="notices"></div>
+      <div id="notice-slot" class="notices"></div>
+      <main id="screen">
+        <div class="splash" role="status">
+          <svg width="56" height="40" viewBox="0 0 28 20" aria-hidden="true"><path d="M5.7 2.5l-1.4 15M10.5 2.5l1 15M17.4 2.5l-.8 15M22.4 2.5l1.2 15M1.5 15l25-10" /></svg>
+          <p>Habit Tally</p>
+          <span class="sr-only">Loading</span>
+        </div>
+      </main>
+    </div>
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+    <div id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+    <noscript><p class="notice notice-warn">Habit Tally needs JavaScript to run.</p></noscript>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
