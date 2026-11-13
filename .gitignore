@@ -1,6 +1,9 @@
-node_modules/
+node_modules
 dist/
 .firebase/
 *.log
 .env*
 service-account*.json
+dist-demo/
+test-results/
+playwright-report/

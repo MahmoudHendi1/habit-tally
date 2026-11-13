@@ -1,11 +1,17 @@
 // Pure habit logic shared by the app and the reminder job. No DOM, no Firebase.
 //
 // Data shapes
-//   habit: { id, name, period: 'day' | 'week', target, unit, times: ['09:00'], created: 'YYYY-MM-DD', archived }
+//   habit: { id, name, period: 'day' | 'week', target, unit, times: ['09:00'], created: 'YYYY-MM-DD',
+//            archived, deletedAt, order, updatedAt }   (full contract: docs/contracts.md)
 //   logs:  { 'YYYY-MM': { 'YYYY-MM-DD': { [habitId]: count } } }
 
 export const SLOT_MINUTES = 30;
 export const SLOT_MS = SLOT_MINUTES * 60 * 1000;
+
+/** Limits shared by the editor, both stores and (where expressible) the security rules. */
+export const LIMITS = Object.freeze({
+  nameMax: 60, unitMax: 20, targetMin: 1, targetMax: 50, timesMax: 48, habitsMax: 50, backDays: 7,
+});
 
 export const pad = (n) => String(n).padStart(2, '0');
 export const keyOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -79,6 +85,85 @@ export function stats(h, logs, today) {
   return { total, periods, hitPeriods, best, streak: streak(h, logs, today) };
 }
 
+/** "N of M habits done" for the Today screen on day k. */
+export function summary(habits, logs, k) {
+  const live = habits.filter((h) => !h.archived && !h.deletedAt);
+  return { done: live.filter((h) => isHit(h, logs, k)).length, total: live.length };
+}
+
+/** The days that can be logged: today first, then the previous `back` days (R6). */
+export function recentDays(today, back = LIMITS.backDays) {
+  return Array.from({ length: back + 1 }, (_, i) => addDays(today, -i));
+}
+
+/** Calendar for the Progress screen: `weeks` Monday-first columns, the last one being this week.
+ *  Each day: { key, count, level, future, before }.
+ *    level 0 = nothing logged, 1 = some, 2 = at least half the daily target, 3 = target hit.
+ *    For weekly habits a logged day is level 2, or 3 when that week's target was hit.
+ *    future = after today; before = before the habit's start date. Both have level 0.
+ *  Each week: { start, hit, days[7] }. */
+export function calendarWeeks(h, logs, today, weeks = 15) {
+  const first = addDays(weekStart(today), -7 * (weeks - 1));
+  const out = [];
+  for (let w = 0; w < weeks; w++) {
+    const start = addDays(first, 7 * w);
+    const hit = isWeekly(h) ? isHit(h, logs, start) : false;
+    const days = weekKeys(start).map((key) => {
+      const future = key > today, before = key < h.created;
+      const count = future ? 0 : countOn(logs, h.id, key);
+      let level = 0;
+      if (count > 0) {
+        if (isWeekly(h)) level = hit ? 3 : 2;
+        else level = count >= h.target ? 3 : count * 2 >= h.target ? 2 : 1;
+      }
+      return { key, count, level, future, before };
+    });
+    out.push({ start, hit: isWeekly(h) ? hit : days.every((d) => d.future || d.level === 3), days });
+  }
+  return out;
+}
+
+// ---------- habits: cleaning and validation ----------
+
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TIME_RE = /^([01]\d|2[0-3]):(00|30)$/;
+
+/** Tidy what the editor collected: trims text, whole-number target, snapped unique sorted times.
+ *  Returns only the fields a person edits; ids, dates and order are set by the store. */
+export function cleanHabit(input) {
+  return {
+    name: String(input?.name ?? '').trim().replace(/\s+/g, ' '),
+    period: input?.period === 'week' ? 'week' : 'day',
+    target: Math.round(Number(input?.target)),
+    unit: String(input?.unit ?? '').trim(),
+    times: cleanTimes(input?.times),
+  };
+}
+
+/** Problems with a habit, as short sentences for the editor. Empty list = valid. Run on cleanHabit output. */
+export function validateHabit(h) {
+  const out = [];
+  if (!h || typeof h !== 'object') return ['Habit is missing.'];
+  if (typeof h.name !== 'string' || h.name.length === 0) out.push('Give the habit a name.');
+  else if (h.name.length > LIMITS.nameMax) out.push(`Keep the name to ${LIMITS.nameMax} characters.`);
+  if (h.period !== 'day' && h.period !== 'week') out.push('Choose per day or per week.');
+  if (!Number.isInteger(h.target) || h.target < LIMITS.targetMin || h.target > LIMITS.targetMax) {
+    out.push(`Target must be a whole number from ${LIMITS.targetMin} to ${LIMITS.targetMax}.`);
+  }
+  if (typeof h.unit !== 'string' || h.unit.length > LIMITS.unitMax) out.push(`Keep the unit to ${LIMITS.unitMax} characters.`);
+  if (!Array.isArray(h.times) || h.times.some((t) => !TIME_RE.test(t))) out.push('Reminder times must be on the hour or half hour.');
+  else if (h.times.length > LIMITS.timesMax) out.push(`At most ${LIMITS.timesMax} reminder times.`);
+  else if (new Set(h.times).size !== h.times.length) out.push('A reminder time is listed twice.');
+  if ('created' in h && !DAY_RE.test(h.created || '')) out.push('Start date is not a valid day.');
+  return out;
+}
+
+/** Display order: by `order`, then by id so ties are stable. Deleted habits are left out. */
+export function sortHabits(habits) {
+  return habits.filter((h) => !h.deletedAt)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(a.id).localeCompare(String(b.id)));
+}
+
 // ---------- reminder times ----------
 
 /** Snap 'HH:MM' to the half-hour step the reminder job runs on. */
@@ -92,13 +177,18 @@ export function snapTime(t) {
 export function cleanTimes(times) {
   return [...new Set((times || []).map(snapTime).filter(Boolean))].sort();
 }
-/** 'Every N hours between start and end', as a list of times. */
+/** 'Every N hours between start and end', as a sorted list of times. An end before the start
+ *  runs past midnight: everyHours('22:00', '06:00', 4) -> ['02:00', '06:00', '22:00']. */
 export function everyHours(start, end, hours) {
   const toMin = (t) => +t.slice(0, 2) * 60 + +t.slice(3);
-  const s = toMin(snapTime(start)), e = toMin(snapTime(end));
-  const step = Math.max(SLOT_MINUTES, Math.round(hours * 60));
+  const a = snapTime(start), b = snapTime(end);
+  if (!a || !b || !(hours > 0)) return [];
+  const s = toMin(a);
+  let e = toMin(b);
+  if (e < s) e += 24 * 60;
+  const step = Math.max(SLOT_MINUTES, Math.round((hours * 60) / SLOT_MINUTES) * SLOT_MINUTES);
   const out = [];
-  for (let m = s; m <= e; m += step) out.push(`${pad(Math.floor(m / 60))}:${pad(m % 60)}`);
+  for (let m = s; m <= e; m += step) out.push(`${pad(Math.floor((m % 1440) / 60))}:${pad(m % 60)}`);
   return cleanTimes(out);
 }
 
@@ -117,22 +207,46 @@ export function localParts(ms, tz) {
   return { day: `${p.year}-${p.month}-${p.day}`, time: `${p.hour}:${p.minute}` };
 }
 
-/** Which half-hour slots a run of the job should handle.
- *  lastSlot is the newest slot already handled (ms since epoch, or 0). The job is scheduled a few
- *  minutes before each slot, so `lookahead` lets an on-time run send that slot's reminders, and
- *  `maxBack` stops a long outage from replaying a day of reminders. */
-export function slotsToProcess(lastSlot, now, lookahead = 5 * 60 * 1000, maxBack = 90 * 60 * 1000) {
-  const latest = Math.floor((now + lookahead) / SLOT_MS) * SLOT_MS;
-  let first = Math.max((lastSlot || 0) + SLOT_MS, latest - Math.floor(maxBack / SLOT_MS) * SLOT_MS);
-  const out = [];
-  for (let s = first; s <= latest; s += SLOT_MS) out.push(s);
-  return out;
+const minutesOf = (t) => +t.slice(0, 2) * 60 + +t.slice(3, 5);
+
+/** Plan one run of the reminder job.
+ *  lastSlot: newest slot already claimed (ms since epoch), or null/0 when the job has never run.
+ *  The job is scheduled a few minutes before each half hour, so `lookahead` lets an on-time run
+ *  take that half hour's slot.
+ *  Returns null when the slot is already claimed, else { slot, from }: send the reminders whose
+ *  time falls in (from, slot]. `from` is the previous slot, or one slot earlier when a run was
+ *  missed. Nothing older than two slots is ever sent; the first ever run covers one slot. */
+export function planRun(lastSlot, now, lookahead = 5 * 60 * 1000) {
+  const slot = Math.floor((now + lookahead) / SLOT_MS) * SLOT_MS;
+  if (lastSlot && lastSlot >= slot) return null;
+  const from = lastSlot ? Math.max(lastSlot, slot - 2 * SLOT_MS) : slot - SLOT_MS;
+  return { slot, from };
 }
 
-/** Habits that should send a reminder for local day `day` at slot `time`. */
-export function dueHabits(habits, logs, day, time) {
+/** The local day and the half-hour reminder times that fall in the window (from, slot] in zone tz.
+ *  Matching a window instead of one exact time makes zones with 45-minute offsets work and sends
+ *  times skipped by a spring-forward change at the next slot. When the clocks go back the local
+ *  window is empty or negative for one slot, so at most one time a year is sent twice. */
+export function dueTimes(from, slot, tz) {
+  const end = localParts(slot, tz);
+  const m0 = minutesOf(localParts(from, tz).time), m1 = minutesOf(end.time);
+  const width = (m1 - m0 + 1440) % 1440;
+  const times = [];
+  if (width > 0 && width <= 720) {
+    for (let t = 0; t < 1440; t += SLOT_MINUTES) {
+      const d = (t - m0 + 1440) % 1440;
+      if (d > 0 && d <= width) times.push(`${pad(Math.floor(t / 60))}:${pad(t % 60)}`);
+    }
+  }
+  return { day: end.day, times };
+}
+
+/** Habits that should send a reminder for local day `day`; `times` is one 'HH:MM' or a list (dueTimes). */
+export function dueHabits(habits, logs, day, times) {
+  const want = new Set([].concat(times || []));
   return habits.filter((h) => {
-    if (h.archived || !(h.times || []).includes(time)) return false;
+    if (h.archived || h.deletedAt) return false;
+    if (!Array.isArray(h.times) || !h.times.some((t) => want.has(t))) return false;
     if (isHit(h, logs, day)) return false;
     // A weekly habit already logged today has had its turn for the day.
     if (isWeekly(h) && countOn(logs, h.id, day) > 0) return false;
