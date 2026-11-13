@@ -37,7 +37,7 @@ import {
 } from 'firebase/auth';
 import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache,
-  connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, increment,
+  memoryLruGarbageCollector, connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, increment,
 } from 'firebase/firestore';
 import { LIMITS, keyOf, monthId, countOn, recentDays, cleanHabit, validateHabit, sortHabits } from '../shared/logic.js';
 import { firebaseConfig, emulatorConfig } from './firebase-config.js';
@@ -104,11 +104,8 @@ function same(a, b) {
 /** The days of one month document: { day: { habitId: count } }. The rules cannot look inside `days`, so
  *  anything that is not a number is left out here. */
 function readDays(data) {
-  const out = {};
-  for (const [day, counts] of Object.entries(isObject(data?.days) ? data.days : {})) {
-    if (isObject(counts)) out[day] = Object.fromEntries(Object.entries(counts).filter(([, n]) => Number.isFinite(n)));
-  }
-  return out;
+  const days = Object.entries(isObject(data?.days) ? data.days : {}).filter(([, counts]) => isObject(counts));
+  return Object.fromEntries(days.map(([day, counts]) => [day, Object.fromEntries(Object.entries(counts).filter(([, n]) => Number.isFinite(n)))]));
 }
 
 /** One change laid over { tz, habits: { id: habit }, logs }. Returns new data; nothing is mutated.
@@ -136,14 +133,16 @@ function connect(emulator, appName) {
   } catch {
     auth = getAuth(app); // already set up on this app (for example after a hot reload)
   }
+  // Like the browser cache, the memory cache keeps documents that no listener is watching any more.
+  const inMemory = () => memoryLocalCache({ garbageCollector: memoryLruGarbageCollector() });
   try {
-    const localCache = inBrowser ? persistentLocalCache({ tabManager: persistentMultipleTabManager() }) : memoryLocalCache();
+    const localCache = inBrowser ? persistentLocalCache({ tabManager: persistentMultipleTabManager() }) : inMemory();
     db = initializeFirestore(app, { localCache });
   } catch {
     try {
-      db = initializeFirestore(app, { localCache: memoryLocalCache() });
+      db = initializeFirestore(app, { localCache: inMemory() });
     } catch {
-      db = getFirestore(app);
+      db = getFirestore(app); // already set up on this app
     }
   }
   if (emulator) {
@@ -166,7 +165,8 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   const today = () => keyOf(now());
   const listeners = new Set();
   /** The signed-in account and everything that belongs to it; replaced, never reused, when the account
-   *  changes, is refused or signs out, so late answers for an old session are easy to ignore. */
+   *  changes, is refused or signs out, so late answers for an old session are easy to ignore.
+   *  `denied`: the rules refused it; it shows as waiting until a retry() gets all the way to ready. */
   let session = null;
   let authKnown = false;
   let lastError = null;
@@ -183,8 +183,9 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     const blank = { mode, user: null, habits: [], logs: {}, lastError };
     if (!session) return { status: authKnown ? 'signedOut' : 'loading', ...blank };
     const { uid, email, has } = session;
-    if (session.denied) return { status: 'waiting', ...blank, user: { uid, email, tz } };
-    if (!has.user || !has.habits || !has.logs) return { status: 'loading', ...blank };
+    if (!has.user || !has.habits || !has.logs) {
+      return session.denied ? { status: 'waiting', ...blank, user: { uid, email, tz } } : { status: 'loading', ...blank };
+    }
     const data = current();
     return { status: 'ready', ...blank, user: { uid, email, tz: data.tz }, habits: sortHabits(Object.values(data.habits)), logs: data.logs };
   }
@@ -254,7 +255,6 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       }
       const zone = snap.data().tz;
       s.base = { ...s.base, tz: isZone(zone) ? zone : tz };
-      s.denied = false;
       s.has.user = true;
       if (!s.live) {
         s.live = true;
@@ -267,22 +267,18 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   function watchData(s, userRef, failed) {
     s.stops.push(onSnapshot(collection(userRef, 'habits'), (snap) => {
       if (session !== s) return;
-      const habits = {};
-      snap.forEach((d) => { habits[d.id] = { id: d.id, ...d.data() }; });
-      s.base = { ...s.base, habits };
+      s.base = { ...s.base, habits: Object.fromEntries(snap.docs.map((d) => [d.id, { id: d.id, ...d.data() }])) };
       s.has.habits = true;
       refresh();
     }, failed));
     s.stops.push(onSnapshot(collection(userRef, 'logs'), { includeMetadataChanges: true }, (snap) => {
       if (session !== s) return;
-      const logs = {};
-      snap.forEach((d) => {
+      const months = snap.docs.map((d) => {
         // See the top of this file: a month that may already hold an unanswered tap of ours is skipped.
         const skip = d.metadata.hasPendingWrites && s.ops.some((op) => op.month === d.id);
-        if (!skip) logs[d.id] = readDays(d.data());
-        else if (s.base.logs[d.id]) logs[d.id] = s.base.logs[d.id];
+        return [d.id, skip ? s.base.logs[d.id] : readDays(d.data())];
       });
-      s.base = { ...s.base, logs };
+      s.base = { ...s.base, logs: Object.fromEntries(months.filter(([, days]) => days)) };
       s.has.logs = true;
       refresh();
     }, failed));
