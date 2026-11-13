@@ -25,9 +25,10 @@ Used mostly on an Android phone (installed from the browser, no Play Store) and 
 
 ## Decided constraints
 - Backend: Firebase Spark plan (Auth, Firestore, Hosting, Cloud Messaging).
-- Reminder sender: a scheduled GitHub Actions job every 30 minutes in a PRIVATE repo. GitHub Free gives 2,000
-  Actions minutes a month for private repos and bills each job rounded up to a whole minute, so the job must
-  finish in well under 60 seconds (about 1,460 runs a month).
+- Reminder sender: a scheduled GitHub Actions job every 30 minutes in the public repo MahmoudHendi1/habit-tally
+  (standard runners are free for public repositories). The job must finish in well under 60 seconds.
+- First version is invite only: anyone can create an account, only approved accounts can store data
+  (pending the owner's confirmation). Opening sign-up later is a one-line change.
 - Reminders may arrive 5 to 20 minutes late (GitHub does not guarantee schedule timing).
 
 ## Later (not in the first version)
