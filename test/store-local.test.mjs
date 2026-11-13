@@ -1,9 +1,11 @@
 // The demo store: the shared Store contract, then what only the demo store promises (contracts.md, "Demo store").
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createLocalStore, STORAGE_KEY } from '../src/store-local.js';
+import { sampleData, SAMPLE_WEEKS } from '../src/sample-data.js';
 import { StoreError } from '../src/store.js';
-import { addDays, countOn, keyOf } from '../shared/logic.js';
+import { addDays, countOn, keyOf, stats, streak, validateHabit, weekStart } from '../shared/logic.js';
 import { runStoreContract } from './store-contract.mjs';
 
 // A Tuesday early in the month, so "7 days back" crosses a week and a month boundary.
@@ -41,7 +43,7 @@ test('demo store: a new store on the same storage sees the earlier data', () => 
   assert.deepEqual([...storage.map.keys()], [STORAGE_KEY]);
   assert.equal(STORAGE_KEY, 'habit-tally:v1');
 
-  const second = open(storage, { tz: 'Asia/Tokyo' });
+  const second = open(storage, { tz: 'Asia/Tokyo', sample: true });
   assert.deepEqual(second.getState(), first.getState());
   assert.deepEqual(second.getState().habits.map((h) => [h.id, h.created]), [[kept, '2026-10-27']]);
   assert.equal(second.getState().user.tz, 'Africa/Cairo');
@@ -172,4 +174,45 @@ test('demo store: one failing listener does not stop the change or the other lis
   store.saveHabit(WATER);
   assert.deepEqual(seen, [0, 1]);
   assert.equal(console.error.mock.callCount(), 1);
+});
+
+const fixture = JSON.parse(readFileSync(new URL('./fixtures/sample-16-weeks.json', import.meta.url), 'utf8'));
+
+test('sample data: 16 weeks for one daily and one weekly habit, with the totals and streaks of the fixture', () => {
+  const { habits, logs } = sampleData(fixture.today);
+  assert.deepEqual(sampleData(fixture.today), { habits, logs }, 'the same day gives the same data');
+  assert.deepEqual(habits.map((h) => [h.id, h.name, h.period, h.target]), fixture.habits.map((h) => [h.id, h.name, h.period, h.target]));
+  assert.deepEqual(habits.map((h) => h.period), ['day', 'week']);
+  for (const [i, habit] of habits.entries()) {
+    assert.deepEqual(validateHabit(habit), []);
+    assert.match(habit.id, /^[A-Za-z0-9]{20}$/);
+    assert.equal(habit.created, fixture.firstDay);
+    assert.deepEqual(stats(habit, logs, fixture.today), fixture.habits[i].expected, habit.name);
+    assert.equal(streak(habit, logs, fixture.today), fixture.habits[i].expected.streak, habit.name);
+  }
+  assert.equal(fixture.firstDay, addDays(weekStart(fixture.today), -7 * (SAMPLE_WEEKS - 1)));
+  for (const [day, id, count] of fixture.counts) assert.equal(countOn(logs, id, day), count, `${id} on ${day}`);
+  const days = Object.values(logs).flatMap((month) => Object.keys(month));
+  assert.ok(days.every((day) => day >= fixture.firstDay && day <= fixture.today), 'nothing outside the 16 weeks');
+  const hitRate = fixture.habits.map((h) => h.expected.hitPeriods / h.expected.periods);
+  assert.ok(hitRate.every((rate) => rate > 0.5 && rate < 0.8), 'a believable mix of hit and missed periods');
+});
+
+test('demo store: sample data loads only when asked for and only into empty storage', () => {
+  const storage = fakeStorage();
+  const now = noonOn(fixture.today);
+  assert.deepEqual(open(storage, { now }).getState().habits, []);
+  assert.equal(storage.map.size, 0, 'looking does not write');
+
+  const store = open(storage, { now, sample: true });
+  const { habits, logs } = store.getState();
+  assert.deepEqual({ habits, logs }, sampleData(fixture.today));
+  for (const [i, habit] of habits.entries()) assert.deepEqual(stats(habit, logs, fixture.today), fixture.habits[i].expected);
+  assert.deepEqual(open(storage, { now }).getState(), store.getState(), 'the sample was saved');
+
+  store.deleteHabit(habits[0].id);
+  store.deleteHabit(habits[1].id);
+  const later = open(storage, { now: noonOn(addDays(fixture.today, 1)), sample: true });
+  assert.deepEqual(later.getState().habits, [], 'the sample does not come back over saved data');
+  assert.equal(open(fakeStorage({ [STORAGE_KEY]: 'damaged' }), { now, sample: true }).getState().habits.length, 2);
 });

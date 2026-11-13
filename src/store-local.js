@@ -3,6 +3,7 @@
 // No network and no real accounts: there is one data set per browser, whatever email is typed.
 import { LIMITS, keyOf, monthId, countOn, recentDays, cleanHabit, validateHabit, sortHabits } from '../shared/logic.js';
 import { StoreError } from './store.js';
+import { sampleData } from './sample-data.js';
 
 /** @typedef {{ id: string, name: string, period: 'day' | 'week', target: number, unit: string, times: string[],
  *     created: string, archived: boolean, deletedAt: null | number, order: number, updatedAt: number }} Habit */
@@ -90,16 +91,19 @@ function readSaved(storage) {
  * @param {KeyValue} [options.storage] where the data is kept (default: localStorage)
  * @param {() => Date} [options.now] the clock (default: the device's)
  * @param {string} [options.tz] IANA zone given to a new user record (default: the device's)
+ * @param {boolean} [options.sample] load the 16-week sample when nothing is saved yet
  */
-export function createLocalStore({ storage = defaultStorage(), now = () => new Date(), tz = deviceZone() } = {}) {
+export function createLocalStore({ storage = defaultStorage(), now = () => new Date(), tz = deviceZone(), sample = false } = {}) {
   const today = () => keyOf(now());
+  const found = readSaved(storage);
   /** @type {Saved} */
-  let saved = readSaved(storage) ?? { signedIn: true, user: { ...DEMO_USER, tz }, habits: [], logs: {} };
+  let saved = found ?? { signedIn: true, user: { ...DEMO_USER, tz }, habits: [], logs: {} };
   /** @type {State['lastError']} */
   let lastError = null;
   let state = view();
   /** @type {Set<(state: State) => void>} */
   const listeners = new Set();
+  if (!found && sample) commit({ ...saved, ...sampleData(today()) });
 
   /** @returns {State} */
   function view() {
