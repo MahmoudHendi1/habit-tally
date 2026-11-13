@@ -40,8 +40,20 @@ export const isWeekly = (h) => h.period === 'week';
 
 /** Taps logged for one habit on one day. Never negative. */
 export function countOn(logs, habitId, k) {
-  const n = logs?.[monthId(k)]?.[k]?.[habitId] || 0;
-  return n > 0 ? n : 0;
+  const n = Number(logs?.[monthId(k)]?.[k]?.[habitId]);
+  return n > 0 && Number.isFinite(n) ? n : 0;
+}
+
+/** The first day that counts for a habit: its start date, or the earliest day with a logged count if
+ *  that is earlier (a back-filled day). Derived, never stored, so undoing a mistaken tap on an old
+ *  day leaves no trace. */
+export function startDay(h, logs) {
+  let first = h.created;
+  for (const m in logs || {}) {
+    if (m > monthId(first)) continue;
+    for (const k in logs[m] || {}) if (k < first && countOn(logs, h.id, k) > 0) first = k;
+  }
+  return first;
 }
 
 /** Progress in the habit's own period (the day, or the Monday-to-Sunday week) that contains k. */
@@ -56,7 +68,7 @@ export const isHit = (h, logs, k) => periodCount(h, logs, k) >= h.target;
 export function streak(h, logs, today) {
   const step = isWeekly(h) ? 7 : 1;
   const norm = (k) => (isWeekly(h) ? weekStart(k) : k);
-  const first = norm(h.created);
+  const first = norm(startDay(h, logs));
   let k = norm(today);
   if (!isHit(h, logs, k)) k = addDays(k, -step);
   let n = 0;
@@ -72,7 +84,7 @@ export function stats(h, logs, today) {
   const norm = (k) => (isWeekly(h) ? weekStart(k) : k);
   const cur = norm(today);
   let periods = 0, hitPeriods = 0, best = 0, run = 0;
-  for (let k = norm(h.created); k <= cur; k = addDays(k, step)) {
+  for (let k = norm(startDay(h, logs)); k <= cur; k = addDays(k, step)) {
     periods++;
     if (isHit(h, logs, k)) {
       hitPeriods++;
@@ -81,7 +93,7 @@ export function stats(h, logs, today) {
     } else if (k !== cur) run = 0;
   }
   let total = 0;
-  for (const m in logs) for (const k in logs[m]) total += Math.max(0, logs[m][k]?.[h.id] || 0);
+  for (const m in logs) for (const k in logs[m]) total += countOn(logs, h.id, k);
   return { total, periods, hitPeriods, best, streak: streak(h, logs, today) };
 }
 
@@ -100,16 +112,17 @@ export function recentDays(today, back = LIMITS.backDays) {
  *  Each day: { key, count, level, future, before }.
  *    level 0 = nothing logged, 1 = some, 2 = at least half the daily target, 3 = target hit.
  *    For weekly habits a logged day is level 2, or 3 when that week's target was hit.
- *    future = after today; before = before the habit's start date. Both have level 0.
+ *    future = after today (level 0); before = before the habit's first day, see startDay().
  *  Each week: { start, hit, days[7] }. */
 export function calendarWeeks(h, logs, today, weeks = 15) {
   const first = addDays(weekStart(today), -7 * (weeks - 1));
+  const began = startDay(h, logs);
   const out = [];
   for (let w = 0; w < weeks; w++) {
     const start = addDays(first, 7 * w);
     const hit = isWeekly(h) ? isHit(h, logs, start) : false;
     const days = weekKeys(start).map((key) => {
-      const future = key > today, before = key < h.created;
+      const future = key > today, before = key < began;
       const count = future ? 0 : countOn(logs, h.id, key);
       let level = 0;
       if (count > 0) {
@@ -168,14 +181,14 @@ export function sortHabits(habits) {
 
 /** Snap 'HH:MM' to the half-hour step the reminder job runs on. */
 export function snapTime(t) {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(t || '');
-  if (!m) return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(typeof t === 'string' ? t : '');
+  if (!m || +m[1] > 23 || +m[2] > 59) return null;
   let total = Math.round((+m[1] * 60 + +m[2]) / SLOT_MINUTES) * SLOT_MINUTES;
   if (total >= 24 * 60) total = 24 * 60 - SLOT_MINUTES;
   return `${pad(Math.floor(total / 60))}:${pad(total % 60)}`;
 }
 export function cleanTimes(times) {
-  return [...new Set((times || []).map(snapTime).filter(Boolean))].sort();
+  return [...new Set((Array.isArray(times) ? times : []).map(snapTime).filter(Boolean))].sort();
 }
 /** 'Every N hours between start and end', as a sorted list of times. An end before the start
  *  runs past midnight: everyHours('22:00', '06:00', 4) -> ['02:00', '06:00', '22:00']. */
@@ -218,6 +231,7 @@ const minutesOf = (t) => +t.slice(0, 2) * 60 + +t.slice(3, 5);
  *  missed. Nothing older than two slots is ever sent; the first ever run covers one slot. */
 export function planRun(lastSlot, now, lookahead = 5 * 60 * 1000) {
   const slot = Math.floor((now + lookahead) / SLOT_MS) * SLOT_MS;
+  if (!(lastSlot > 0)) lastSlot = 0; // junk in the bookmark counts as "never run"
   if (lastSlot && lastSlot >= slot) return null;
   const from = lastSlot ? Math.max(lastSlot, slot - 2 * SLOT_MS) : slot - SLOT_MS;
   return { slot, from };
@@ -239,6 +253,21 @@ export function dueTimes(from, slot, tz) {
     }
   }
   return { day: end.day, times };
+}
+
+/** Everything a run must consider for one user: dueTimes for each half hour in (from, slot], merged
+ *  by local day, oldest first. Usually one entry with one time. A catch-up window that crosses the
+ *  user's midnight gives two entries, so "target already hit" is judged on the right day for each. */
+export function dueWindows(from, slot, tz) {
+  const out = [];
+  for (let s = from + SLOT_MS; s <= slot; s += SLOT_MS) {
+    const { day, times } = dueTimes(s - SLOT_MS, s, tz);
+    if (!times.length) continue;
+    const last = out.at(-1);
+    if (last && last.day === day) last.times = [...new Set([...last.times, ...times])].sort();
+    else out.push({ day, times });
+  }
+  return out;
 }
 
 /** Habits that should send a reminder for local day `day`; `times` is one 'HH:MM' or a list (dueTimes). */

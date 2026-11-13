@@ -5,7 +5,7 @@ One line per package. States: not started, in progress, in review, changes reque
 | Id | Title | Owner | State | Evidence |
 |---|---|---|---|---|
 | L0 | Contracts and project skeleton | Lead | merged | `docs/contracts.md` (tag `contract-v1`); `npm test` 17 of 17; `npm run build` and `npm run build:demo` pass; emulators start |
-| A1 | Demo store | Dev A | in progress | |
+| A1 | Demo store | Dev A | merged | Reviewer approved; `npm test` 52 of 52 on main |
 | A2 | App skeleton and Today screen | Dev A | not started | |
 | A3 | Habit editor with reminder times | Dev A | not started | |
 | A4 | Progress screen and 15-week calendar | Dev A | not started | |
