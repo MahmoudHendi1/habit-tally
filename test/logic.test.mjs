@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   addDays, weekStart, weekKeys, countOn, periodCount, isHit, streak, stats,
-  snapTime, cleanTimes, everyHours, localParts, planRun, dueTimes, dueHabits, reminderText, SLOT_MS,
+  snapTime, cleanTimes, everyHours, localParts, planRun, dueTimes, dueWindows, dueHabits, reminderText, SLOT_MS,
+  startDay,
   LIMITS, summary, recentDays, calendarWeeks, cleanHabit, validateHabit, sortHabits,
 } from '../shared/logic.js';
 
@@ -182,9 +183,10 @@ test('calendarWeeks: 15 Monday-first columns ending this week', () => {
   const week = cal.at(-1).days;
   assert.deepEqual(week.map((d) => d.level), [0, 3, 2, 1, 0, 0, 0]);
   assert.deepEqual(week.map((d) => d.future), [false, false, false, false, false, true, true]);
-  // a day before the habit's start date is flagged but still shows what was logged
+  // a back-filled day before the start date counts: it becomes the habit's first day
   const sunday = cal.at(-3).days.at(6);
-  assert.deepEqual(sunday, { key: '2026-11-01', count: 9, level: 3, future: false, before: true });
+  assert.deepEqual(sunday, { key: '2026-11-01', count: 9, level: 3, future: false, before: false });
+  assert.equal(cal.at(-3).days.at(5).before, true);
   // weekly habit: logged days are level 2, or 3 in a week that hit the target
   const wlogs = logsOf([['2026-11-02', 'g', 1], ['2026-11-04', 'g', 2], ['2026-11-10', 'g', 1]]);
   const wcal = calendarWeeks(gym, wlogs, '2026-11-13');
@@ -214,4 +216,46 @@ test('cleanHabit and validateHabit', () => {
 test('sortHabits: by order, deleted left out', () => {
   const hs = [{ id: 'b', order: 2 }, { id: 'c', order: 1, deletedAt: 9 }, { id: 'a', order: 2 }, { id: 'z', order: 0 }];
   assert.deepEqual(sortHabits(hs).map((h) => h.id), ['z', 'a', 'b']);
+});
+
+test('startDay: a back-filled day moves the first day, an undone one does not', () => {
+  assert.equal(startDay(water, {}), '2026-11-02');
+  const logs = logsOf([['2026-10-30', 'w', 3], ['2026-10-31', 'w', 3], ['2026-11-01', 'w', 3], ['2026-11-02', 'w', 3], ['2026-10-20', 'g', 1]]);
+  assert.equal(startDay(water, logs), '2026-10-30');
+  assert.equal(streak(water, logs, '2026-11-02'), 4);
+  assert.deepEqual(stats(water, logs, '2026-11-02'), { total: 12, periods: 4, hitPeriods: 4, best: 4, streak: 4 });
+  // a mistaken tap seven days back that was undone (count back to 0) leaves no trace
+  const undone = logsOf([['2026-10-27', 'w', 0], ['2026-11-02', 'w', 3]]);
+  assert.equal(startDay(water, undone), '2026-11-02');
+  assert.deepEqual(stats(water, undone, '2026-11-02'), { total: 3, periods: 1, hitPeriods: 1, best: 1, streak: 1 });
+  // counts stored as text or junk never corrupt totals
+  const junk = { '2026-11': { '2026-11-03': { w: '5' }, '2026-11-04': { w: 'x' }, '2026-11-05': { w: {} } } };
+  assert.equal(countOn(junk, 'w', '2026-11-03'), 5);
+  assert.equal(countOn(junk, 'w', '2026-11-04'), 0);
+  assert.equal(stats(water, junk, '2026-11-05').total, 5);
+});
+
+test('dueWindows: a catch-up window across midnight judges each time on its own day', () => {
+  const at = (h, m) => Date.UTC(2026, 10, 13, h, m);
+  assert.deepEqual(dueWindows(at(8, 30), at(9, 0), 'Europe/London'), [{ day: '2026-11-13', times: ['09:00'] }]);
+  assert.deepEqual(dueWindows(at(8, 0), at(9, 0), 'Europe/London'), [{ day: '2026-11-13', times: ['08:30', '09:00'] }]);
+  assert.deepEqual(dueWindows(at(23, 0), at(24, 0), 'Europe/London'), [
+    { day: '2026-11-13', times: ['23:30'] }, { day: '2026-11-14', times: ['00:00'] },
+  ]);
+  // a habit finished on the 13th with a 23:30 reminder is not sent by the midnight catch-up run
+  const late = { ...water, times: ['23:30'] };
+  const logs = logsOf([['2026-11-13', 'w', 3]]);
+  const due = dueWindows(at(23, 0), at(24, 0), 'Europe/London').flatMap((w) => dueHabits([late], logs, w.day, w.times));
+  assert.deepEqual(due, []);
+  assert.deepEqual(dueWindows(at(9, 0), at(9, 0), 'Europe/London'), []);
+});
+
+test('input hardening: snapTime, cleanTimes, planRun', () => {
+  assert.equal(snapTime('25:00'), null);
+  assert.equal(snapTime('09:75'), null);
+  assert.equal(snapTime(900), null);
+  assert.deepEqual(cleanTimes('09:00'), []);
+  assert.deepEqual(cleanHabit({ name: 'A', target: 1, times: '09:00' }).times, []);
+  const nine = Date.UTC(2026, 10, 13, 9, 0);
+  for (const junk of ['x', NaN, -5, {}, undefined]) assert.deepEqual(planRun(junk, nine), { slot: nine, from: nine - SLOT_MS });
 });
