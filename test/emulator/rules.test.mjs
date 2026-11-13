@@ -402,7 +402,8 @@ describe('7. project files', () => {
   test('firebase.json serves dist; only /assets/** may be cached, every other path is no-cache', () => {
     const cfg = JSON.parse(file('firebase.json'));
     assert.equal(cfg.hosting.public, 'dist');
-    assert.deepEqual(cfg.hosting.rewrites, [{ source: '**', destination: '/index.html' }]);
+    // A missing file under /assets/ must be a 404, not index.html cached for a year.
+    assert.deepEqual(cfg.hosting.rewrites, [{ source: '!/assets/**', destination: '/index.html' }]);
     // Hosting matches header rules against the request path, before rewrites, and applies every matching
     // rule in the order written, so for one header the last matching rule wins.
     const cacheControl = (path) => {
