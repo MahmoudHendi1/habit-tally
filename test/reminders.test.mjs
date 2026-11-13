@@ -62,9 +62,11 @@ function createWorld(from) {
       w.billed += 1;
       return docs.has(path) ? doc(path) : null;
     },
-    async listDocs(col) {
-      await enter('listDocs', col);
-      return found(children(col));
+    async listDocs(col, options = {}) {
+      await enter('listDocs', col, 'limit' in options ? options : undefined);
+      const limit = options.limit ?? Infinity;
+      if (limit !== Infinity && !(Number.isSafeInteger(limit) && limit >= 1)) throw new TypeError('listDocs limit must be a whole number of at least 1');
+      return found(children(col).slice(0, limit));
     },
     async queryEqual(col, field, value) {
       await enter('queryEqual', `${col} ${field}`);
@@ -72,11 +74,16 @@ function createWorld(from) {
     },
     async setDoc(path, data, options = {}) {
       await enter('setDoc', path, options);
-      const { ifUpdateTime, ifMissing } = options;
-      if (ifUpdateTime && ifMissing) throw new TypeError('Use ifUpdateTime or ifMissing, not both');
+      const conditional = 'ifUpdateTime' in options; // as strict as the real client
+      const { ifUpdateTime, ifMissing = false } = options;
+      if (conditional && (typeof ifUpdateTime !== 'string' || !/^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(ifUpdateTime))) {
+        throw new TypeError('ifUpdateTime must be the updateTime string of a document');
+      }
+      if (typeof ifMissing !== 'boolean') throw new TypeError('ifMissing must be true or false');
+      if (conditional && ifMissing) throw new TypeError('Use ifUpdateTime or ifMissing, not both');
       const refused = (status, code) => new PreconditionError(`setDoc failed: HTTP ${status} ${code}`, { status, code });
       if (ifMissing && docs.has(path)) throw refused(409, 'ALREADY_EXISTS');
-      if (ifUpdateTime && docs.get(path)?.updateTime !== ifUpdateTime) throw refused(400, 'FAILED_PRECONDITION');
+      if (conditional && docs.get(path)?.updateTime !== ifUpdateTime) throw refused(400, 'FAILED_PRECONDITION');
       w.put(path, data);
       return doc(path);
     },
@@ -335,7 +342,7 @@ test('6a. an unregistered device is deleted and the run succeeds; no device is d
   assert.ok(!w.docs.has('devices/fid-alice-old') && w.docs.has('devices/fid-alice-phone'));
   assert.deepEqual(w.ops('sendPush'), ['fid-alice-old', 'fid-alice-phone', 'fid-alice-phone']); // not tried again
 
-  for (const [status, code] of [[500, 'INTERNAL'], [404, 'HTTP_404'], [400, 'INVALID_ARGUMENT'], [0, 'NETWORK']]) {
+  for (const [status, code] of [[500, 'INTERNAL'], [404, 'NOT_FOUND'], [404, 'HTTP_404'], [400, 'INVALID_ARGUMENT'], [0, 'TIMEOUT']]) {
     const v = addUser(worldAt(at(8, 30)), 'uid-alice', user);
     v.pushReply = (fid) => (fid === 'fid-alice-old' ? new GoogleError('sendPush failed', { status, code }) : 'sent');
     assert.deepEqual(await go(v, at(9)), { slot: at(9), sent: 2, skipped: 0, failed: 2, removed: 0 }, code);
@@ -380,7 +387,8 @@ test('6c. a failed read of the bookmark or the user list, or of every user, leav
 });
 
 test('6d. only a PreconditionError on the claim means "another run has it"; any other claim error sends nothing', async () => {
-  for (const err of [new GoogleError('setDoc failed: network error', { code: 'NETWORK' }), unavailable(), new Error('boom')]) {
+  const timeout = new GoogleError('setDoc failed: no answer in time', { code: 'TIMEOUT' });
+  for (const err of [timeout, unavailable(), new Error('boom')]) {
     const w = addUser(worldAt(at(8, 30)), 'uid-alice', { habits: { h1: {} }, devices: ['fid-alice-phone'] });
     w.fail = (op) => (op === 'setDoc' ? err : null);
     await assert.rejects(go(w, at(9)), (thrown) => thrown === err);
@@ -451,19 +459,22 @@ test('hostile or broken data: nothing crashes, nothing reaches another user, not
   w.put('devices/fid mallory!', { uid: 'uid-mallory', ua: '', updatedAt: 9 }); // not a usable id
   w.put(`devices/${'f'.repeat(65)}`, { uid: 'uid-mallory', ua: '', updatedAt: 9 });
   w.put('devices/fid-mallory-claims-alice', { uid: 'uid-alice', ua: '', updatedAt: 'now' }); // rules prevent this; still harmless
-  addUser(w, 'uid-nolog', { habits: { h1: { name: 'No log map' } }, devices: ['fid-nolog'] });
+  addUser(w, 'uid-nolog', { habits: { length: { name: 'No log map' } }, devices: ['fid-nolog'] });
   w.put('users/uid-nolog/logs/2026-11', { days: ['2026-11-13'] });
+  addUser(w, 'uid-noday', { habits: { length: { name: 'No day map' } }, devices: ['fid-noday'] });
+  w.put('users/uid-noday/logs/2026-11', { days: { '2026-11-13': 'abc' } }); // 'abc'.length is 3, the target
   w.put('users/uid-nodata', {});
   addUser(w, 'uid-alice', { habits: { h1: {} }, devices: ['fid-alice-phone'] });
 
-  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 6, skipped: 0, failed: 0, removed: 0 });
-  assert.deepEqual(tags(w, 'fid-mallory'), ['fine', 'hugeCount', 'textCount']);
+  // counts are judged by the shared logic, as in the app: 'lots' is 0, '5' and 1e300 mean done
+  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 5, skipped: 2, failed: 0, removed: 0 });
+  assert.deepEqual(tags(w, 'fid-mallory'), ['fine']);
   assert.ok(w.pushes.filter((p) => p.fid === 'fid-mallory').every((p) => p.data.body === 'Not started today. Target: 3.'));
-  assert.deepEqual(tags(w, 'fid-nolog'), ['h1']);
+  assert.deepEqual([tags(w, 'fid-nolog'), tags(w, 'fid-noday')], [['length'], ['length']]);
   // alice's habit goes to her phone and to the record that names her, never to mallory; mallory's go nowhere else
   assert.deepEqual(w.pushes.filter((p) => p.data.title === 'Drink water').map((p) => p.fid),
     ['fid-alice-phone', 'fid-mallory-claims-alice']);
-  assert.ok(w.pushes.filter((p) => p.data.title !== 'Drink water').every((p) => ['fid-mallory', 'fid-nolog'].includes(p.fid)));
+  assert.ok(w.pushes.filter((p) => p.data.title !== 'Drink water').every((p) => ['fid-mallory', 'fid-nolog', 'fid-noday'].includes(p.fid)));
   for (const { data } of w.pushes) {
     assert.deepEqual(Object.keys(data), ['title', 'body', 'tag', 'url']);
     assert.ok(data.title.length <= 60 && data.body.length <= 120);
@@ -477,6 +488,72 @@ test('hostile or broken data: nothing crashes, nothing reaches another user, not
   leaky.google.queryEqual = () => leaky.google.listDocs('devices');
   await go(leaky, at(9));
   assert.deepEqual(leaky.pushes.map((p) => [p.fid, p.data.title]), [['fid-alice-phone', 'Drink water'], ['fid-bob-phone', 'Read a book']]);
+});
+
+test('bookmark ahead of the clock: more than one slot ahead fails the run and changes nothing; one slot ahead is quiet', async () => {
+  const user = { habits: { h1: {} }, devices: ['fid-alice-phone'] };
+  const ahead = addUser(worldAt(at(10)), 'uid-alice', user);
+  const bookmark = structuredClone(ahead.docs.get(BOOKMARK));
+  const lines = [];
+  const result = await run({ google: ahead.google, now: at(8, 56), log: (line) => { lines.push(line); log(line); } });
+  assert.deepEqual(result, { slot: null, sent: 0, skipped: 0, failed: 1, removed: 0 });
+  assert.deepEqual(lines, ['The bookmark (2026-11-13T10:00Z) is ahead of the clock (slot 2026-11-13T09:00Z): reminders are on '
+    + 'hold until it is corrected. Nothing was sent, the bookmark is unchanged.']);
+  assert.deepEqual([ahead.docs.get(BOOKMARK), ahead.calls.length, ahead.pushes], [bookmark, 1, []]);
+  assert.equal((await go(ahead, at(9), { force: true })).sent, 1); // a forced run does not look at the bookmark
+
+  const one = addUser(worldAt(at(9, 30)), 'uid-alice', user);
+  assert.deepEqual(await go(one, at(9)), nothing);
+});
+
+test('read limit: at most 300 habit records are read per user, and the log says when a user reaches it', async () => {
+  const w = worldAt(at(8, 30));
+  const habits = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`a${String(i).padStart(3, '0')}`, { deletedAt: 5 }]));
+  for (let i = 0; i < 5; i += 1) habits[`z${i}`] = {};
+  addUser(w, 'uid-alice', { habits, devices: ['fid-alice-phone'] });
+  addUser(w, 'uid-bob', { habits: { h1: {} }, devices: ['fid-bob-phone'] });
+  const lines = [];
+  const result = await run({ google: w.google, now: at(8, 56), log: (line) => { lines.push(line); log(line); } });
+  assert.deepEqual(result, { slot: at(9), sent: 1, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual(w.calls[2], { op: 'listDocs', arg: 'users/uid-alice/habits', options: { limit: 300 } });
+  assert.equal(w.billed, 1 + 2 + 300 + 1 + 1 + 1); // bookmark, users, alice's 300, bob's habit, log and device
+  assert.equal(lines[1], 'Habit records: 1 user reached the read limit of 300; anything beyond it was not looked at.');
+});
+
+test('time limit: past the deadline no new push is started and the rest count as failed; out of time while reading claims nothing', async () => {
+  const build = () => {
+    const w = worldAt(at(8, 30));
+    addUser(w, 'uid-alice', { habits: { h1: {}, h2: { name: 'Stretch' } }, devices: ['fid-alice-phone', 'fid-alice-laptop'] });
+    addUser(w, 'uid-bob', { habits: { h1: {} }, devices: ['fid-bob-phone', 'fid-bob-laptop'] });
+    return w;
+  };
+  const timed = async (w, slowOp, ms, options = {}) => {
+    let t = 5000; // a fake clock: each `slowOp` call takes `ms`
+    w.before = async (op, arg) => { if (op === slowOp && arg !== 'users') t += ms; };
+    const lines = [];
+    const result = await run({ google: w.google, now: at(8, 56), log: (line) => { lines.push(line); log(line); }, clock: () => t, ...options });
+    return { result, last: lines.at(-1) };
+  };
+  // default 150 s, 40 s a push: four are started (at 0, 40, 80 and 120 s), two are not
+  const w = build();
+  assert.deepEqual(await timed(w, 'sendPush', 40000), {
+    result: { slot: at(9), sent: 4, skipped: 0, failed: 2, removed: 0 },
+    last: 'Time limit (150 s) reached while sending. Pushes not sent: 2.',
+  });
+  assert.deepEqual(w.pushes.map((p) => p.fid), ['fid-alice-laptop', 'fid-alice-phone', 'fid-alice-laptop', 'fid-alice-phone']);
+  assert.equal(w.docs.get(BOOKMARK).data.lastSlot, at(9));
+  const short = build();
+  assert.deepEqual((await timed(short, 'sendPush', 40000, { deadlineMs: 50000 })).result,
+    { slot: at(9), sent: 2, skipped: 0, failed: 4, removed: 0 });
+  // reading takes 160 s: nothing is claimed or sent, and the next run still has the slot
+  const slow = build();
+  assert.deepEqual(await timed(slow, 'listDocs', 160000), {
+    result: { slot: null, sent: 0, skipped: 0, failed: 1, removed: 0 },
+    last: 'Time limit (150 s) reached while reading: the slot is not claimed, so the next run retries it. Nothing was sent.',
+  });
+  assert.deepEqual([slow.ops('setDoc'), slow.pushes, slow.ops('listDocs')], [[], [], ['users', 'users/uid-alice/habits']]);
+  slow.before = async () => {};
+  assert.equal((await go(slow, at(9))).sent, 6);
 });
 
 /** Runs the command itself with the given environment (nothing inherited but PATH). */

@@ -2,14 +2,16 @@
 // Zero npm dependencies. Contract: docs/contracts.md section 9; flow: docs/architecture.md section 4.
 // Everything about dates, zones and what is due is decided by shared/logic.js.
 //
-// run({ google, now, log, force }) -> { slot, sent, skipped, failed, removed }
+// run({ google, now, log, force, deadlineMs, clock }) -> { slot, sent, skipped, failed, removed }
 //   google  the client of scripts/lib/google.mjs (or a stand-in with the same calls)
-//   now     ms since epoch
+//   now     ms since epoch: decides the slot
 //   log     function taking one line of text. The Actions log of a public repository is public, so a line holds
 //           only counts, the slot time in UTC, HTTP statuses and error codes: never a key, token, email, uid,
 //           device id, habit name or anything a server answered.
 //   force   true = a manual test run: the bookmark is neither read nor written, the window is the current
 //           slot only, and the reminders are sent even if the slot was already handled.
+//   deadlineMs, clock   the time the run may take (default 150 s, inside the workflow's 3-minute limit), measured
+//           with clock(), a function returning ms (default: the process's monotonic clock; tests pass a fake).
 //
 //   Order: read the bookmark `system/reminders` and plan the run; read everything (users, then per user habits,
 //   logs and devices, one user after another); claim the slot; send. The claim is written even when there is
@@ -17,13 +19,15 @@
 //
 //   Result:
 //     slot     the slot (ms) this run handled; null when it did nothing: the slot was already claimed, another
-//              run won the claim, or no user could be read (the slot is then left for the next run)
+//              run won the claim, the bookmark is ahead of the clock, or the reading did not finish (no user
+//              could be read, or time ran out: the slot is then left for the next run)
 //     sent     push messages FCM accepted (one per due habit per device)
 //     skipped  habits with a reminder time in the window that got no reminder because the logs show them done:
 //              target hit for the day or week, or a weekly habit already logged today. Not counted: habits
 //              without a time in the window, archived, deleted or invalid habits, habits over the per-user
 //              limit, and due habits of a user who has no device
-//     failed   users whose data could not be read + pushes that failed + device records that could not be deleted
+//     failed   users whose data could not be read + pushes that failed or were not sent for lack of time + device
+//              records that could not be deleted; 1 for a bookmark ahead of the clock or reading out of time
 //     removed  device records deleted because FCM reported them as unregistered
 //
 //   Failures:
@@ -33,6 +37,10 @@
 //       this slot; the others are still served. If no user at all could be read (a Firestore outage, or the
 //       only user), nothing is claimed, so the next run catches the slot up.
 //     - A lost claim (PreconditionError) is a success: every count is 0, the other run reports its own.
+//     - The bookmark is more than one slot ahead of the slot this run would take (a wrong clock, a manual edit):
+//       reminders would silently stop, so the run fails. Nothing is sent, the bookmark is not touched.
+//     - Out of time: before the claim, nothing is claimed or sent (the next run retries the slot); while sending,
+//       no further push is started and each one left over counts as failed.
 //
 // Executed directly (`node scripts/send-reminders.mjs`): builds `google` from the environment
 // (FIREBASE_SERVICE_ACCOUNT; optional FIRESTORE_EMULATOR_HOST, FCM_BASE_URL, GCLOUD_PROJECT, REMINDERS_FORCE=1),
@@ -41,13 +49,18 @@
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { readServiceAccount, createGoogle, ConfigError, GoogleError, PreconditionError } from './lib/google.mjs';
-import { planRun, dueWindows, dueHabits, reminderText, validateHabit, weekKeys, monthId } from '../shared/logic.js';
+import {
+  planRun, dueWindows, dueHabits, reminderText, validateHabit, weekKeys, monthId, SLOT_MS,
+} from '../shared/logic.js';
 
 const BOOKMARK = 'system/reminders';
-const MAX_HABITS = 100; // per user and run
+const MAX_HABIT_DOCS = 300; // habit records read per user: 50 live ones plus room for soft-deleted ones
+const MAX_HABITS = 100; // habits with a reminder time in the window considered per user and run
 const MAX_DEVICES = 10; // per user: the most recently updated ones
 const TITLE_MAX = 60;
 const BODY_MAX = 120;
+const DEADLINE_MS = 150 * 1000;
+const TIMEOUT_MS = 10 * 1000; // one HTTP request
 const DEVICE_ID = /^[A-Za-z0-9_-]{1,64}$/; // what the security rules accept as a device id
 
 const isMap = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -56,7 +69,7 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 /** '2026-11-13T09:00Z' */
 function utc(ms) {
-  const d = new Date(ms);
+  const d = new Date(Number(ms));
   return Number.isNaN(d.getTime()) ? 'an unreadable time' : `${d.toISOString().slice(0, 16)}Z`;
 }
 
@@ -80,19 +93,10 @@ function toHabit(doc) {
   return typeof doc.id === 'string' && doc.id && validateHabit(habit).length === 0 ? habit : null;
 }
 
-/** The `logs` shape of shared/logic.js, holding only whole positive counts of the given habits on the given
- *  days: whatever else a client wrote into `days` never reaches the logic. */
-function cleanLogs(daysByMonth, dayKeys, habitIds) {
-  const logs = {};
-  for (const k of dayKeys) {
-    const stored = daysByMonth[monthId(k)]?.[k];
-    if (!isMap(stored)) continue;
-    for (const id of habitIds) {
-      const n = Object.hasOwn(stored, id) ? stored[id] : 0;
-      if (Number.isSafeInteger(n) && n > 0) ((logs[monthId(k)] ??= {})[k] ??= {})[id] = n;
-    }
-  }
-  return logs;
+/** One stored month as shared/logic.js wants it: `days` must be a map and each day a map. What a count is worth
+ *  is for the shared logic to decide, so the job and the app agree on "done". */
+function monthOf(days) {
+  return Object.fromEntries(Object.entries(isMap(days) ? days : {}).filter(([, counts]) => isMap(counts)));
 }
 
 /** Reads what one user needs. Returns the messages to send and the devices to send them to. */
@@ -102,7 +106,8 @@ async function readUser(google, user, plan, stats) {
   const windows = dueWindows(plan.from, plan.slot, tz);
   if (!windows.length) return null; // no local time in the window (the hour the clocks go back): no reads
 
-  const docs = await google.listDocs(`users/${uid}/habits`);
+  const docs = await google.listDocs(`users/${uid}/habits`, { limit: MAX_HABIT_DOCS });
+  if (docs.length >= MAX_HABIT_DOCS) stats.atReadLimit += 1;
   const habits = docs.map(toHabit).filter(Boolean);
   stats.invalidHabits += docs.length - habits.length;
   // Live habits with a reminder time in the window: the same test as dueHabits, before any count is known.
@@ -111,13 +116,10 @@ async function readUser(google, user, plan, stats) {
   stats.overLimit += inWindow.size - candidates.length;
   if (!candidates.length) return null;
 
-  const dayKeys = [...new Set(windows.flatMap((w) => weekKeys(w.day)))];
-  const daysByMonth = {};
-  for (const month of new Set(dayKeys.map(monthId))) {
-    const days = (await google.getDoc(`users/${uid}/logs/${month}`))?.data?.days;
-    daysByMonth[month] = isMap(days) ? days : {};
+  const logs = {};
+  for (const month of new Set(windows.flatMap((w) => weekKeys(w.day)).map(monthId))) {
+    logs[month] = monthOf((await google.getDoc(`users/${uid}/logs/${month}`))?.data?.days);
   }
-  const logs = cleanLogs(daysByMonth, dayKeys, candidates.map((h) => h.id));
 
   const due = new Map(); // habit -> the latest local day it is due on
   for (const w of windows) for (const h of dueHabits(candidates, logs, w.day, w.times)) due.set(h, w.day);
@@ -143,8 +145,12 @@ async function readUser(google, user, plan, stats) {
   return { messages, devices };
 }
 
-export async function run({ google, now, log = () => {}, force = false }) {
+export async function run({
+  google, now, log = () => {}, force = false, deadlineMs = DEADLINE_MS, clock = () => performance.now(),
+}) {
   if (!Number.isFinite(now)) throw new TypeError('run() needs `now` in ms since epoch');
+  const started = clock();
+  const late = () => clock() - started > deadlineMs;
   const result = { slot: null, sent: 0, skipped: 0, failed: 0, removed: 0 };
   const failures = new Map(); // what failed -> how often, so a bad run still logs only a few lines
   const fail = (what, err) => {
@@ -169,7 +175,14 @@ export async function run({ google, now, log = () => {}, force = false }) {
     const lastSlot = bookmark?.data?.lastSlot;
     plan = planRun(lastSlot, now);
     if (!plan) {
-      log(`Nothing to do: the newest claimed slot is ${utc(lastSlot)}.`);
+      const current = planRun(null, now).slot;
+      if (lastSlot > current + SLOT_MS) {
+        log(`The bookmark (${utc(lastSlot)}) is ahead of the clock (slot ${utc(current)}): reminders are on hold `
+          + 'until it is corrected. Nothing was sent, the bookmark is unchanged.');
+        result.failed = 1;
+      } else {
+        log(`Nothing to do: the newest claimed slot is ${utc(lastSlot)}.`);
+      }
       return result;
     }
   }
@@ -177,10 +190,13 @@ export async function run({ google, now, log = () => {}, force = false }) {
   // 2. Read everything
   let users;
   try { users = await google.listDocs('users'); } catch (err) { throw stop('listing the users', err); }
-  const stats = { due: 0, skipped: 0, devices: 0, noDevice: 0, invalidHabits: 0, badDevices: 0, overLimit: 0 };
+  const stats = {
+    due: 0, skipped: 0, devices: 0, noDevice: 0, invalidHabits: 0, badDevices: 0, overLimit: 0, atReadLimit: 0,
+  };
   const jobs = [];
   let unread = 0;
   for (const user of users) {
+    if (late()) break;
     try {
       const job = await readUser(google, user, plan, stats);
       if (job) jobs.push(job);
@@ -198,9 +214,20 @@ export async function run({ google, now, log = () => {}, force = false }) {
   log(`Slot ${utc(plan.slot)}, window ${(plan.slot - plan.from) / 60000} min: ${plural(users.length, 'user')}, `
     + `${plural(stats.due, 'reminder')} due, ${stats.skipped} skipped (already done), `
     + `${plural(stats.devices, 'device')}${extra}.`);
+  if (stats.atReadLimit) {
+    log(`Habit records: ${plural(stats.atReadLimit, 'user')} reached the read limit of ${MAX_HABIT_DOCS}; `
+      + 'anything beyond it was not looked at.');
+  }
+  const unclaimed = 'the slot is not claimed, so the next run retries it. Nothing was sent.';
+  if (late()) {
+    logFailures();
+    log(`Time limit (${deadlineMs / 1000} s) reached while reading: ${unclaimed}`);
+    result.failed += 1;
+    return result;
+  }
   if (unread && unread === users.length) {
     logFailures();
-    log('No user could be read: the slot is not claimed, so the next run retries it. Nothing was sent.');
+    log(`No user could be read: ${unclaimed}`);
     return result;
   }
 
@@ -221,11 +248,13 @@ export async function run({ google, now, log = () => {}, force = false }) {
   result.skipped = stats.skipped;
 
   // 4. Send
+  let unsent = 0;
   for (const { messages, devices } of jobs) {
     const gone = new Set();
     for (const data of messages) {
       for (const fid of devices) {
         if (gone.has(fid)) continue;
+        if (unsent || late()) { unsent += 1; continue; } // out of time: nothing more is started
         let outcome;
         try { outcome = await google.sendPush(fid, data); } catch (err) { fail('a push', err); continue; }
         if (outcome !== 'unregistered') { result.sent += 1; continue; }
@@ -238,6 +267,10 @@ export async function run({ google, now, log = () => {}, force = false }) {
     }
   }
   logFailures();
+  if (unsent) {
+    result.failed += unsent;
+    log(`Time limit (${deadlineMs / 1000} s) reached while sending. Pushes not sent: ${unsent}.`);
+  }
   return result;
 }
 
@@ -247,7 +280,7 @@ async function main(env = process.env, print = console.log) {
   try {
     google = createGoogle({
       serviceAccount: readServiceAccount(env), projectId: env.GCLOUD_PROJECT,
-      firestoreEmulatorHost: env.FIRESTORE_EMULATOR_HOST, fcmBaseUrl: env.FCM_BASE_URL,
+      firestoreEmulatorHost: env.FIRESTORE_EMULATOR_HOST, fcmBaseUrl: env.FCM_BASE_URL, timeoutMs: TIMEOUT_MS,
     });
   } catch (err) {
     print(`Reminder job cannot start: ${describe(err)}.`);
