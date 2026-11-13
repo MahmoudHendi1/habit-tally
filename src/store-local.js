@@ -18,6 +18,9 @@ import { sampleData } from './sample-data.js';
 export const STORAGE_KEY = 'habit-tally:v1';
 const DEMO_USER = { uid: 'demo', email: 'demo@habit-tally.example' };
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Ids read back from storage become object keys in the logs, so only plain ones are let in, and none
+// that every object already has ('constructor', 'toString').
+const isSafeId = (/** @type {unknown} */ id) => typeof id === 'string' && /^[A-Za-z0-9]+$/.test(id) && !(id in Object.prototype);
 const ID_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 
 /** 20 random characters of [A-Za-z0-9], the same form as the ids of the real backend. */
@@ -74,13 +77,15 @@ const isSaved = (x) => isObject(x) && x.v === 1 && typeof x.signedIn === 'boolea
   && isObject(x.user) && isText(x.user.uid) && isText(x.user.email) && isText(x.user.tz)
   && Array.isArray(x.habits) && x.habits.every(isHabit) && isLogs(x.logs);
 
-/** The saved data, or null when there is none or any part of it is damaged. Never throws.
+/** The saved data, or null when there is none or any part of it is damaged. Habits with an unsafe id
+ *  are left out. Never throws.
  *  @param {KeyValue} storage @returns {Saved | null} */
 function readSaved(storage) {
   try {
     const found = JSON.parse(storage.getItem(STORAGE_KEY) ?? 'null');
     if (!isSaved(found)) return null;
-    return { signedIn: found.signedIn, user: found.user, habits: found.habits, logs: found.logs };
+    const habits = found.habits.filter((/** @type {Habit} */ h) => isSafeId(h.id));
+    return { signedIn: found.signedIn, user: found.user, habits, logs: found.logs };
   } catch {
     return null;
   }
@@ -135,6 +140,11 @@ export function createLocalStore({ storage = defaultStorage(), now = () => new D
   /** @param {string} id @param {Partial<Habit>} patch */
   const patchHabit = (id, patch) => saved.habits.map((h) => (h.id === id ? { ...h, ...patch, updatedAt: now().getTime() } : h));
 
+  function requireRoom() {
+    if (state.habits.length < LIMITS.habitsMax) return;
+    throw new StoreError('too-many', `You can have at most ${LIMITS.habitsMax} habits. Delete one to add another.`);
+  }
+
   /** @param {any} input @returns {string} */
   function saveHabit(input) {
     if (!saved.signedIn) throw new StoreError('not-ready', 'Sign in to change habits.');
@@ -146,35 +156,40 @@ export function createLocalStore({ storage = defaultStorage(), now = () => new D
       commit({ ...saved, habits: patchHabit(input.id, fields) });
       return input.id;
     }
-    if (state.habits.length >= LIMITS.habitsMax) {
-      throw new StoreError('too-many', `You can have at most ${LIMITS.habitsMax} habits. Delete one to add another.`);
-    }
+    requireRoom();
     // Deleted habits count too, so a restored habit never shares its place with a newer one.
-    const order = Math.max(0, ...saved.habits.map((h) => h.order)) + 1;
+    const order = saved.habits.reduce((highest, h) => Math.max(highest, h.order), 0) + 1;
     /** @type {Habit} */
     const habit = { id: newId(), ...fields, created: today(), archived: false, deletedAt: null, order, updatedAt: now().getTime() };
     commit({ ...saved, habits: [...saved.habits, habit] });
     return habit.id;
   }
 
-  /** Soft delete (a time) or restore (null). Unknown ids and repeats are ignored.
-   *  @param {string} id @param {number | null} deletedAt */
-  function setDeleted(id, deletedAt) {
-    const habit = saved.habits.find((h) => h.id === id);
-    if (!saved.signedIn || !habit || (habit.deletedAt === null) === (deletedAt === null)) return;
-    commit({ ...saved, habits: patchHabit(id, { deletedAt }) });
+  /** Soft delete. Unknown and already deleted ids are ignored.
+   *  @param {string} id */
+  function deleteHabit(id) {
+    if (!state.habits.some((h) => h.id === id)) return; // empty when signed out; deleted habits are not in it
+    commit({ ...saved, habits: patchHabit(id, { deletedAt: now().getTime() }) });
   }
 
-  /** @param {string} dayKey @param {string} habitId @param {number} delta */
+  /** Undo a delete. Unknown ids and habits that are not deleted are ignored.
+   *  @param {string} id */
+  function restoreHabit(id) {
+    if (!saved.signedIn || !saved.habits.some((h) => h.id === id && h.deletedAt)) return;
+    requireRoom();
+    commit({ ...saved, habits: patchHabit(id, { deletedAt: null }) });
+  }
+
+  /** Never touches the habit: a count before its start date is found by startDay() in shared/logic.js.
+   *  @param {string} dayKey @param {string} habitId @param {number} delta */
   function addCount(dayKey, habitId, delta) {
-    const habit = state.habits.find((h) => h.id === habitId); // empty when signed out; deleted habits are not in it
-    if (!habit || (delta !== 1 && delta !== -1) || !recentDays(today()).includes(dayKey)) return;
+    const known = state.habits.some((h) => h.id === habitId);
+    if (!known || (delta !== 1 && delta !== -1) || !recentDays(today()).includes(dayKey)) return;
     const count = countOn(saved.logs, habitId, dayKey) + delta;
     if (count < 0) return;
     const days = saved.logs[monthId(dayKey)] ?? {};
     const logs = { ...saved.logs, [monthId(dayKey)]: { ...days, [dayKey]: { ...days[dayKey], [habitId]: count } } };
-    const habits = dayKey < habit.created ? patchHabit(habitId, { created: dayKey }) : saved.habits;
-    commit({ ...saved, habits, logs });
+    commit({ ...saved, logs });
   }
 
   /** @param {string} zone */
@@ -217,10 +232,8 @@ export function createLocalStore({ storage = defaultStorage(), now = () => new D
     },
     retry() {},
     saveHabit,
-    /** @param {string} id */
-    deleteHabit: (id) => setDeleted(id, now().getTime()),
-    /** @param {string} id */
-    restoreHabit: (id) => setDeleted(id, null),
+    deleteHabit,
+    restoreHabit,
     addCount,
     setTimeZone,
     /** @param {string} _fid */

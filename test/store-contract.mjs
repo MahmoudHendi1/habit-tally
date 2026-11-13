@@ -4,26 +4,30 @@
 // optimistic and must show before the call returns, and again after `settle()`, because a backend that
 // confirms a little later must not take the change back.
 import assert from 'node:assert/strict';
-import { LIMITS, addDays, countOn, monthId } from '../shared/logic.js';
+import { LIMITS, addDays, countOn, monthId, startDay, stats } from '../shared/logic.js';
 import { StoreError } from '../src/store.js';
 
 const WATER = { name: 'Water', period: 'day', target: 3, unit: 'glasses', times: ['09:00'] };
 const shortWait = () => new Promise((resolve) => setTimeout(resolve, 5));
 const anotherZone = (store) => (store.getState().user.tz === 'Africa/Cairo' ? 'Asia/Tokyo' : 'Africa/Cairo');
+const UNKNOWN_ID = 'noSuchHabit000000000';
 const fails = (code) => (err) => err instanceof StoreError && err.code === code && err.message.length > 0;
 
 /**
  * @param {object} options
- * @param {(name: string, fn: () => Promise<void>) => unknown} options.test `test` from node:test
- * @param {() => Promise<{ store: any, today: string, cleanup?: () => unknown, settle?: () => Promise<unknown> }>} options.makeStore
+ * @param {(name: string, fn: (t: any) => Promise<void>) => unknown} options.test `test` from node:test
+ * @param {() => Promise<{ store: any, today: string, cleanup?: () => unknown, settle?: () => Promise<unknown>,
+ *   advance?: (ms: number) => void }>} options.makeStore
  *   Called once per test. Resolves with a store that is already `ready` on a fresh, empty account, the day
- *   that store calls today ('YYYY-MM-DD'), an optional `cleanup` run after the test, and an optional `settle`
- *   that resolves once the backend has confirmed the writes so far (default: wait 5 ms).
+ *   that store calls today ('YYYY-MM-DD'), an optional `cleanup` run after the test, an optional `settle`
+ *   that resolves once the backend has confirmed the writes so far (default: wait 5 ms), and an optional
+ *   `advance` that moves the store's clock (its `now`) forward by `ms`. Without `advance` the one test that
+ *   needs it is reported as skipped. The suite advances by a few seconds at most.
  * @param {string} [options.label] put in front of every test name
  */
 export function runStoreContract({ test, makeStore, label = 'store' }) {
-  const check = (name, body) => test(`${label} contract: ${name}`, async () => {
-    const { store, today, cleanup, settle = shortWait } = await makeStore();
+  const check = (name, body) => test(`${label} contract: ${name}`, async (t) => {
+    const { store, today, cleanup, settle = shortWait, advance } = await makeStore();
     const holds = async (expectation) => {
       expectation();
       await settle();
@@ -32,7 +36,7 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     const habit = (id) => store.getState().habits.find((h) => h.id === id);
     const count = (id, day = today) => countOn(store.getState().logs, id, day);
     try {
-      await body({ store, today, holds, settle, habit, count });
+      await body({ store, today, holds, settle, habit, count, advance, t });
       await settle();
       assert.equal(store.getState().lastError, null, 'the backend refused none of these writes');
     } finally {
@@ -80,6 +84,39 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     });
   });
 
+  check('saveHabit: an unknown id throws "not-found"; a new habit takes only the editor fields from the input', async ({ store, today, holds, habit }) => {
+    assert.throws(() => store.saveHabit({ ...WATER, id: UNKNOWN_ID }), fails('not-found'));
+    const id = store.saveHabit({ ...WATER, created: '2001-01-01', order: 99, archived: true, deletedAt: 5, updatedAt: 5, colour: 'red' });
+    await holds(() => {
+      assert.deepEqual(store.getState().habits.map((h) => h.id), [id]);
+      const { updatedAt, ...rest } = habit(id);
+      assert.deepEqual(rest, { id, ...WATER, created: today, archived: false, deletedAt: null, order: 1 });
+      assert.ok(updatedAt > 5);
+    });
+  });
+
+  check('updatedAt is set again on every save', async ({ store, holds, habit, advance, t }) => {
+    if (!advance) return t.skip('makeStore returned no advance(ms), so the clock cannot be moved');
+    const id = store.saveHabit(WATER);
+    const saved = [habit(id).updatedAt];
+    for (const name of ['Tea', 'Coffee']) {
+      advance(1000);
+      store.saveHabit({ ...WATER, id, name });
+      saved.push(habit(id).updatedAt);
+    }
+    assert.ok(saved[1] - saved[0] >= 1000 && saved[2] - saved[1] >= 1000, `updatedAt after each save: ${saved}`);
+    await holds(() => assert.equal(habit(id).updatedAt, saved[2]));
+  });
+
+  check('order: delete, create, restore gives three different orders and the restored habit keeps its own', async ({ store, holds }) => {
+    const first = store.saveHabit(WATER);
+    const deleted = store.saveHabit({ ...WATER, name: 'Deleted, then restored' });
+    store.deleteHabit(deleted);
+    const created = store.saveHabit({ ...WATER, name: 'Created meanwhile' });
+    store.restoreHabit(deleted);
+    await holds(() => assert.deepEqual(store.getState().habits.map((h) => [h.id, h.order]), [[first, 1], [deleted, 2], [created, 3]]));
+  });
+
   check('delete hides the habit and keeps its counts; restore brings it back', async ({ store, today, holds, habit, count }) => {
     const id = store.saveHabit(WATER);
     const other = store.saveHabit({ ...WATER, name: 'Other' });
@@ -123,17 +160,73 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     await holds(() => assert.deepEqual([count(id, weekAgo), count(id, today)], [1, 0]));
   });
 
-  check('a log before the start date moves the start date back', async ({ store, today, holds, habit }) => {
+  check('a count before the start date leaves the habit alone; startDay() and stats() pick it up', async ({ store, today, holds, habit }) => {
     const id = store.saveHabit(WATER);
-    const [threeBack, oneBack] = [addDays(today, -3), addDays(today, -1)];
+    const [before, threeBack] = [habit(id), addDays(today, -3)];
+    const firstDayAndPeriods = () => [startDay(habit(id), store.getState().logs), stats(habit(id), store.getState().logs, today).periods];
     store.addCount(today, id, 1);
-    await holds(() => assert.equal(habit(id).created, today));
+    await holds(() => assert.deepEqual([habit(id), ...firstDayAndPeriods()], [before, today, 1]));
     store.addCount(threeBack, id, 1);
-    await holds(() => assert.equal(habit(id).created, threeBack));
-    store.addCount(oneBack, id, 1);
-    await holds(() => assert.equal(habit(id).created, threeBack, 'a later day does not move it forward'));
+    await holds(() => assert.deepEqual([habit(id), ...firstDayAndPeriods()], [before, threeBack, 4]));
     store.addCount(threeBack, id, -1);
-    await holds(() => assert.equal(habit(id).created, threeBack, 'taking the log back does not move it either'));
+    await holds(() => assert.deepEqual([habit(id), ...firstDayAndPeriods()], [before, today, 1]));
+  });
+
+  check('five quick taps count 5 at once, and no listener ever sees the count go down', async ({ store, today, holds, settle, count }) => {
+    const id = store.saveHabit(WATER);
+    await settle();
+    const seen = [];
+    store.subscribe((state) => seen.push(countOn(state.logs, id, today)));
+    for (let taps = 1; taps <= 5; taps++) {
+      store.addCount(today, id, 1);
+      assert.equal(count(id), taps);
+    }
+    await holds(() => assert.equal(count(id), 5));
+    assert.deepEqual(seen, [...seen].sort((a, b) => a - b), `counts seen, in order: ${seen}`);
+    assert.deepEqual([seen[0], seen.at(-1)], [0, 5]);
+  });
+
+  check('quick save, edit, delete, restore: no listener ever sees an earlier step come back', async ({ store, holds, habit }) => {
+    const seen = [];
+    store.subscribe((state) => seen.push(state));
+    const id = store.saveHabit(WATER);
+    store.saveHabit({ ...WATER, id, name: 'Tea' });
+    store.deleteHabit(id);
+    store.restoreHabit(id);
+    await holds(() => assert.equal(habit(id)?.name, 'Tea'));
+    const names = seen.map((state) => state.habits.find((h) => h.id === id)?.name ?? null);
+    const steps = names.filter((name, i) => name !== names[i - 1]);
+    assert.deepEqual(steps, [null, 'Water', 'Tea', null, 'Tea'], `the habit as listeners saw it: ${names}`);
+  });
+
+  check('ignored calls change nothing and tell no listener', async ({ store, today, settle }) => {
+    const id = store.saveHabit(WATER);
+    const gone = store.saveHabit({ ...WATER, name: 'Gone' });
+    store.addCount(today, gone, 1);
+    store.deleteHabit(gone);
+    await settle();
+    let calls = 0;
+    store.subscribe(() => calls++);
+    const before = store.getState();
+    const ignored = {
+      'delta 0': () => store.addCount(today, id, 0),
+      'delta 2': () => store.addCount(today, id, 2),
+      '-1 at 0': () => store.addCount(today, id, -1),
+      'a day that is not a day key': () => store.addCount('yesterday', id, 1),
+      'a day key in another form': () => store.addCount(today.replaceAll('-', '/'), id, 1),
+      'tomorrow': () => store.addCount(addDays(today, 1), id, 1),
+      'a count for an unknown habit': () => store.addCount(today, UNKNOWN_ID, 1),
+      'a count for a deleted habit': () => store.addCount(today, gone, 1),
+      'deleting an unknown habit': () => store.deleteHabit(UNKNOWN_ID),
+      'restoring an unknown habit': () => store.restoreHabit(UNKNOWN_ID),
+    };
+    for (const [name, call] of Object.entries(ignored)) {
+      call();
+      assert.equal(store.getState(), before, `${name}: the state object is the same`);
+      assert.equal(calls, 1, `${name}: no listener call`);
+    }
+    await settle();
+    assert.deepEqual(store.getState(), before);
   });
 
   check('setTimeZone changes only the zone of the user', async ({ store, holds }) => {
@@ -192,7 +285,7 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     });
   });
 
-  check(`at most ${LIMITS.habitsMax} live habits: one more throws StoreError "too-many"`, async ({ store, holds }) => {
+  check(`at most ${LIMITS.habitsMax} live habits: one more, created or restored, throws StoreError "too-many"`, async ({ store, holds }) => {
     const ids = Array.from({ length: LIMITS.habitsMax }, (_, i) => store.saveHabit({ ...WATER, name: `Habit ${i + 1}` }));
     assert.equal(new Set(ids).size, LIMITS.habitsMax);
     assert.throws(() => store.saveHabit(WATER), fails('too-many'));
@@ -203,6 +296,14 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     await holds(() => {
       const names = store.getState().habits.map((h) => h.name);
       assert.deepEqual([names.length, names[0], names.at(-1)], [LIMITS.habitsMax, 'Habit 2', 'Fits again']);
+    });
+    assert.throws(() => store.restoreHabit(ids[0]), fails('too-many'));
+    await holds(() => assert.deepEqual(store.getState().habits.map((h) => h.id).slice(0, 2), [ids[1], ids[2]]));
+    store.deleteHabit(ids[1]);
+    store.restoreHabit(ids[0]);
+    await holds(() => {
+      const live = store.getState().habits.map((h) => h.id);
+      assert.deepEqual([live.length, live[0], live[1]], [LIMITS.habitsMax, ids[0], ids[2]]);
     });
   });
 
