@@ -192,7 +192,7 @@ Draft 1 was reviewed independently (`docs/review-architecture.md`: 2 blockers, 6
 | 5 | Exact `HH:MM` match drops reminders in some zones and at DST | **Accepted.** Local-window matching |
 | 6 | Zone list and per-habit zone copy | **Accepted.** Removed; the job scans; zone changes need a yes |
 | 7 | One over-privileged key | **Accepted, and simplified.** One least-privilege key for the job; no deploy key at all (D11) |
-| 8 | Actions budget; open sign-up | **Accepted.** The repo is public, so minutes are free; keepalive for the 60-day rule. Invite list in the rules (D5b), pending the owner's confirmation |
+| 8 | Actions budget; open sign-up | **Accepted.** The repo is public, so minutes are free; keepalive for the 60-day rule. Invite list in the rules (D5b), confirmed by the owner |
 | 9 | Hard delete | **Accepted.** Soft delete with undo; full-shape rules |
 | 10 | Caps, back-fill, undo clamp | **Accepted.** 48 times; `created` moves back; clamped. Target edits rewriting history: accepted for v1 |
 | 11 | Service worker details | **Accepted.** All four points |
