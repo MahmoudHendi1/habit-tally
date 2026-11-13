@@ -106,7 +106,7 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
 | `retry(): void` | In `waiting`: checks again whether the account is now allowed |
 | `saveHabit(input): string` | `input` is editor data, with `id` to edit or without to create. The store runs `cleanHabit` and `validateHabit`; on problems it throws `StoreError('invalid', problems[0], problems)`. On create it sets `id`, `created` (device today), `order`, `archived: false`, `deletedAt: null`. Editing never changes `id`, `created`, `order`. Creating beyond `LIMITS.habitsMax` live habits throws `StoreError('too-many', ...)`. Returns the id |
 | `deleteHabit(id): void` | Soft delete: sets `deletedAt`. The habit leaves `state.habits`; its counts stay in `logs` |
-| `restoreHabit(id): void` | Clears `deletedAt` (Undo) |
+| `restoreHabit(id): void` | Clears `deletedAt` (Undo). Throws `StoreError('too-many', ...)` if that would exceed `LIMITS.habitsMax` live habits |
 | `addCount(dayKey, habitId, delta): void` | `delta` is `+1` or `-1`. Ignored when `delta` is `-1` and `countOn` is 0, when `dayKey` is in the future, or older than `LIMITS.backDays` days before today. Never changes the habit itself: a count on a day before `created` is picked up by `startDay()` |
 | `setTimeZone(tz): void` | Changes `user.tz` (only called after the person says yes) |
 | `saveDevice(fid): Promise<void>` | Writes `devices/{fid}` for the signed-in user. Demo: resolves, does nothing |
@@ -142,10 +142,11 @@ The message is a plain sentence the UI can show as is.
 
 ### Demo store
 
-- Starts **signed in** as `demo@habit-tally.example` with no habits; with `sample: true` (from `?demo=sample`) and
+- On the first visit (empty storage) it starts **signed in** as `demo@habit-tally.example` with no habits; with `sample: true` (from `?demo=sample`) and
   empty storage it loads the sample fixture (16 weeks, one daily and one weekly habit).
 - Sign-out shows the sign-in screen and is remembered across reloads; any well-formed email with a password of 6 or more characters signs in or up.
-  There is one data set per browser, whatever the email.
+  There is one data set per browser, whatever the email. Two demo tabs do not see each other's changes until
+  reload (accepted demo limit).
 - Everything is kept in `storage` (default `localStorage`) under the single key `habit-tally:v1`. Missing or
   damaged data starts clean without an error.
 
@@ -264,6 +265,13 @@ nothing". A demo build leaves Firebase chunks out of `files`. Service worker che
 - System font stack; no request to any other origin; colours as CSS custom properties with light and dark values.
 - Touch targets at least 44 px; no sideways scrolling at 360 px wide.
 - Screens never talk to Firebase; they use the store and push interfaces only.
+- How a screen plugs into the shell (exports, `ctx`, re-rendering with `patch()`, sheets, toasts, the CSS class and
+  colour-token vocabulary) is defined by the header comment of `src/ui/common.js`. Screen CSS files are linked
+  from `index.html`, not imported by the modules, so the modules can be loaded by Node tests.
+- `index.html` belongs to the shell (A2). The install package (A6) may edit only the block marked for the
+  manifest and icon links.
+- In demo and emulator builds the shell exposes the `ctx` object as `window.habitTally` for browser tests; it is
+  absent in the real build.
 
 ## 11. Time-zone prompt
 
@@ -273,4 +281,5 @@ device zone (`Intl.DateTimeFormat().resolvedOptions().timeZone`) differs from `s
 `store.setTimeZone(deviceZone)`. Keep stores the declined zone in `localStorage['habit-tally:tz-declined']`, and
 the notice stays away until the device reports yet another zone. Settings always shows the reminder zone with a
 button to switch to the device's zone. The shell asks `src/ui/settings.js` for the notice through an exported
-`notice(state, ctx): string` (empty string = nothing to show).
+`notice(state, ctx): string` (empty string = nothing to show) and attaches its clicks once at start-up through an
+exported `bindNotice(root, ctx)`.

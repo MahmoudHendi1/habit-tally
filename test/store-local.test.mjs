@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { createLocalStore, STORAGE_KEY } from '../src/store-local.js';
 import { sampleData, SAMPLE_WEEKS } from '../src/sample-data.js';
 import { StoreError } from '../src/store.js';
-import { addDays, countOn, keyOf, stats, streak, validateHabit, weekStart } from '../shared/logic.js';
+import { addDays, countOn, keyOf, startDay, stats, streak, validateHabit, weekStart } from '../shared/logic.js';
 import { runStoreContract } from './store-contract.mjs';
 
 // A Tuesday early in the month, so "7 days back" crosses a week and a month boundary.
@@ -21,7 +21,14 @@ const open = (storage = fakeStorage(), options = {}) =>
   createLocalStore({ storage, now: noonOn(TODAY), tz: 'Europe/London', ...options });
 const rejects = (promise, code) => assert.rejects(promise, (err) => err instanceof StoreError && err.code === code && err.message.length > 0);
 
-runStoreContract({ test, label: 'demo store', makeStore: async () => ({ store: open(), today: TODAY }) });
+runStoreContract({
+  test,
+  label: 'demo store',
+  makeStore: async () => {
+    let clock = noonOn(TODAY)().getTime();
+    return { store: open(fakeStorage(), { now: () => new Date(clock) }), today: TODAY, advance: (ms) => { clock += ms; } };
+  },
+});
 
 test('demo store: starts signed in as the demo user, in the given zone', () => {
   const state = open().getState();
@@ -36,7 +43,7 @@ test('demo store: a new store on the same storage sees the earlier data', () => 
   const kept = first.saveHabit(WATER);
   const deleted = first.saveHabit({ ...WATER, name: 'Gym', period: 'week' });
   first.addCount(TODAY, kept, 1);
-  first.addCount(addDays(TODAY, -7), kept, 1); // 27 October: another month, and it moves the start date
+  first.addCount(addDays(TODAY, -7), kept, 1); // 27 October: another month, and before the start date
   first.addCount(TODAY, deleted, 1);
   first.deleteHabit(deleted);
   first.setTimeZone('Africa/Cairo');
@@ -45,7 +52,8 @@ test('demo store: a new store on the same storage sees the earlier data', () => 
 
   const second = open(storage, { tz: 'Asia/Tokyo', sample: true });
   assert.deepEqual(second.getState(), first.getState());
-  assert.deepEqual(second.getState().habits.map((h) => [h.id, h.created]), [[kept, '2026-10-27']]);
+  const { habits, logs } = second.getState();
+  assert.deepEqual(habits.map((h) => [h.id, h.created, startDay(h, logs)]), [[kept, TODAY, '2026-10-27']]);
   assert.equal(second.getState().user.tz, 'Africa/Cairo');
   second.restoreHabit(deleted); // deleted habits are kept too, so Undo works after a reload
   assert.deepEqual(second.getState().habits.map((h) => h.id), [kept, deleted]);
@@ -70,6 +78,24 @@ test('demo store: missing or damaged storage starts clean without an error', () 
     assert.deepEqual(store.getState().habits.map((h) => h.id), [id]);
     assert.equal(store.getState().lastError, null);
   }
+});
+
+test('demo store: stored habits with an unsafe id are left out, the rest is kept', () => {
+  const ids = ['constructor', '__proto__', 'toString', 'a.b', 'two words', 'good1', 'good2'];
+  const habits = ids.map((id, i) => ({ id, ...WATER, created: TODAY, archived: false, deletedAt: null, order: i, updatedAt: 1 }));
+  const saved = { v: 1, signedIn: true, user: { uid: 'demo', email: 'a@b.co', tz: 'UTC' }, habits, logs: { '2026-11': { [TODAY]: { good1: 2 } } } };
+  const store = open(fakeStorage({ [STORAGE_KEY]: JSON.stringify(saved) }));
+  assert.deepEqual(store.getState().habits.map((h) => h.id), ['good1', 'good2']);
+  assert.deepEqual([countOn(store.getState().logs, 'good1', TODAY), store.getState().user.email], [2, 'a@b.co']);
+});
+
+test('demo store: a very long stored list of deleted habits does not break adding one', () => {
+  const habits = Array.from({ length: 150_000 }, (_, i) => (
+    { id: `old${i}`, ...WATER, created: TODAY, archived: false, deletedAt: 5, order: i + 1, updatedAt: 1 }));
+  const text = JSON.stringify({ v: 1, signedIn: true, user: { uid: 'demo', email: 'a@b.co', tz: 'UTC' }, habits, logs: {} });
+  const store = open({ getItem: () => text, setItem: () => {}, removeItem: () => {} });
+  store.saveHabit(WATER); // spreading 150 000 orders into Math.max would throw a RangeError here
+  assert.deepEqual(store.getState().habits.map((h) => h.order), [150_001]);
 });
 
 test('demo store: storage that refuses writes sets lastError and keeps working in memory', () => {
@@ -124,21 +150,28 @@ test('demo store: sign-in errors have the contract codes and leave the state alo
   assert.equal(store.getState(), before);
 });
 
-test('demo store: while signed out, nothing can be changed', async () => {
+test('demo store: while signed out, saveHabit throws "not-ready" and the other changes are ignored', async () => {
   const storage = fakeStorage();
   const store = open(storage);
   const id = store.saveHabit(WATER);
+  const gone = store.saveHabit({ ...WATER, name: 'Gone' });
+  store.deleteHabit(gone);
   await store.signOut();
   const [before, stored] = [store.getState(), storage.map.get(STORAGE_KEY)];
-  assert.throws(() => store.saveHabit(WATER), (err) => err instanceof StoreError && err.code === 'not-ready');
+  for (const input of [WATER, { ...WATER, id }, { ...WATER, name: '' }]) {
+    assert.throws(() => store.saveHabit(input), (err) => err instanceof StoreError && err.code === 'not-ready' && err.message.length > 0);
+  }
   store.addCount(TODAY, id, 1);
   store.deleteHabit(id);
+  store.restoreHabit(gone);
   store.setTimeZone('Africa/Cairo');
   assert.equal(store.getState(), before);
   assert.equal(storage.map.get(STORAGE_KEY), stored);
+  await store.signIn('a@b.co', 'secret');
+  assert.deepEqual(store.getState().habits.map((h) => h.id), [id], 'nothing happened behind the sign-in screen');
 });
 
-test('demo store: calls that must be ignored change nothing and tell nobody', async () => {
+test('demo store: more calls that are ignored, beyond those in the shared contract', async () => {
   const store = open();
   const id = store.saveHabit(WATER);
   const gone = store.saveHabit({ ...WATER, name: 'Gone' });
@@ -146,18 +179,14 @@ test('demo store: calls that must be ignored change nothing and tell nobody', as
   let calls = 0;
   store.subscribe(() => calls++);
   const before = store.getState();
-  store.addCount(TODAY, id, -1);
-  for (const delta of [0, 2, -2, '1', undefined]) store.addCount(TODAY, id, delta);
-  for (const day of [addDays(TODAY, 1), addDays(TODAY, -8), '2026-11-3', 'today', '', undefined]) store.addCount(day, id, 1);
-  for (const habitId of ['missing', gone, undefined]) store.addCount(TODAY, habitId, 1);
+  for (const delta of ['1', -2, undefined]) store.addCount(TODAY, id, delta);
+  for (const day of [addDays(TODAY, -8), '2026-11-3', '', undefined]) store.addCount(day, id, 1);
   for (const zone of ['Mars/Olympus', '', undefined, 'Europe/London']) store.setTimeZone(zone);
-  store.deleteHabit('missing');
-  store.deleteHabit(gone);
-  store.restoreHabit(id);
+  store.deleteHabit(gone); // already deleted
+  store.restoreHabit(id); // not deleted
   store.retry();
   await store.saveDevice('fid');
   await store.removeDevice('fid');
-  assert.throws(() => store.saveHabit({ ...WATER, id: 'missing' }), (err) => err instanceof StoreError && err.code === 'not-found');
   assert.throws(() => store.saveHabit(null), (err) => err instanceof StoreError && err.code === 'invalid');
   assert.equal(store.getState(), before);
   assert.equal(calls, 1);
