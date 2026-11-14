@@ -3,6 +3,7 @@
 import { after, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { matchesGlob } from 'node:path';
 import { assertFails, assertSucceeds, initializeTestEnvironment } from '@firebase/rules-unit-testing';
 import {
   collection, collectionGroup, deleteDoc, doc, getDoc, getDocs, increment, query, setDoc, setLogLevel, Timestamp,
@@ -169,6 +170,7 @@ describe('3. habits', () => {
     'a non-integer target': { target: 2.5 },
     'a target that is text': { target: '8' },
     'an empty name': { name: '' },
+    'a name of only spaces': { name: '   ' },
     'a name of 61 characters': { name: 'x'.repeat(61) },
     'a name that is not text': { name: 8 },
     'a name that is a list': { name: ['Drink water'] },
@@ -260,6 +262,17 @@ describe('4. logs and the account record', () => {
     assert.deepEqual(await stored(`users/alice/logs/${MONTH}`), { days });
   });
 
+  test('a month of 31 days is allowed; a 32nd key in days is refused', async () => {
+    const days = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`2026-12-${String(i + 1).padStart(2, '0')}`,
+      { [HABIT]: 1 }]));
+    await assertFails(setDoc(log('2026-12'), { days: days(32) }));
+    await assertSucceeds(setDoc(log('2026-12'), { days: days(31) }));
+    await assertSucceeds(tap(alice, 'alice', '2026-12-31'));
+    await assertFails(tap(alice, 'alice', '2026-12-32'));
+    await assertFails(setDoc(log('2026-12'), { days: { junk: { [HABIT]: 1 } } }, { merge: true }));
+    assert.deepEqual(await stored('users/alice/logs/2026-12'), { days: { ...days(31), '2026-12-31': { [HABIT]: 2 } } });
+  });
+
   test('refused: days that is not a map, and a month id that is not YYYY-MM', async () => {
     await assertFails(setDoc(log(), { days: 3 }));
     await assertFails(setDoc(log(), { days: ['2026-11-13'] }));
@@ -328,6 +341,16 @@ describe('5. devices', () => {
     await assertFails(getDocs(query(collection(alice, 'devices'), where('uid', '==', 'alice'))));
   });
 
+  test('a device id is 1 to 64 letters, digits, _ or -', async () => {
+    for (const fid of ['dK3_pX-9aB7cD1eF2gH3iJ', 'a', 'a'.repeat(64)]) {
+      await named(fid, assertSucceeds(setDoc(dev(alice, fid), device('alice'))));
+    }
+    for (const fid of ['a'.repeat(65), 'fid 1', 'fid-\u00e9', 'fid.1', 'fid:1']) {
+      await named(fid, assertFails(setDoc(dev(alice, fid), device('alice'))));
+      assert.equal(await stored(`devices/${fid}`), null);
+    }
+  });
+
   test('refused: extra, missing or wrongly typed device fields', async () => {
     const bad = [device('alice', { token: 'abc' }), without(device('alice'), 'ua'), without(device('alice'), 'updatedAt'),
       without(device('alice'), 'uid'), device('alice', { ua: 7 }), device('alice', { ua: 'x'.repeat(501) }),
@@ -376,13 +399,27 @@ describe('7. project files', () => {
     assert.deepEqual(JSON.parse(file('firestore.indexes.json')), { indexes: [], fieldOverrides: [] });
   });
 
-  test('firebase.json serves dist and never caches /index.html or /sw.js', () => {
+  test('firebase.json serves dist; only /assets/** may be cached, every other path is no-cache', () => {
     const cfg = JSON.parse(file('firebase.json'));
     assert.equal(cfg.hosting.public, 'dist');
-    assert.deepEqual(cfg.hosting.rewrites, [{ source: '**', destination: '/index.html' }]);
-    for (const source of ['/index.html', '/sw.js']) {
-      const entry = cfg.hosting.headers.find((h) => h.source === source);
-      assert.deepEqual(entry?.headers, [{ key: 'Cache-Control', value: 'no-cache' }], source);
+    // A missing file under /assets/ must be a 404, not index.html cached for a year.
+    assert.deepEqual(cfg.hosting.rewrites, [{ source: '!/assets/**', destination: '/index.html' }]);
+    // Hosting matches header rules against the request path, before rewrites, and applies every matching
+    // rule in the order written, so for one header the last matching rule wins.
+    const cacheControl = (path) => {
+      const sent = {};
+      for (const rule of cfg.hosting.headers) {
+        if (!matchesGlob(path, rule.source.startsWith('/') ? rule.source : `/${rule.source}`)) continue;
+        for (const { key, value } of rule.headers) sent[key.toLowerCase()] = value;
+      }
+      return sent['cache-control'];
+    };
+    assert.ok(cfg.hosting.headers.every((rule) => typeof rule.source === 'string'));
+    for (const path of ['/', '/index.html', '/sw.js', '/settings', '/habit/abc/edit', '/manifest.webmanifest']) {
+      assert.equal(cacheControl(path), 'no-cache', path);
+    }
+    for (const path of ['/assets/index-ea-HuSDn.js', '/assets/styles-B1x2.css']) {
+      assert.equal(cacheControl(path), 'public, max-age=31536000, immutable', path);
     }
     assert.equal(cfg.firestore.rules, 'firestore.rules');
     assert.equal(cfg.firestore.indexes, 'firestore.indexes.json');
