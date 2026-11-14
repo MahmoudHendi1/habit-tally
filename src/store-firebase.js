@@ -15,8 +15,8 @@
 // - A change is pushed onto `ops`, shown, and sent. Nothing is awaited.
 // - When the server confirms it, the op moves from `ops` into `base`: the view does not change.
 // - When the server refuses it, the op is dropped and `lastError` is set; the view is then Firestore's.
-// - Habit and account snapshots replace `base`. They may already contain some of our unanswered ops, but
-//   those are plain assignments, so laying `ops` over them again gives the same result.
+// - Habit, routine and account snapshots replace `base`. They may already contain some of our unanswered
+//   ops, but those are plain assignments, so laying `ops` over them again gives the same result.
 // - Count snapshots are different: +1 laid over a snapshot that already holds that +1 would count twice,
 //   and a snapshot does not say which of our taps it holds. So while an op of ours is waiting in a month,
 //   that month's snapshots are not used at all: the server's confirmations move the ops into `base` one by
@@ -38,16 +38,24 @@ import {
 import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache,
   memoryLruGarbageCollector, connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, updateDoc, increment, runTransaction,
+  writeBatch,
   waitForPendingWrites, terminate, clearIndexedDbPersistence,
 } from 'firebase/firestore';
-import { LIMITS, keyOf, monthId, countOn, recentDays, cleanHabit, validateHabit, sortHabits } from '../shared/logic.js';
+import {
+  LIMITS, keyOf, monthId, countOn, recentDays, cleanHabit, validateHabit, sortHabits, cleanRoutine, validateRoutine, sortRoutines,
+} from '../shared/logic.js';
 import { firebaseConfig, emulatorConfig } from './firebase-config.js';
 import { StoreError } from './store.js';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/; // the form the rules accept; installation ids are 22 such characters
 const ZONE_MAX = 64, UA_MAX = 500; // limits in firestore.rules
-const SHARED = ['user', 'habits', 'logs', 'lastError'];
+const SHARED = ['user', 'habits', 'routines', 'logs', 'lastError'];
+/** The two kinds of record a person makes; each is a subcollection of the account and a list in the state. */
+const KINDS = {
+  habits: { max: LIMITS.habitsMax, one: 'habit' },
+  routines: { max: LIMITS.routinesMax, one: 'routine' },
+};
 /** How long a missing user record that came from the cache may wait for the server's word before it
  *  counts as "offline". Listening again to a record the server once reported missing gives that cached
  *  answer first even while online; the server's own answer then follows within a moment. */
@@ -57,7 +65,7 @@ const LISTEN_AGAIN_MS = [2000, 5000, 15_000, 60_000];
 /** Sign-out in a browser: how long to wait for writes that have not reached the server yet, and for the
  *  browser to delete the offline cache. */
 const PENDING_WAIT_MS = 2000, CLEAR_WAIT_MS = 1000;
-const NOTHING_HEARD = { user: false, habits: false, logs: false };
+const NOTHING_HEARD = { user: false, habits: false, routines: false, logs: false };
 const inBrowser = typeof window !== 'undefined' && typeof indexedDB !== 'undefined';
 
 const AUTH_ERRORS = {
@@ -126,14 +134,19 @@ function readDays(data) {
   return Object.fromEntries(days.map(([day, counts]) => [day, Object.fromEntries(numbers(counts))]));
 }
 
-/** One change laid over { tz, habits: { id: habit }, logs }. Returns new data; nothing is mutated.
- *  An op is { habit: id, patch, create? } or { month, day, id, delta } or { tz }. */
+/** A stored habit as the app knows it. One stored before routines existed has no `routine`: it is loose. */
+const readHabit = (id, data) => ({ id, ...data, routine: typeof data.routine === 'string' ? data.routine : '' });
+
+/** One change laid over { tz, habits: { id: habit }, routines: { id: routine }, logs }. Returns new data;
+ *  nothing is mutated. An op is { kind: 'habits' | 'routines', id, patch, create? } or
+ *  { month, day, id, delta } or { tz } or { all: [ops] } (one write of several records). */
 function applyOp(data, op) {
+  if (op.all) return op.all.reduce(applyOp, data);
   if (op.tz) return { ...data, tz: op.tz };
-  if (op.patch) {
-    const old = data.habits[op.habit];
+  if (op.kind) {
+    const old = data[op.kind][op.id];
     if (!old && !op.create) return data;
-    return { ...data, habits: { ...data.habits, [op.habit]: { id: op.habit, ...old, ...op.patch } } };
+    return { ...data, [op.kind]: { ...data[op.kind], [op.id]: { id: op.id, ...old, ...op.patch } } };
   }
   const days = data.logs[op.month] ?? {};
   const count = (days[op.day]?.[op.id] ?? 0) + op.delta;
@@ -206,19 +219,22 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   const newSession = (uid, email, denied = false) => ({
     uid, email, denied, stops: [], live: false, creating: false, trouble: null, offline: null,
     heard: NOTHING_HEARD, failures: 0, again: null,
-    has: { user: false, habits: false, logs: false }, base: { tz, habits: {}, logs: {} }, ops: [],
+    has: { user: false, habits: false, routines: false, logs: false }, base: { tz, habits: {}, routines: {}, logs: {} }, ops: [],
   });
   const current = () => session.ops.reduce(applyOp, session.base);
 
   function view() {
-    const blank = { mode, user: null, habits: [], logs: {}, lastError: session?.trouble ?? lastError };
+    const blank = { mode, user: null, habits: [], routines: [], logs: {}, lastError: session?.trouble ?? lastError };
     if (!session) return { status: authKnown ? 'signedOut' : 'loading', ...blank };
     const { uid, email, has } = session;
-    if (!has.user || !has.habits || !has.logs) {
+    if (!has.user || !has.habits || !has.routines || !has.logs) {
       return session.denied ? { status: 'waiting', ...blank, user: { uid, email, tz } } : { status: 'loading', ...blank };
     }
     const data = current();
-    return { status: 'ready', ...blank, user: { uid, email, tz: data.tz }, habits: sortHabits(Object.values(data.habits)), logs: data.logs };
+    return {
+      status: 'ready', ...blank, user: { uid, email, tz: data.tz },
+      habits: sortHabits(Object.values(data.habits)), routines: sortRoutines(Object.values(data.routines)), logs: data.logs,
+    };
   }
 
   /** Work the state out again and tell the listeners if it changed (always, after a change made here). */
@@ -290,7 +306,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     const userRef = doc(db, 'users', s.uid);
     const failed = (err) => {
       if (session !== s) return;
-      stop(); // a failed listener is over, and the other two are attached again with it
+      stop(); // a failed listener is over, and the others are attached again with it
       if (err?.code === 'permission-denied') {
         session = newSession(s.uid, s.email, true);
         return refresh();
@@ -306,11 +322,11 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       s.again.unref?.(); // under Node (tests) this must not keep the process alive
       refresh();
     };
-    /** A listener delivered. Trouble with listening is over once the server has answered all three. */
+    /** A listener delivered. Trouble with listening is over once the server has answered all four. */
     const heard = (part, snap) => {
       s.has[part] = true;
       if (!snap.metadata.fromCache) s.heard = { ...s.heard, [part]: true };
-      if (s.heard.user && s.heard.habits && s.heard.logs) {
+      if (s.heard.user && s.heard.habits && s.heard.routines && s.heard.logs) {
         s.failures = 0;
         if (s.trouble === NOT_LOADED) s.trouble = null;
       }
@@ -362,13 +378,19 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     });
   }
 
-  /** Both with includeMetadataChanges: the logs for the reason at the top of this file, and both so that
+  /** All with includeMetadataChanges: the logs for the reason at the top of this file, and all so that
    *  the server's first answer is noticed even when it brings nothing the cache did not have. */
   function watchData(s, userRef, failed, heard) {
     s.stops.push(onSnapshot(collection(userRef, 'habits'), { includeMetadataChanges: true }, (snap) => {
       if (session !== s) return;
-      s.base = { ...s.base, habits: Object.fromEntries(snap.docs.map((d) => [d.id, { id: d.id, ...d.data() }])) };
+      s.base = { ...s.base, habits: Object.fromEntries(snap.docs.map((d) => [d.id, readHabit(d.id, d.data())])) };
       heard('habits', snap);
+      refresh();
+    }, failed));
+    s.stops.push(onSnapshot(collection(userRef, 'routines'), { includeMetadataChanges: true }, (snap) => {
+      if (session !== s) return;
+      s.base = { ...s.base, routines: Object.fromEntries(snap.docs.map((d) => [d.id, { id: d.id, ...d.data() }])) };
+      heard('routines', snap);
       refresh();
     }, failed));
     s.stops.push(onSnapshot(collection(userRef, 'logs'), { includeMetadataChanges: true }, (snap) => {
@@ -410,39 +432,77 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     refresh(true);
   }
 
-  const habitRef = (id) => doc(db, 'users', session.uid, 'habits', id);
-  const tooMany = () => new StoreError('too-many', `You can have at most ${LIMITS.habitsMax} habits. Delete one to add another.`);
+  const recordRef = (kind, id) => doc(db, 'users', session.uid, kind, id);
+  const tooMany = (kind) => new StoreError('too-many', `You can have at most ${KINDS[kind].max} ${kind}. Delete one to add another.`);
+  /** The place of a new habit or routine. Deleted ones count too, so a restored one never shares its place
+   *  with a newer one. */
+  const nextOrder = (all) => Math.max(0, ...Object.values(all).map((x) => x.order)) + 1;
 
-  function saveHabit(input) {
-    if (state.status !== 'ready') throw new StoreError('not-ready', 'Sign in to change habits.');
-    const fields = cleanHabit(input);
-    const problems = validateHabit(fields);
-    if (problems.length > 0) throw new StoreError('invalid', problems[0], problems);
-    const all = current().habits; // deleted ones included
+  /** Create (no `id`) or edit one habit or routine. `fields` is what the person edits, cleaned and valid;
+   *  `fresh` is what a new record gets besides. Returns the id. */
+  function saveRecord(kind, id, fields, fresh) {
+    const all = current()[kind]; // deleted ones included
     const updatedAt = now().getTime();
-    if (input.id) {
-      if (!all[input.id]) throw new StoreError('not-found', 'This habit no longer exists.');
+    if (id) {
+      if (!all[id]) throw new StoreError('not-found', `This ${KINDS[kind].one} no longer exists.`);
       const patch = { ...fields, updatedAt };
-      change({ habit: input.id, patch }, () => updateDoc(habitRef(input.id), patch));
-      return input.id;
+      change({ kind, id, patch }, () => updateDoc(recordRef(kind, id), patch));
+      return id;
     }
-    if (state.habits.length >= LIMITS.habitsMax) throw tooMany();
-    // Deleted habits count too, so a restored habit never shares its place with a newer one.
-    const order = Math.max(0, ...Object.values(all).map((h) => h.order)) + 1;
-    const ref = doc(collection(db, 'users', session.uid, 'habits')); // a new 20-character id
-    const habit = { ...fields, created: today(), archived: false, deletedAt: null, order, updatedAt };
-    change({ habit: ref.id, patch: habit, create: true }, () => setDoc(ref, habit));
+    if (state[kind].length >= KINDS[kind].max) throw tooMany(kind);
+    const ref = doc(collection(db, 'users', session.uid, kind)); // a new 20-character id
+    const record = { ...fields, ...fresh, deletedAt: null, order: nextOrder(all), updatedAt };
+    change({ kind, id: ref.id, patch: record, create: true }, () => setDoc(ref, record));
     return ref.id;
   }
 
-  /** Soft delete (a time) or restore (null). Unknown ids and repeats are ignored. */
-  function setDeleted(id, deletedAt) {
+  function saveHabit(input) {
+    if (state.status !== 'ready') throw new StoreError('not-ready', 'Sign in to change habits.');
+    // Only a live routine can be joined. Any other value (none, unknown, deleted) leaves the habit loose,
+    // and it is dropped before cleaning, because cleanHabit empties the times of a habit with a routine.
+    const routine = state.routines.some((r) => r.id === input?.routine) ? input.routine : '';
+    const fields = cleanHabit({ ...input, routine });
+    const problems = validateHabit(fields);
+    if (problems.length > 0) throw new StoreError('invalid', problems[0], problems);
+    return saveRecord('habits', input.id, fields, { created: today(), archived: false });
+  }
+
+  function saveRoutine(input) {
+    if (state.status !== 'ready') throw new StoreError('not-ready', 'Sign in to change routines.');
+    const fields = cleanRoutine(input);
+    const problems = validateRoutine(fields);
+    if (problems.length > 0) throw new StoreError('invalid', problems[0], problems);
+    return saveRecord('routines', input.id, fields, {});
+  }
+
+  /** Soft delete (a time) or restore (null) of a habit or routine. Unknown ids and repeats are ignored.
+   *  Deleting a routine writes none of its habits: they keep naming it and are loose meanwhile (routineOf). */
+  function setDeleted(kind, id, deletedAt) {
     if (state.status !== 'ready') return;
-    const habit = current().habits[id];
-    if (!habit || (habit.deletedAt === null) === (deletedAt === null)) return;
-    if (deletedAt === null && state.habits.length >= LIMITS.habitsMax) throw tooMany();
+    const record = current()[kind][id];
+    if (!record || (record.deletedAt === null) === (deletedAt === null)) return;
+    if (deletedAt === null && state[kind].length >= KINDS[kind].max) throw tooMany(kind);
     const patch = { deletedAt, updatedAt: now().getTime() };
-    change({ habit: id, patch }, () => updateDoc(habitRef(id), patch));
+    change({ kind, id, patch }, () => updateDoc(recordRef(kind, id), patch));
+  }
+
+  /** Number the live records named in `ids` 1, 2, 3... in that sequence. Ids that name no live record and
+   *  an id's second mention are dropped; records not named keep their order; only a record whose order
+   *  changes is written. All of them go in one batch: one change of state, one call to the listeners, and
+   *  the server takes all or none. */
+  function reorder(kind, ids) {
+    if (state.status !== 'ready' || !Array.isArray(ids)) return;
+    const live = new Map(state[kind].map((x) => [x.id, x]));
+    const place = new Map();
+    for (const id of ids) if (live.has(id) && !place.has(id)) place.set(id, place.size + 1);
+    const moved = [...place].filter(([id, order]) => live.get(id).order !== order);
+    if (moved.length === 0) return;
+    const updatedAt = now().getTime();
+    change({ all: moved.map(([id, order]) => ({ kind, id, patch: { order, updatedAt } })) }, () => {
+      const batch = writeBatch(db);
+      for (const [id, order] of moved) batch.update(recordRef(kind, id), { order, updatedAt });
+      return batch.commit();
+    });
   }
 
   function addCount(dayKey, habitId, delta) {
@@ -619,8 +679,13 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       watch(s);
     },
     saveHabit,
-    deleteHabit: (id) => setDeleted(id, now().getTime()),
-    restoreHabit: (id) => setDeleted(id, null),
+    deleteHabit: (id) => setDeleted('habits', id, now().getTime()),
+    restoreHabit: (id) => setDeleted('habits', id, null),
+    saveRoutine,
+    deleteRoutine: (id) => setDeleted('routines', id, now().getTime()),
+    restoreRoutine: (id) => setDeleted('routines', id, null),
+    reorderHabits: (ids) => reorder('habits', ids),
+    reorderRoutines: (ids) => reorder('routines', ids),
     addCount,
     setTimeZone,
     saveDevice,
