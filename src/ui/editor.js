@@ -2,7 +2,7 @@
 // The habit editor: a bottom sheet to add, change or delete a habit and to choose its reminder times
 // (R1, R4). Not a screen: screens open it with ctx.openEditor(). Contract: src/ui/common.js, rules 1 to 6.
 // Styles: editor.css. The first half of this file is pure (no DOM) and is tested by test/editor.test.mjs.
-import { LIMITS, cleanHabit, validateHabit, cleanTimes, everyHours } from '../../shared/logic.js';
+import { LIMITS, cleanHabit, validateHabit, cleanTimes, everyHours, cleanRoutine, validateRoutine, routineOf } from '../../shared/logic.js';
 import { StoreError } from '../store.js';
 import { esc, patch, on, icon, openSheet } from './common.js';
 
@@ -10,8 +10,11 @@ import { esc, patch, on, icon, openSheet } from './common.js';
 /** @typedef {import('./common.js').Habit} Habit */
 /** @typedef {import('./common.js').PushStatus} PushStatus */
 /** What the form holds. `target` is the text in the box, so "2.5" or "abc" can be refused rather than rounded.
- *  @typedef {{ name: string, period: string, target: string, unit: string, times: string[] }} FormValues */
-/** @typedef {'name' | 'period' | 'target' | 'unit' | 'times' | 'form'} Field */
+ *  `routine` is '' (None), the id of a routine, or NEW_ROUTINE, and then `routineName` is the name typed for it.
+ *  `times` keeps the habit's own reminder times while a routine is chosen, so going back to None shows them again.
+ *  @typedef {{ name: string, period: string, target: string, unit: string, times: string[], routine: string,
+ *    routineName: string }} FormValues */
+/** @typedef {'name' | 'period' | 'target' | 'unit' | 'times' | 'routine' | 'routineName' | 'form'} Field */
 /** @typedef {{ field: Field, message: string }} Problem */
 
 // ================================ pure parts ================================
@@ -22,29 +25,47 @@ export const HALF_HOURS = everyHours('00:00', '23:30', 0.5);
 /** The choices of "Every N hours" in the quick fill. */
 export const EVERY_CHOICES = [0.5, 1, 2, 3, 4, 6];
 
-/** The form of a new habit. @returns {FormValues} */
-export const blankForm = () => ({ name: '', period: 'day', target: '1', unit: '', times: [] });
+/** The value of the "Routine" choice that stands for "New routine...". Never a routine id (those are 20 characters). */
+export const NEW_ROUTINE = 'new';
 
-/** The form filled from a stored habit.
- *  @param {Pick<Habit, 'name' | 'period' | 'target' | 'unit' | 'times'>} habit @returns {FormValues} */
-export const formOf = (habit) => ({
+/** The form of a new habit. @returns {FormValues} */
+export const blankForm = () => ({ name: '', period: 'day', target: '1', unit: '', times: [], routine: '', routineName: '' });
+
+/** The form filled from a stored habit. Its routine is the live one it is in (`routineOf`), so a habit of a
+ *  deleted routine shows None.
+ *  @param {Pick<Habit, 'name' | 'period' | 'target' | 'unit' | 'times'> & { routine?: string }} habit
+ *  @param {{ id: string }[]} [routines] `state.routines` @returns {FormValues} */
+export const formOf = (habit, routines = []) => ({
   name: habit.name, period: habit.period, target: String(habit.target), unit: habit.unit, times: cleanTimes(habit.times),
+  routine: routineOf(habit, routines)?.id ?? '', routineName: '',
 });
 
 /** Form values as the input of `store.saveHabit()`: with `id` to change a habit, without to add one.
  *  The target becomes a number as typed (NaN when it is not one); tidying is left to `cleanHabit`.
+ *  `routine` is always there ('' for None). A habit in a routine has no reminder times of its own. For
+ *  "New routine..." the routine is '' here: the editor saves the routine first and then puts its id in.
  *  @param {FormValues} form @param {string | null} [id] */
 export function toInput(form, id = null) {
   const target = form.target.trim();
   return {
     ...(id ? { id } : {}),
-    name: form.name, period: form.period, target: target === '' ? NaN : Number(target), unit: form.unit, times: [...form.times],
+    name: form.name, period: form.period, target: target === '' ? NaN : Number(target), unit: form.unit,
+    times: form.routine ? [] : [...form.times], routine: form.routine === NEW_ROUTINE ? '' : form.routine,
   };
+}
+
+/** The name typed for "New routine...", checked with the shared rules.
+ *  @param {string} name @returns {{ input: { name: string, times: string[] }, problem: Problem | null }} */
+export function checkRoutineName(name) {
+  const input = cleanRoutine({ name, times: [] });
+  const [message] = validateRoutine(input);
+  return { input, problem: message ? { field: 'routineName', message } : null };
 }
 
 /** Which field a sentence from `validateHabit` is about ('form' when it is about none of them).
  *  @param {string} message @returns {Field} */
 export function fieldOf(message) {
+  if (/\broutine\b/i.test(message)) return 'routine';
   if (/\bname\b/i.test(message)) return 'name';
   if (/\bper day\b|\bper week\b/i.test(message)) return 'period';
   if (/\btarget\b/i.test(message)) return 'target';
@@ -68,7 +89,8 @@ export function checkForm(form, id = null) {
 /** Whether a draft differs from the form the editor opened with, in what would be saved.
  *  @param {FormValues} form @param {FormValues} opened @returns {boolean} */
 export function formChanged(form, opened) {
-  const key = (/** @type {FormValues} */ f) => JSON.stringify([f.name.trim(), f.period, f.target.trim(), f.unit.trim(), cleanTimes(f.times)]);
+  const key = (/** @type {FormValues} */ f) => JSON.stringify([f.name.trim(), f.period, f.target.trim(), f.unit.trim(),
+    f.routine ? [] : cleanTimes(f.times), f.routine, f.routine === NEW_ROUTINE ? f.routineName.trim() : '']);
   return key(form) !== key(opened);
 }
 
