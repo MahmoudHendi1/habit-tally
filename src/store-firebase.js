@@ -67,6 +67,9 @@ const AUTH_ERRORS = {
 const authError = (err) => (err instanceof StoreError ? err
   : new StoreError(...(AUTH_ERRORS[err?.code] ?? ['unknown', 'Something went wrong. Try again in a moment.'])));
 
+/** Why the account's data is not there yet; shown as `lastError` until it is. */
+const NOT_SET_UP = { code: 'not-saved', message: 'Your account could not be set up. Try again in a moment.' };
+
 const notSaved = (err) => ({
   code: 'not-saved',
   message: err?.code === 'permission-denied'
@@ -168,7 +171,9 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   const listeners = new Set();
   /** The signed-in account and everything that belongs to it; replaced, never reused, when the account
    *  changes, is refused or signs out, so late answers for an old session are easy to ignore.
-   *  `denied`: the rules refused it; it shows as waiting until a retry() gets all the way to ready. */
+   *  `denied`: the rules refused it; it shows as waiting until a retry() gets all the way to ready.
+   *  `creating`: the user record is being written ('sending') or was refused ('refused').
+   *  `trouble`: why the data is not loading, if something is wrong; it is the state's `lastError` meanwhile. */
   let session = null;
   let authKnown = false;
   let lastError = null;
@@ -176,13 +181,13 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   let state = view();
 
   const newSession = (uid, email, denied = false) => ({
-    uid, email, denied, stops: [], live: false, creating: false,
+    uid, email, denied, stops: [], live: false, creating: false, trouble: null,
     has: { user: false, habits: false, logs: false }, base: { tz, habits: {}, logs: {} }, ops: [],
   });
   const current = () => session.ops.reduce(applyOp, session.base);
 
   function view() {
-    const blank = { mode, user: null, habits: [], logs: {}, lastError };
+    const blank = { mode, user: null, habits: [], logs: {}, lastError: session?.trouble ?? lastError };
     if (!session) return { status: authKnown ? 'signedOut' : 'loading', ...blank };
     const { uid, email, has } = session;
     if (!has.user || !has.habits || !has.logs) {
@@ -214,8 +219,10 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   // ---------- account and live data ----------
 
   function stop() {
-    for (const off of session?.stops ?? []) off();
-    if (session) session.stops = [];
+    if (!session) return;
+    for (const off of session.stops) off();
+    session.stops = [];
+    session.live = false;
   }
 
   /** Auth reported who is signed in (or nobody). */
@@ -243,18 +250,14 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     s.stops.push(onSnapshot(userRef, { includeMetadataChanges: true }, (snap) => {
       if (session !== s) return;
       if (!snap.exists()) {
+        s.has.user = false;
         // Allowed, and the server (not just an empty cache) says there is no record yet: create it.
-        if (snap.metadata.fromCache || s.creating) return;
-        s.creating = true;
-        const at = now().getTime();
-        setDoc(userRef, { tz, createdAt: at, updatedAt: at }).catch((err) => {
-          if (session !== s) return;
-          s.creating = false;
-          lastError = notSaved(err);
-          refresh();
-        });
-        return;
+        if (!snap.metadata.fromCache && !s.creating) createRecord(s, userRef);
+        return refresh();
       }
+      // The record this store is creating counts once the rules have accepted it, not before.
+      if (s.creating === 'sending' && snap.metadata.hasPendingWrites) return;
+      s.trouble = null;
       const zone = snap.data().tz;
       s.base = { ...s.base, tz: isZone(zone) ? zone : tz };
       s.has.user = true;
@@ -264,6 +267,22 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       }
       refresh();
     }, failed));
+  }
+
+  /** Write the user record of an allowed account. A refusal (the rules do not accept the record, a time
+   *  zone for example) would be repeated at once if it were tried again by itself: `creating` stays set
+   *  until retry(). */
+  function createRecord(s, userRef) {
+    s.creating = 'sending';
+    const at = now().getTime();
+    setDoc(userRef, { tz, createdAt: at, updatedAt: at }).then(() => {
+      s.creating = false;
+    }, (err) => {
+      console.error(err);
+      s.creating = 'refused';
+      s.trouble = NOT_SET_UP;
+      if (session === s) refresh();
+    });
   }
 
   function watchData(s, userRef, failed) {
@@ -369,12 +388,15 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     return address;
   }
 
-  /** Resolves once the status is no longer 'loading'. */
-  const settled = () => new Promise((resolve) => {
+  /** Resolves once the status is no longer 'loading'. Rejects when loading has run into trouble instead:
+   *  the session stays, and becomes ready by itself (or after retry()) once the trouble is over. */
+  const settled = () => new Promise((resolve, reject) => {
     const check = () => {
-      if (state.status === 'loading') return;
+      if (state.status === 'loading' && !state.lastError) return;
       listeners.delete(check);
-      resolve();
+      if (state.status !== 'loading') return resolve();
+      const { code, message } = state.lastError;
+      reject(new StoreError(code === 'offline' ? 'offline' : 'unknown', message));
     };
     listeners.add(check);
     check();
@@ -444,8 +466,15 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       adopt(null);
       await authSignOut(auth);
     },
+    /** Listen again: for an account that was refused, or whose user record was. */
     retry() {
-      if (session?.denied && session.stops.length === 0) watch(session);
+      const s = session;
+      if (!s) return;
+      const refused = s.creating === 'refused';
+      if (!refused && s.stops.length > 0) return; // listening, and nothing was refused
+      if (refused) s.creating = false;
+      stop();
+      watch(s);
     },
     saveHabit,
     deleteHabit: (id) => setDeleted(id, now().getTime()),

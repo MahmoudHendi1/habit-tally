@@ -225,6 +225,38 @@ test('check 4: signing in to an account that is not invited resolves in waiting;
   assert.deepEqual(await stored(`users/${account.uid}`), { tz: 'Africa/Cairo', createdAt: NOON, updatedAt: NOON });
 });
 
+test('a user record the rules refuse is tried once, shows as lastError, and is tried again only by retry()', async () => {
+  const account = await newAccount();
+  const { store } = open();
+  const seen = [];
+  store.subscribe((state) => { if (seen.at(-1) !== state.status) seen.push(state.status); });
+  // The account may read its own data, but nothing may be written.
+  await loadRules(`rules_version = '2';
+    service cloud.firestore { match /databases/{db}/documents {
+      match /users/{uid} { allow read: if request.auth.uid == uid; }
+      match /users/{uid}/{rest=**} { allow read: if request.auth.uid == uid; }
+    } }`);
+  try {
+    await rejects(store.signIn(account.email, account.password), 'unknown');
+    const { lastError, ...rest } = store.getState();
+    assert.deepEqual(rest, { status: 'loading', mode: 'emulator', user: null, habits: [], logs: {} });
+    assert.equal(lastError.code, 'not-saved');
+    assert.match(lastError.message, SENTENCE);
+  } finally {
+    await loadInvited();
+  }
+  // The real rules would accept the record now: a store that kept trying would become ready by itself.
+  await sleep(500);
+  assert.equal(store.getState().status, 'loading');
+  assert.equal(await stored(`users/${account.uid}`), null);
+  assert.deepEqual(seen, ['loading', 'signedOut', 'loading'], 'never ready on a record the rules had not accepted');
+
+  store.retry();
+  const ready = await until(store, (state) => state.status === 'ready', 'ready after retry()');
+  assert.equal(ready.lastError, null);
+  assert.deepEqual(await stored(`users/${account.uid}`), { tz: 'Europe/London', createdAt: NOON, updatedAt: NOON });
+});
+
 test('check 4: setTimeZone changes only the user record; another device signing in keeps the record', async () => {
   const { store, settle, advance, uid, email, password } = await readyStore({ tz: 'Europe/London' });
   const id = store.saveHabit(WATER);
