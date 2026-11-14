@@ -104,10 +104,10 @@ function openUnreachable(options) {
   }
 }
 
-/** `promise`, or a failure when it has not settled within 3 seconds. */
-function soon(promise, what) {
+/** `promise`, or a failure when it has not settled within `ms`. */
+function soon(promise, what, ms = 3000) {
   let timer;
-  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`not settled within 3 s: ${what}`)), 3000); });
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`not settled within ${ms} ms: ${what}`)), ms); });
   return Promise.race([promise, late]).finally(() => clearTimeout(timer));
 }
 
@@ -506,6 +506,29 @@ test('offline: changes show at once and stay; with cached data and no connection
   assert.deepEqual(await stored(`users/${a.uid}/logs/2026-11`), { days: { [TODAY]: { [id]: 4 } } });
 });
 
+test('nothing cached and Firestore out of reach: sign-in rejects "offline", lastError says so, and it loads by itself later', async () => {
+  const account = await newAccount();
+  const cut = openUnreachable();
+  await rejects(soon(cut.store.signIn(account.email, account.password), 'signIn', 15_000), 'offline');
+  const { lastError, ...rest } = cut.store.getState();
+  assert.deepEqual(rest, { status: 'loading', mode: 'emulator', user: null, habits: [], logs: {} });
+  assert.equal(lastError.code, 'offline');
+  assert.match(lastError.message, SENTENCE);
+
+  // The same with a connection that comes back: the session was kept, so nobody has to sign in again.
+  const it = open();
+  const seen = [];
+  it.store.subscribe((state) => seen.push(`${state.status}:${state.lastError?.code ?? ''}`));
+  await disableNetwork(it.db);
+  await rejects(soon(it.store.signIn(account.email, account.password), 'signIn', 15_000), 'offline');
+  assert.deepEqual(seen, ['loading:', 'signedOut:', 'loading:', 'loading:offline']);
+  await enableNetwork(it.db);
+  const ready = await until(it.store, (state) => state.status === 'ready', 'ready once the connection is back');
+  assert.deepEqual([ready.user.uid, ready.lastError], [account.uid, null]);
+  assert.equal(seen.at(-1), 'ready:');
+  assert.deepEqual(await stored(`users/${account.uid}`), { tz: 'Europe/London', createdAt: NOON, updatedAt: NOON });
+});
+
 // ---------- refused writes ----------
 
 test('a write the rules refuse sets lastError "not-saved"; a write made after that and saved clears it', async () => {
@@ -695,7 +718,7 @@ test('devices are written on the server at once or not at all, never queued for 
 
   // Firestore out of reach: both calls fail, and nothing arrives later.
   const cut = openUnreachable();
-  await rejects(cut.store.signIn(a.email, a.password), 'offline');
+  await rejects(soon(cut.store.signIn(a.email, a.password), 'signIn', 15_000), 'offline');
   await rejects(soon(cut.store.saveDevice(fid), 'saveDevice'), 'not-saved');
   await a.store.saveDevice(fid);
   await rejects(soon(cut.store.removeDevice(fid), 'removeDevice'), 'not-saved');

@@ -47,6 +47,10 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/; // the form the rules accept; installation ids are 22 such characters
 const ZONE_MAX = 64, UA_MAX = 500; // limits in firestore.rules
 const SHARED = ['user', 'habits', 'logs', 'lastError'];
+/** How long a missing user record that came from the cache may wait for the server's word before it
+ *  counts as "offline". Listening again to a record the server once reported missing gives that cached
+ *  answer first even while online; the server's own answer then follows within a moment. */
+const OFFLINE_GRACE_MS = 1500;
 const inBrowser = typeof window !== 'undefined' && typeof indexedDB !== 'undefined';
 
 const AUTH_ERRORS = {
@@ -68,6 +72,7 @@ const authError = (err) => (err instanceof StoreError ? err
   : new StoreError(...(AUTH_ERRORS[err?.code] ?? ['unknown', 'Something went wrong. Try again in a moment.'])));
 
 /** Why the account's data is not there yet; shown as `lastError` until it is. */
+const OFFLINE = { code: 'offline', message: 'You seem to be offline. Your habits will load when the connection is back.' };
 const NOT_SET_UP = { code: 'not-saved', message: 'Your account could not be set up. Try again in a moment.' };
 
 const notSaved = (err) => ({
@@ -181,7 +186,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   let state = view();
 
   const newSession = (uid, email, denied = false) => ({
-    uid, email, denied, stops: [], live: false, creating: false, trouble: null,
+    uid, email, denied, stops: [], live: false, creating: false, trouble: null, offline: null,
     has: { user: false, habits: false, logs: false }, base: { tz, habits: {}, logs: {} }, ops: [],
   });
   const current = () => session.ops.reduce(applyOp, session.base);
@@ -223,6 +228,28 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     for (const off of session.stops) off();
     session.stops = [];
     session.live = false;
+    clearTimeout(session.offline);
+    session.offline = null;
+  }
+
+  /** There is no user record in the cache and the server has not answered: nothing can be shown. Unless
+   *  the server answers shortly, say so. The listener stays, so the data arrives by itself once the
+   *  connection is back; a sign-in that is waiting is told "offline" (see settled()). */
+  function unreachable(s) {
+    if (s.offline || s.trouble) return;
+    s.offline = setTimeout(() => {
+      s.offline = null;
+      if (session !== s || s.trouble) return;
+      s.trouble = OFFLINE;
+      refresh();
+    }, OFFLINE_GRACE_MS);
+    s.offline.unref?.(); // under Node (tests) this must not keep the process alive
+  }
+
+  function reachable(s) {
+    clearTimeout(s.offline);
+    s.offline = null;
+    if (s.trouble === OFFLINE) s.trouble = null;
   }
 
   /** Auth reported who is signed in (or nobody). */
@@ -251,12 +278,21 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       if (session !== s) return;
       if (!snap.exists()) {
         s.has.user = false;
-        // Allowed, and the server (not just an empty cache) says there is no record yet: create it.
-        if (!snap.metadata.fromCache && !s.creating) createRecord(s, userRef);
+        if (snap.metadata.fromCache) {
+          unreachable(s);
+        } else {
+          // Allowed, and the server (not just an empty cache) says there is no record yet: create it.
+          reachable(s);
+          if (!s.creating) createRecord(s, userRef);
+        }
         return refresh();
       }
       // The record this store is creating counts once the rules have accepted it, not before.
-      if (s.creating === 'sending' && snap.metadata.hasPendingWrites) return;
+      if (s.creating === 'sending' && snap.metadata.hasPendingWrites) {
+        if (snap.metadata.fromCache) unreachable(s); // the connection went just after the record was sent
+        return;
+      }
+      reachable(s);
       s.trouble = null;
       const zone = snap.data().tz;
       s.base = { ...s.base, tz: isZone(zone) ? zone : tz };
