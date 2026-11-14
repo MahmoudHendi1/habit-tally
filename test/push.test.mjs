@@ -443,7 +443,7 @@ test('resume() clears the flag and registers again, so the device belongs to who
   await w.push.resume();
 
   assert.equal(w.caches.flag(), undefined);
-  assert.equal(w.log[0], 'flag:clear');
+  assert.deepEqual(w.log, ['register:fid-1', 'save:fid-1', 'flag:clear'], 'the flag goes only once the record is saved');
   assert.deepEqual([...w.store.devices], [['fid-1', { uid: 'ben' }]]);
   assert.equal(w.m.registered, true);
   assert.equal(w.push.getStatus(), 'on');
@@ -481,10 +481,53 @@ test('resume() never rejects; a failed registration leaves reminders as they wer
   w.m.failRegister = async () => { throw new Error('offline'); };
   await w.push.resume();
   assert.equal(w.push.getStatus(), 'on', 'the earlier registration and record still stand');
+  assert.ok(!w.log.includes('flag:clear'), 'the flag is left alone until the record is saved');
 
   const v = setup({ permission: 'granted', stored: ON, caches: null, localStorage: null });
   await v.push.resume();
   assert.equal(v.push.getStatus(), 'off');
+});
+
+test('resume() keeps the signed-out flag while the device still points at the account that left', async () => {
+  const w = setup();
+  await w.push.enable();
+  // Ana signs out offline: her device record and her FCM registration survive.
+  w.store.removeDevice = async () => { throw new Error('offline'); };
+  w.m.failUnregister = async () => { throw new Error('offline'); };
+  await w.push.detach();
+  assert.deepEqual([...w.store.devices], [['fid-1', { uid: 'ana' }]]);
+  assert.ok(w.caches.flag());
+
+  // Ben signs in on this browser, and the registration fails.
+  w.store.uid = 'ben';
+  w.m.failRegister = async () => { throw new Error('offline'); };
+  await w.push.resume();
+  assert.ok(w.caches.flag(), 'registration failed: the worker keeps to the generic text');
+  assert.deepEqual([...w.store.devices], [['fid-1', { uid: 'ana' }]]);
+
+  // The same when the device record is what cannot be saved.
+  w.m.failRegister = null;
+  const saveDevice = w.store.saveDevice;
+  w.store.saveDevice = async () => { throw new Error('offline'); };
+  await w.push.resume();
+  assert.ok(w.caches.flag(), 'the record was not saved: the flag stays');
+
+  // Once the record points at Ben, the flag goes.
+  w.store.saveDevice = saveDevice;
+  await w.push.resume();
+  assert.equal(w.caches.flag(), undefined);
+  assert.deepEqual([...w.store.devices], [['fid-1', { uid: 'ben' }]]);
+});
+
+test('enable() after a failed resume() clears the held flag once the device is saved', async () => {
+  const w = setup({ permission: 'granted', stored: { [CHOICE_KEY]: 'on' } });
+  await w.push.detach();
+  w.m.failRegister = async () => { throw new Error('offline'); };
+  await w.push.resume();
+  assert.ok(w.caches.flag());
+  w.m.failRegister = null;
+  assert.equal(await w.push.enable(), 'on');
+  assert.equal(w.caches.flag(), undefined);
 });
 
 test('detach() never rejects, even when every step fails', async () => {

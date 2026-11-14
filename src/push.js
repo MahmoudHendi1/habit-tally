@@ -99,6 +99,8 @@ export function createPush({ store, swRegistration, deps = {} }) {
   let sdkSupported = null;
   /** True from detach() until resume(): nothing is saved for an account that is signing out. */
   let detached = false;
+  /** True while resume() waits for a saved device record before it clears the signed-out flag. */
+  let flagHeld = false;
   /** The device record removed last, so that an explicit removal and onUnregistered do not both delete it. */
   let dropped = '';
 
@@ -243,6 +245,10 @@ export function createPush({ store, swRegistration, deps = {} }) {
     }
     const old = read(FID_KEY);
     write(FID_KEY, fid);
+    if (flagHeld) { // the record now points at the signed-in account: the worker may show reminder text again
+      flagHeld = false;
+      await clearFlag();
+    }
     if (old && old !== fid) await dropDevice(old).catch(() => {});
   }
 
@@ -327,6 +333,7 @@ export function createPush({ store, swRegistration, deps = {} }) {
   async function detach() {
     if (demo) return;
     detached = true;
+    flagHeld = false;
     /** @type {any} */
     let timer;
     const work = (async () => {
@@ -350,9 +357,15 @@ export function createPush({ store, swRegistration, deps = {} }) {
   async function resume() {
     if (demo) return;
     detached = false;
-    await clearFlag();
     if (hasBrowserApis && N && read(CHOICE_KEY) === 'on' && attempt(() => N.permission) === 'granted') {
-      await serial(registerDevice).catch(() => { /* reminders stay as they were: the status says which */ });
+      // The earlier person's device record and FCM registration may have survived an offline sign-out, so
+      // the flag stays until the record points at the account that is signed in now. A failed registration
+      // leaves reminders as they were (the status says which) and the flag in place: the worker keeps to
+      // the generic text until a later resume() or enable() gets through.
+      flagHeld = true;
+      await serial(registerDevice).catch(() => {});
+    } else {
+      await clearFlag();
     }
     emit();
   }
