@@ -2,7 +2,7 @@
 // The Progress screen: per habit, the headline numbers (R5) and a calendar of the last 15 weeks (R13).
 // Every number comes from shared/logic.js (stats, calendarWeeks, periodCount); this file only words and
 // draws them. Styles: progress.css. Screen contract: src/ui/common.js.
-import { stats, startDay, calendarWeeks, periodCount, isHit, isWeekly, weekStart, addDays } from '../../shared/logic.js';
+import { stats, startDay, calendarWeeks, periodCount, isHit, isWeekly, weekStart, addDays, groupHabits } from '../../shared/logic.js';
 import { esc, on, icon, formatDay, screenHead, emptyState } from './common.js';
 
 /** @typedef {import('./common.js').State} State */
@@ -132,8 +132,9 @@ function calendar(habit, logs, today) {
   </div>`;
 }
 
-/** @param {Habit} habit @param {State['logs']} logs @param {string} today @returns {string} HTML */
-function habitCard(habit, logs, today) {
+/** @param {Habit} habit @param {State['logs']} logs @param {string} today
+ *  @param {'h2' | 'h3'} [tag] the heading level of the name: h3 under a routine heading @returns {string} HTML */
+function habitCard(habit, logs, today, tag = 'h2') {
   const id = esc(habit.id), weekly = isWeekly(habit), span = weekly ? 'week' : 'day';
   const { total, periods, hitPeriods, best, streak } = stats(habit, logs, today);
   const unit = habit.unit || (habit.target === 1 ? 'time' : 'times');
@@ -146,7 +147,7 @@ function habitCard(habit, logs, today) {
 
   return `<li class="card progress-habit" data-key="${id}">
     <header class="progress-head">
-      <h2>${esc(habit.name)}</h2>
+      <${tag} class="progress-name">${esc(habit.name)}</${tag}>
       <p class="muted small num">${habit.target} ${esc(unit)} a ${span} · since ${esc(dayText(startDay(habit, logs), 'since'))}</p>
     </header>
     <div class="progress-hero${streak > 0 ? ' is-running' : ''}">
@@ -178,7 +179,21 @@ export function render(state, ctx) {
     });
   }
   const today = ctx.today();
-  return `${head}<ul class="progress-list" role="list" data-key="habits">${habits.map((h) => habitCard(h, logs, today)).join('')}</ul>`;
+  const routines = state.routines ?? [];
+  // With no routines: one plain list, as before there were routines.
+  if (routines.length === 0) {
+    return `${head}<ul class="progress-list" role="list" data-key="habits">${habits.map((h) => habitCard(h, logs, today)).join('')}</ul>`;
+  }
+  // The sections and the order of Today. A routine without habits has nothing to show here.
+  const sections = groupHabits(habits, routines).filter((/** @type {{ habits: Habit[] }} */ entry) => entry.habits.length > 0)
+    .map((/** @type {{ routine: { id: string, name: string } | null, habits: Habit[] }} */ { routine, habits: list }) => {
+      const key = routine ? `routine-${esc(routine.id)}` : 'loose';
+      return `<section class="progress-group" data-key="${key}" aria-labelledby="progress-title-${key}">
+        <h2 id="progress-title-${key}">${routine ? esc(routine.name) : 'Other habits'}</h2>
+        <ul class="progress-list" role="list">${list.map((h) => habitCard(h, logs, today, 'h3')).join('')}</ul>
+      </section>`;
+    });
+  return `${head}<div class="progress-groups" data-key="habits">${sections.join('')}</div>`;
 }
 
 /** @param {HTMLElement} root @param {Ctx} ctx @returns {() => void} */
