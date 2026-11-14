@@ -1,11 +1,12 @@
-// Tests for scripts/send-reminders.mjs. No network: run() is driven with an in-memory stand-in for the `google`
-// object of scripts/lib/google.mjs, and the command itself is only started with a missing or unusable key.
+// Tests for scripts/send-reminders.mjs. No network: run() and main() are driven with an in-memory stand-in for
+// the `google` object of scripts/lib/google.mjs, and the command as a process is only started with a missing or
+// unusable key.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { run } from '../scripts/send-reminders.mjs';
-import { GoogleError, PreconditionError } from '../scripts/lib/google.mjs';
+import { run, main } from '../scripts/send-reminders.mjs';
+import { ConfigError, GoogleError, PreconditionError } from '../scripts/lib/google.mjs';
 
 const SCRIPT = fileURLToPath(new URL('../scripts/send-reminders.mjs', import.meta.url));
 const BOOKMARK = 'system/reminders';
@@ -134,8 +135,10 @@ function worldAt(lastSlot) {
   if (lastSlot) w.put(BOOKMARK, { lastSlot, updatedAt: lastSlot });
   return w;
 }
+const waits = []; // every wait the job asked for before trying a read again (ms); nothing really waits
+const sleep = async (ms) => { waits.push(ms); };
 /** One run, started four minutes before `slot` as the schedule does. */
-const go = (w, slot, options = {}) => run({ google: w.google, now: slot - 4 * 60 * 1000, log, ...options });
+const go = (w, slot, options = {}) => run({ google: w.google, now: slot - 4 * 60 * 1000, log, sleep, ...options });
 const nothing = { slot: null, sent: 0, skipped: 0, failed: 0, removed: 0 };
 const tags = (w, fid) => w.pushes.filter((p) => !fid || p.fid === fid).map((p) => p.data.tag);
 const unavailable = (detail = '') => new GoogleError('call failed: HTTP 503 UNAVAILABLE', { status: 503, code: 'UNAVAILABLE', detail });
@@ -200,6 +203,7 @@ test('3b. two runs racing for one slot: exactly one sends, the other succeeds ha
   assert.deepEqual(results.sort((a, b) => b.sent - a.sent), [{ slot: at(9), sent: 2, skipped: 0, failed: 0, removed: 0 }, nothing]);
   assert.equal(w.pushes.length, 2);
   assert.equal(w.ops('setDoc').length, 2); // both tried; the precondition let one through
+  assert.equal(reads, 3); // the loser looked again, saw its own slot taken and stopped
 
   // the run that loses reports nothing of its own, not even a read that failed
   const v = worldAt(at(8, 30));
@@ -221,6 +225,73 @@ test('3c. everything is read first, then the slot is claimed, then the first pus
   const empty = addUser(worldAt(at(8, 30)), 'uid-bob', { habits: { h1: { times: ['20:00'] } }, devices: ['fid-bob-phone'] });
   assert.deepEqual(await go(empty, at(9)), { slot: at(9), sent: 0, skipped: 0, failed: 0, removed: 0 });
   assert.equal(empty.docs.get(BOOKMARK).data.lastSlot, at(9));
+});
+
+test('3d. a claim lost to a late run for the slot BEFORE: this run starts again from the new bookmark, once', async () => {
+  const build = () => {
+    const w = worldAt(at(8, 30));
+    addUser(w, 'uid-alice', {
+      habits: { t0900: { name: 'At 09:00', times: ['09:00'] }, t0930: { name: 'At 09:30', times: ['09:30'] } },
+      devices: ['fid-alice-phone'],
+    });
+    addUser(w, 'uid-bob', { habits: { h1: { times: ['09:30'] } }, devices: ['fid-bob-phone'] });
+    return w;
+  };
+  /** Before this run's n-th claim another run writes `slots[n - 1]` into the bookmark. */
+  const raced = async (w, slots) => {
+    const others = [...slots];
+    w.before = async (op) => { if (op === 'setDoc' && others.length) w.put(BOOKMARK, { lastSlot: others.shift(), updatedAt: 1 }); };
+    const lines = [];
+    const result = await go(w, at(9, 30), { log: (line) => { lines.push(line); log(line); } });
+    return { result, lines };
+  };
+  const slotLine = (window, counts) => `Slot 2026-11-13T09:30Z, window ${window} min: 2 users, ${counts}.`;
+  const restart = 'The claim was lost to a run for another slot (newest claimed slot: 2026-11-13T09:00Z): starting again.';
+  // the late 09:00 run claims between this run's read and claim: 09:30 is still sent, 09:00 is not sent twice
+  const w = build();
+  w.fail = (op, arg) => (arg === 'users/uid-bob/habits' ? unavailable() : null);
+  const first = await raced(w, [at(9)]);
+  assert.deepEqual(first.result, { slot: at(9, 30), sent: 1, skipped: 0, failed: 1, removed: 0 }); // bob counted once
+  assert.deepEqual(tags(w), ['t0930']);
+  assert.equal(w.docs.get(BOOKMARK).data.lastSlot, at(9, 30));
+  const claims = w.calls.filter((c) => c.op === 'setDoc').map((c) => c.options.ifUpdateTime);
+  assert.equal(claims.length, 2);
+  assert.ok(claims[0] < claims[1] && claims[1] < w.docs.get(BOOKMARK).updateTime); // claimed against the bookmark as re-read
+  assert.deepEqual(w.ops('listDocs').filter((arg) => arg === 'users'), ['users']); // the user list is read once
+  assert.deepEqual(first.lines, [
+    slotLine(60, '2 reminders due, 0 skipped (already done), 1 device, 1 failed read tried again'), restart,
+    slotLine(30, '1 reminder due, 0 skipped (already done), 1 device, 1 failed read tried again'),
+    'Failed 1 x: reading a user, HTTP 503 UNAVAILABLE.',
+  ]);
+
+  // the second claim is lost to a run for this very slot: a success with nothing sent
+  const same = build();
+  assert.deepEqual(await raced(same, [at(9), at(9, 30)]), {
+    result: nothing,
+    lines: [slotLine(60, '3 reminders due, 0 skipped (already done), 2 devices'), restart,
+      slotLine(30, '2 reminders due, 0 skipped (already done), 2 devices'), 'Another run claimed slot 2026-11-13T09:30Z: nothing sent.'],
+  });
+  assert.deepEqual([same.pushes, same.ops('setDoc').length], [[], 2]);
+
+  // the second claim is lost to an older slot again: no third try, the run fails and the slot stays open
+  const twice = build();
+  const lost = await raced(twice, [at(9), at(9)]);
+  assert.deepEqual(lost.result, { slot: null, sent: 0, skipped: 0, failed: 1, removed: 0 });
+  assert.equal(lost.lines.at(-1), 'Two claims in a row were lost to other runs and slot 2026-11-13T09:30Z is still open: '
+    + 'the slot is not claimed, so the next run retries it. Nothing was sent.');
+  assert.deepEqual([twice.pushes, twice.ops('setDoc').length, twice.docs.get(BOOKMARK).data.lastSlot], [[], 2, at(9)]);
+  twice.before = async () => {};
+  assert.deepEqual(tags((await go(twice, at(9, 30)), twice)), ['t0930', 'h1']); // the next run has it
+
+  // the bookmark cannot be read again after the lost claim: the run fails, nothing is sent
+  const blind = build();
+  blind.before = async (op) => {
+    if (op !== 'setDoc') return;
+    blind.put(BOOKMARK, { lastSlot: at(9), updatedAt: 1 });
+    blind.fail = (o, arg) => (arg === BOOKMARK ? unavailable() : null);
+  };
+  await assert.rejects(go(blind, at(9, 30)), GoogleError);
+  assert.deepEqual(blind.pushes, []);
 });
 
 test('4. one missed run is caught up, older slots are not replayed, the first ever run sends the current slot only', async () => {
@@ -356,7 +427,7 @@ test('6a. an unregistered device is deleted and the run succeeds; no device is d
   assert.deepEqual(await go(x, at(9)), { slot: at(9), sent: 2, skipped: 0, failed: 1, removed: 0 });
 });
 
-test('6b. one user\'s failed read does not stop the others; the result reports it', async () => {
+test('6b. one user\'s read that keeps failing does not stop the others; the result reports it', async () => {
   const w = worldAt(at(8, 30));
   for (const name of ['alice', 'bob', 'carol', 'dave']) addUser(w, `uid-${name}`, { habits: { h1: {} }, devices: [`fid-${name}`] });
   w.fail = (op, arg) => {
@@ -366,6 +437,54 @@ test('6b. one user\'s failed read does not stop the others; the result reports i
   assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 1, skipped: 0, failed: 3, removed: 0 });
   assert.deepEqual(w.pushes.map((p) => p.fid), ['fid-dave']);
   assert.equal(w.docs.get(BOOKMARK).data.lastSlot, at(9));
+  // each failed read was tried exactly twice
+  assert.equal(w.ops('listDocs').filter((arg) => arg === 'users/uid-bob/habits').length, 2);
+  assert.equal(w.ops('getDoc').filter((arg) => arg === 'users/uid-carol/logs/2026-11').length, 2);
+});
+
+test('6b2. a read that fails once is tried again after a second: that user loses nothing; one retry per user', async () => {
+  const build = () => {
+    const w = worldAt(at(8, 30));
+    for (const name of ['alice', 'bob', 'carol', 'dave']) addUser(w, `uid-${name}`, { habits: { h1: {} }, devices: [`fid-${name}`] });
+    return w;
+  };
+  /** Makes the first call of each of `targets` (an `arg` of the stand-in) fail. */
+  const failOnce = (w, targets, error = unavailable) => {
+    const left = new Set(targets);
+    w.fail = (op, arg) => (left.delete(op === 'queryEqual' ? `${op} ${w.ops('queryEqual').length}` : arg) ? error() : null);
+  };
+  // bob's habit list, carol's logs and dave's devices (the 4th device query) each fail once, in different ways
+  const w = build();
+  const errors = [unavailable(), new GoogleError('getDoc failed: no answer in time', { code: 'TIMEOUT' }), new Error('socket closed')];
+  failOnce(w, ['users/uid-bob/habits', 'users/uid-carol/logs/2026-11', 'queryEqual 4'], () => errors.shift());
+  waits.length = 0;
+  const lines = [];
+  const result = await go(w, at(9), { log: (line) => { lines.push(line); log(line); } });
+  assert.deepEqual(result, { slot: at(9), sent: 4, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual(w.pushes.map((p) => p.fid), ['fid-alice', 'fid-bob', 'fid-carol', 'fid-dave']);
+  assert.deepEqual(waits, [1000, 1000, 1000]);
+  assert.deepEqual(w.calls.slice(0, 6).map((c) => `${c.op} ${c.arg}`), [`getDoc ${BOOKMARK}`, 'listDocs users',
+    'listDocs users/uid-alice/habits', 'getDoc users/uid-alice/logs/2026-11', 'queryEqual devices uid', 'listDocs users/uid-bob/habits']);
+  assert.equal(w.ops('listDocs').length, 1 + 4 + 1); // only the failed read is repeated
+  assert.deepEqual(lines, ['Slot 2026-11-13T09:00Z, window 30 min: 4 users, 4 reminders due, 0 skipped (already done), '
+    + '4 devices, 3 failed reads tried again.']);
+
+  // a second failed read of the same user is not tried again: that user fails, the others are served
+  const v = build();
+  failOnce(v, ['users/uid-bob/habits', 'users/uid-bob/logs/2026-11']);
+  assert.deepEqual(await go(v, at(9)), { slot: at(9), sent: 3, skipped: 0, failed: 1, removed: 0 });
+  assert.deepEqual(v.pushes.map((p) => p.fid), ['fid-alice', 'fid-carol', 'fid-dave']);
+  assert.equal(v.ops('getDoc').filter((arg) => arg === 'users/uid-bob/logs/2026-11').length, 1);
+  assert.equal(v.docs.get(BOOKMARK).data.lastSlot, at(9));
+
+  // no retry when it is already too late to claim (the failed read took 95 of the 120 s)
+  const x = build();
+  failOnce(x, ['users/uid-bob/habits']);
+  let t = 0;
+  x.before = async (op, arg) => { if (arg === 'users/uid-bob/habits') t += 95000; };
+  waits.length = 0;
+  assert.deepEqual(await go(x, at(9), { clock: () => t }), { slot: null, sent: 0, skipped: 0, failed: 2, removed: 0 });
+  assert.deepEqual([waits, x.ops('listDocs').filter((arg) => arg === 'users/uid-bob/habits').length, x.ops('setDoc')], [[], 1, []]);
 });
 
 test('6c. a failed read of the bookmark or the user list, or of every user, leaves the slot for the next run', async () => {
@@ -534,26 +653,39 @@ test('time limit: past the deadline no new push is started and the rest count as
     const result = await run({ google: w.google, now: at(8, 56), log: (line) => { lines.push(line); log(line); }, clock: () => t, ...options });
     return { result, last: lines.at(-1) };
   };
-  // default 150 s, 40 s a push: four are started (at 0, 40, 80 and 120 s), two are not
+  // default 120 s, 40 s a push: four are started (at 0, 40, 80 and 120 s), two are not
   const w = build();
   assert.deepEqual(await timed(w, 'sendPush', 40000), {
     result: { slot: at(9), sent: 4, skipped: 0, failed: 2, removed: 0 },
-    last: 'Time limit (150 s) reached while sending. Pushes not sent: 2.',
+    last: 'Time limit (120 s) reached while sending. Pushes not sent: 2.',
   });
+  const exact = build(); // 30 s a push: the fifth would start at 120 s exactly, which is still in time
+  assert.equal((await timed(exact, 'sendPush', 30000)).result.sent, 5);
   assert.deepEqual(w.pushes.map((p) => p.fid), ['fid-alice-laptop', 'fid-alice-phone', 'fid-alice-laptop', 'fid-alice-phone']);
   assert.equal(w.docs.get(BOOKMARK).data.lastSlot, at(9));
   const short = build();
   assert.deepEqual((await timed(short, 'sendPush', 40000, { deadlineMs: 50000 })).result,
     { slot: at(9), sent: 2, skipped: 0, failed: 4, removed: 0 });
   // reading takes 160 s: nothing is claimed or sent, and the next run still has the slot
+  const tooLate = 'Reading ended less than 30 s before the time limit (120 s), too late to send: '
+    + 'the slot is not claimed, so the next run retries it. Nothing was sent.';
   const slow = build();
-  assert.deepEqual(await timed(slow, 'listDocs', 160000), {
-    result: { slot: null, sent: 0, skipped: 0, failed: 1, removed: 0 },
-    last: 'Time limit (150 s) reached while reading: the slot is not claimed, so the next run retries it. Nothing was sent.',
-  });
+  assert.deepEqual(await timed(slow, 'listDocs', 160000), { result: { slot: null, sent: 0, skipped: 0, failed: 1, removed: 0 }, last: tooLate });
   assert.deepEqual([slow.ops('setDoc'), slow.pushes, slow.ops('listDocs')], [[], [], ['users', 'users/uid-alice/habits']]);
   slow.before = async () => {};
   assert.equal((await go(slow, at(9))).sent, 6);
+  // the claim needs 30 s of the limit left for sending: reading for 91 s (2 x 45.5) is too long, 90 s is not
+  const tight = build();
+  assert.deepEqual(await timed(tight, 'queryEqual', 45500), { result: { slot: null, sent: 0, skipped: 0, failed: 1, removed: 0 }, last: tooLate });
+  assert.deepEqual([tight.ops('setDoc'), tight.pushes, tight.ops('queryEqual').length], [[], [], 2]);
+  const enough = build();
+  assert.deepEqual((await timed(enough, 'queryEqual', 45000)).result, { slot: at(9), sent: 6, skipped: 0, failed: 0, removed: 0 });
+  assert.equal(enough.docs.get(BOOKMARK).data.lastSlot, at(9));
+  // the same with another limit, and for a forced run (which claims nothing anyway)
+  assert.equal((await timed(build(), 'queryEqual', 45500, { deadlineMs: 150000 })).result.sent, 6);
+  const forced = build();
+  assert.deepEqual((await timed(forced, 'queryEqual', 45500, { force: true })).result, { slot: null, sent: 0, skipped: 0, failed: 1, removed: 0 });
+  assert.deepEqual(forced.pushes, []);
 });
 
 /** Runs the command itself with the given environment (nothing inherited but PATH). */
@@ -587,6 +719,79 @@ test('7. missing or malformed key: exit code 1 and a clear message that shows no
   // importing the module runs nothing
   const importOnly = ['--input-type=module', '-e', `await import(${JSON.stringify(pathToFileURL(SCRIPT).href)})`];
   assert.deepEqual(command({}, importOnly), { code: 0, output: '' });
+});
+
+test('7b. the command (main): exit code 0 or 1, the summary line, and only REMINDERS_FORCE=1 forces a run', async () => {
+  const build = () => {
+    const w = worldAt(at(8, 30));
+    addUser(w, 'uid-alice', {
+      habits: { h1: {}, h2: { name: 'Stretch', target: 1 } }, logs: { '2026-11-13': { h2: 1 } },
+      devices: ['fid-alice-phone', 'fid-alice-old'],
+    });
+    w.pushReply = (fid) => (fid === 'fid-alice-old' ? 'unregistered' : 'sent');
+    return w;
+  };
+  const start = async (w, env = {}, makeGoogle = () => w.google) => {
+    const lines = [];
+    const code = await main({ env, now: at(8, 56), log: (line) => { lines.push(line); log(line); }, makeGoogle });
+    return { code, lines };
+  };
+  // all well: exit code 0, the summary is the last line, the slot is claimed
+  const fine = build();
+  let given;
+  const env = { REMINDERS_FORCE: '', FCM_BASE_URL: 'http://127.0.0.1:9' };
+  const ok = await start(fine, env, (e) => { given = e; return fine.google; });
+  assert.equal(ok.code, 0);
+  assert.equal(given, env); // the factory gets the environment
+  assert.deepEqual(ok.lines, [
+    'Slot 2026-11-13T09:00Z, window 30 min: 1 user, 1 reminder due, 1 skipped (already done), 2 devices.',
+    'Done: 1 sent, 1 skipped, 0 failed, 1 device removed.',
+  ]);
+  assert.equal(fine.docs.get(BOOKMARK).data.lastSlot, at(9));
+  assert.deepEqual(await start(fine), { code: 0, lines: ['Nothing to do: the newest claimed slot is 2026-11-13T09:00Z.',
+    'Done: 0 sent, 0 skipped, 0 failed, 0 devices removed.'] });
+
+  // anything failed: exit code 1, with the same summary
+  const bad = build();
+  bad.pushReply = () => new GoogleError('sendPush failed', { status: 500, code: 'INTERNAL' });
+  const failed = await start(bad);
+  assert.equal(failed.code, 1);
+  assert.deepEqual(failed.lines.slice(1), ['Failed 2 x: a push, HTTP 500 INTERNAL.', 'Done: 0 sent, 1 skipped, 2 failed, 0 devices removed.']);
+  const late = worldAt(at(10)); // a result that failed without a single failed call
+  assert.equal((await start(late)).code, 1);
+
+  // the run itself fails: exit code 1, one line, no summary
+  const down = build();
+  down.fail = (op, arg) => (arg === 'users' ? unavailable(`secret of ${EMAIL}`) : null);
+  assert.deepEqual(await start(down), { code: 1, lines: ['Run stopped, listing the users failed: HTTP 503 UNAVAILABLE. Nothing was sent.',
+    'Reminder run failed: HTTP 503 UNAVAILABLE.'] });
+  // no client: exit code 1 and only our own text
+  assert.deepEqual(await start(build(), {}, () => { throw new ConfigError('FIREBASE_SERVICE_ACCOUNT is not set'); }),
+    { code: 1, lines: ['Reminder job cannot start: FIREBASE_SERVICE_ACCOUNT is not set.'] });
+  assert.deepEqual(await start(build(), {}, () => { throw new Error(`cannot parse ${EMAIL}`); }),
+    { code: 1, lines: ['Reminder job cannot start: Error.'] });
+
+  // REMINDERS_FORCE: unset, empty or anything but '1' is a normal run, which claims the slot
+  for (const value of [undefined, '', '0', 'true', 'false', 'yes', '2', ' 1', '1 ', 'force']) {
+    const w = build();
+    const { code, lines } = await start(w, value === undefined ? {} : { REMINDERS_FORCE: value });
+    assert.equal(code, 0, `REMINDERS_FORCE=${value}`);
+    assert.equal(w.docs.get(BOOKMARK).data.lastSlot, at(9), `REMINDERS_FORCE=${value}`);
+    assert.ok(!lines.some((line) => line.startsWith('Forced run')), `REMINDERS_FORCE=${value}`);
+    assert.deepEqual((await start(w, { REMINDERS_FORCE: value ?? '' })).lines[0], 'Nothing to do: the newest claimed slot is 2026-11-13T09:00Z.');
+  }
+  // '1' is a forced run: the bookmark is neither read nor written, and a claimed slot is sent again
+  const w = build();
+  const bookmark = structuredClone(w.docs.get(BOOKMARK));
+  for (let i = 0; i < 2; i += 1) {
+    const forced = await start(w, { REMINDERS_FORCE: '1' });
+    assert.equal(forced.code, 0);
+    assert.deepEqual(forced.lines.slice(1), ['Forced run: the bookmark was not read and is not changed.',
+      `Done: 1 sent, 1 skipped, 0 failed, ${i ? '0 devices' : '1 device'} removed.`]);
+  }
+  assert.deepEqual(w.docs.get(BOOKMARK), bookmark);
+  assert.ok(!w.calls.some((c) => c.arg === BOOKMARK));
+  assert.equal(w.pushes.length, 2);
 });
 
 test('8. reads are kept to a minimum, and a 200-user run finishes in under 5 seconds', async () => {
@@ -645,11 +850,11 @@ test('9. nothing sensitive in the log: no habit name, uid, device id, email or s
   w.fail = (op, arg) => (arg === 'users/uid-bob/habits' ? unavailable(said) : null);
   w.pushReply = (fid) => (fid === 'fid-alice-old' ? 'unregistered' : new GoogleError(said, { status: 403, code: said, detail: said }));
   const lines = [];
-  const result = await run({ google: w.google, now: at(8, 56), log: (line) => { lines.push(line); log(line); } });
+  const result = await run({ google: w.google, now: at(8, 56), log: (line) => { lines.push(line); log(line); }, sleep });
   assert.deepEqual(result, { slot: at(9), sent: 0, skipped: 1, failed: 2, removed: 1 });
   assert.deepEqual(lines, [
     'Slot 2026-11-13T09:00Z, window 60 min: 3 users, 2 reminders due, 1 skipped (already done), 2 devices, '
-      + '1 due without a device, 1 unusable device record ignored.',
+      + '1 due without a device, 1 unusable device record ignored, 1 failed read tried again.',
     'Failed 1 x: reading a user, HTTP 503 UNAVAILABLE.',
     'Failed 1 x: a push, HTTP 403 UNKNOWN.',
   ]);
