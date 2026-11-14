@@ -17,7 +17,7 @@ One line per package. States: not started, in progress, in review, changes reque
 | B1 | Firebase store | Dev B | in review | On `wp/B1`; `npm run test:emulator` 98 of 98 |
 | B4 | Reminder job | Dev B | merged | Reviewed, 4 findings fixed; `npm test` 92 of 92 on main |
 | B5 | Push registration | Dev B | not started | |
-| B6 | Workflows and owner setup guide | Dev B | not started | |
+| B6 | Workflows and owner setup guide | Dev B | in review | CI workflow and `docs/owner-setup.md` on main; `reminders.yml` stays on `wp/B6` until the owner has saved the secret (a schedule without the key would fail every 30 minutes) |
 | L1 | Local integration on the emulator | Lead | not started | |
 | L2 | Go live: deploy, sign-in, sync | Lead | not started | Needs owner |
 | L3 | Reminders on the owner's phone | Lead | not started | Needs owner |
