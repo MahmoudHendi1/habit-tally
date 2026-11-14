@@ -16,6 +16,9 @@
 //        return a clean-up function, which runs when the screen is unmounted (tab change, sign-out):
 //        unsubscribe there and reset the module-level UI state.
 //      `root` is a <div class="screen">: a column with 16px between the top-level elements of your HTML.
+//      export function dayChanged(ctx): void      (optional)
+//        Called just before a render when the local day is not the one of the last render (midnight
+//        passed): drop UI state that belonged to the old day, and tell the person with ctx.toast().
 //
 //    - signin.js is mounted while state.status is 'signedOut' OR 'waiting'; its render() switches on it.
 //    - settings.js also exports `notice(state, ctx): string` (contracts section 11) and
@@ -142,7 +145,7 @@ import { parseKey } from '../../shared/logic.js';
  * @property {() => void} refresh
  */
 /** @typedef {{ render: (state: State, ctx: Ctx) => string,
- *     bind: (root: HTMLElement, ctx: Ctx) => void | (() => void) }} Screen */
+ *     bind: (root: HTMLElement, ctx: Ctx) => void | (() => void), dayChanged?: (ctx: Ctx) => void }} Screen */
 
 // ---------- text ----------
 

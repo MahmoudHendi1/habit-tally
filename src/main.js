@@ -75,7 +75,9 @@ function draw() {
   const ready = state.status === 'ready';
   /** @type {View} */
   const view = state.status === 'loading' ? 'loading' : ready ? tabFromAddress() : 'signin';
-  dayDrawn = ctx.today();
+  const day = ctx.today();
+  if (dayDrawn && day !== dayDrawn && mounted.view) SCREENS[mounted.view].dayChanged?.(ctx);
+  dayDrawn = day;
 
   if (ready && lastStatus !== 'ready') push.resume().catch(() => { /* reminders stay as they were; Settings shows the status */ });
   if (lastStatus === 'ready' && !ready) {

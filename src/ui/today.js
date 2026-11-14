@@ -15,6 +15,18 @@ let picked = null;
  *  @param {string} today */
 const dayShown = (today) => (picked && recentDays(today).includes(picked) ? picked : today);
 
+/** The picked day has left the 7 days that can be logged (midnight passed): go to today and say so,
+ *  instead of changing the day silently under the person's finger. @param {Ctx} ctx */
+function leaveOldDay(ctx) {
+  picked = null;
+  ctx.toast('That day can no longer be logged. Showing today.');
+}
+
+/** Called by main.js before it renders a new local day (contract rule 2). @param {Ctx} ctx */
+export function dayChanged(ctx) {
+  if (picked && !recentDays(ctx.today()).includes(picked)) leaveOldDay(ctx);
+}
+
 /** "Today", "Yesterday" or "3 days ago". @param {string} day @param {string} today */
 function howLongAgo(day, today) {
   const back = recentDays(today).indexOf(day);
@@ -108,6 +120,13 @@ export function bind(root, ctx) {
       if (el.getAttribute('aria-disabled') === 'true') return;
       // Log on the day the card was drawn for: just after midnight that can still be yesterday.
       const day = /** @type {HTMLElement} */ (el.closest('[data-day]')).dataset.day ?? ctx.today();
+      // Midnight can pass between the render and the tap: the store would drop a count for a day that
+      // is out of range without a word.
+      if (!recentDays(ctx.today()).includes(day)) {
+        leaveOldDay(ctx);
+        ctx.refresh();
+        return;
+      }
       ctx.store.addCount(day, id, action === 'add' ? 1 : -1);
       const { habits, logs } = ctx.store.getState();
       const habit = habits.find((h) => h.id === id);
