@@ -200,8 +200,7 @@ function remindersView(s) {
     <p class="field-hint" id="editor-reminders-hint">Reminders arrive at about the chosen time (they can be up to 20 minutes late), stop for the
       ${period === 'week' ? 'week' : 'day'} once the target is reached, and need “Turn on reminders” in Settings.</p>
     ${status === 'on' ? '' : `<div class="notice editor-push${times.length > 0 && status !== 'demo' ? ' notice-warn' : ''}" id="editor-push">
-      <p>${esc(pushNote(status))}</p>${status === 'off' || status === 'blocked'
-    ? '<button type="button" class="btn" data-action="settings">Open Settings</button>' : ''}</div>`}
+      <p>${esc(pushNote(status))}</p></div>`}
     <div class="editor-add">
       <div class="field"><label for="editor-time">Add a time</label>
         <select class="input num" id="editor-time" name="time"${describe(s, 'times')}>${options('time', HALF_HOURS, s.picks.time)}</select></div>
@@ -281,7 +280,7 @@ function view(s) {
       ${errorOf(s, 'form')}
       <div class="sheet-actions">
         <button type="button" class="btn" data-sheet-close>${s.gone ? 'Close' : 'Cancel'}</button>
-        ${s.gone ? '' : '<button type="submit" class="btn btn-primary">Save habit</button>'}
+        ${s.gone ? '' : '<button type="button" class="btn btn-primary" data-action="save">Save habit</button>'}
       </div>
     </div>
   </form>`;
@@ -364,11 +363,7 @@ function remove(s) {
 function act(s, el) {
   const { action } = el.dataset;
   if (action === 'delete') return remove(s);
-  if (action === 'settings') {
-    s.end();
-    s.close();
-    return s.ctx.navigate('settings');
-  }
+  if (action === 'save') return save(s);
   sync(s);
   if (action === 'step') {
     s.form.target = stepTarget(s.form.target, Number(el.dataset.delta));
@@ -442,9 +437,15 @@ export function openEditor(habitId, ctx) {
   s.body = sheet.body;
   s.close = sheet.close;
 
+  // Only the "Save habit" button saves. Enter (the Done key of a phone keyboard) in a text field puts
+  // the keyboard away instead, and the form itself is never submitted.
   on(sheet.body, 'submit', 'form', (event) => {
     event.preventDefault();
-    save(s);
+  });
+  on(sheet.body, 'keydown', '#editor-name, #editor-target, #editor-unit', (event, el) => {
+    if (event.key !== 'Enter' || event.isComposing) return;
+    event.preventDefault();
+    el.blur();
   });
   on(sheet.body, 'click', '[data-action]', (_event, el) => {
     act(s, el);
