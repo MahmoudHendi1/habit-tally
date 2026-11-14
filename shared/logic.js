@@ -2,7 +2,10 @@
 //
 // Data shapes
 //   habit: { id, name, period: 'day' | 'week', target, unit, times: ['09:00'], created: 'YYYY-MM-DD',
-//            archived, deletedAt, order, updatedAt }   (full contract: docs/contracts.md)
+//            archived, deletedAt, order, updatedAt, routine: '' | routineId }   (full contract: docs/contracts.md)
+//   routine: { id, name, times: ['07:00'], order, deletedAt, updatedAt }   a named, ordered list of habits done
+//            together. A habit is "in" a routine only while that routine exists and is not deleted; otherwise
+//            it is loose, like a habit with routine ''.
 //   logs:  { 'YYYY-MM': { 'YYYY-MM-DD': { [habitId]: count } } }
 
 export const SLOT_MINUTES = 30;
@@ -11,6 +14,7 @@ export const SLOT_MS = SLOT_MINUTES * 60 * 1000;
 /** Limits shared by the editor, both stores and (where expressible) the security rules. */
 export const LIMITS = Object.freeze({
   nameMax: 60, unitMax: 20, targetMin: 1, targetMax: 50, timesMax: 48, habitsMax: 50, backDays: 7,
+  routineNameMax: 40, routinesMax: 20,
 });
 
 export const pad = (n) => String(n).padStart(2, '0');
@@ -140,20 +144,37 @@ export function calendarWeeks(h, logs, today, weeks = 15) {
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):(00|30)$/;
+const ID_RE = /^[A-Za-z0-9]{20}$/;
+
+const cleanName = (v) => String(v ?? '').trim().replace(/\s+/g, ' ');
+const objects = (list) => (Array.isArray(list) ? list : []).filter((x) => x && typeof x === 'object');
+const finite = (n) => (Number.isFinite(n) ? n : 0);
+const byText = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // code-unit order: the same on every device
+
+function timesProblems(times) {
+  if (!Array.isArray(times) || times.some((t) => !TIME_RE.test(t))) return ['Reminder times must be on the hour or half hour.'];
+  if (times.length > LIMITS.timesMax) return [`At most ${LIMITS.timesMax} reminder times.`];
+  if (new Set(times).size !== times.length) return ['A reminder time is listed twice.'];
+  return [];
+}
 
 /** Tidy what the editor collected: trims text, whole-number target, snapped unique sorted times.
+ *  `routine` is '' or a routine id; a habit in a routine has no reminder times of its own, so they are emptied.
  *  Returns only the fields a person edits; ids, dates and order are set by the store. */
 export function cleanHabit(input) {
+  const routine = typeof input?.routine === 'string' ? input.routine.trim() : '';
   return {
-    name: String(input?.name ?? '').trim().replace(/\s+/g, ' '),
+    name: cleanName(input?.name),
     period: input?.period === 'week' ? 'week' : 'day',
     target: Math.round(Number(input?.target)),
     unit: String(input?.unit ?? '').trim(),
-    times: cleanTimes(input?.times),
+    times: routine ? [] : cleanTimes(input?.times),
+    routine,
   };
 }
 
-/** Problems with a habit, as short sentences for the editor. Empty list = valid. Run on cleanHabit output. */
+/** Problems with a habit, as short sentences for the editor. Empty list = valid. Run on cleanHabit output.
+ *  A missing `routine` counts as ''. */
 export function validateHabit(h) {
   const out = [];
   if (!h || typeof h !== 'object') return ['Habit is missing.'];
@@ -164,9 +185,10 @@ export function validateHabit(h) {
     out.push(`Target must be a whole number from ${LIMITS.targetMin} to ${LIMITS.targetMax}.`);
   }
   if (typeof h.unit !== 'string' || h.unit.length > LIMITS.unitMax) out.push(`Keep the unit to ${LIMITS.unitMax} characters.`);
-  if (!Array.isArray(h.times) || h.times.some((t) => !TIME_RE.test(t))) out.push('Reminder times must be on the hour or half hour.');
-  else if (h.times.length > LIMITS.timesMax) out.push(`At most ${LIMITS.timesMax} reminder times.`);
-  else if (new Set(h.times).size !== h.times.length) out.push('A reminder time is listed twice.');
+  out.push(...timesProblems(h.times));
+  const routine = h.routine ?? ''; // a habit stored before routines existed has no such field
+  if (routine !== '' && !(typeof routine === 'string' && ID_RE.test(routine))) out.push('Choose a routine from the list.');
+  else if (routine !== '' && Array.isArray(h.times) && h.times.length > 0) out.push('A habit in a routine takes its reminder times from the routine.');
   if ('created' in h && !DAY_RE.test(h.created || '')) out.push('Start date is not a valid day.');
   return out;
 }
@@ -175,6 +197,50 @@ export function validateHabit(h) {
 export function sortHabits(habits) {
   return habits.filter((h) => !h.deletedAt)
     .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(a.id).localeCompare(String(b.id)));
+}
+
+// ---------- routines ----------
+
+/** Tidy what the routine editor collected. Returns only the fields a person edits. */
+export function cleanRoutine(input) {
+  return { name: cleanName(input?.name), times: cleanTimes(input?.times) };
+}
+
+/** Problems with a routine, as short sentences for the editor. Empty list = valid. Run on cleanRoutine output. */
+export function validateRoutine(r) {
+  if (!r || typeof r !== 'object') return ['Routine is missing.'];
+  const out = [];
+  if (typeof r.name !== 'string' || r.name.trim().length === 0) out.push('Give the routine a name.');
+  else if (r.name.length > LIMITS.routineNameMax) out.push(`Keep the name to ${LIMITS.routineNameMax} characters.`);
+  out.push(...timesProblems(r.times));
+  return out;
+}
+
+/** Display order: by `order`, then by name, then by id. Deleted routines are left out. */
+export function sortRoutines(routines) {
+  return objects(routines).filter((r) => !r.deletedAt)
+    .sort((a, b) => finite(a.order) - finite(b.order) || byText(String(a.name ?? ''), String(b.name ?? ''))
+      || byText(String(a.id), String(b.id)));
+}
+
+/** The live routine a habit belongs to, or null when the habit is loose: `routine` is '' or missing, or it
+ *  names a routine that does not exist or is deleted. The one test of membership for the app and the job. */
+export function routineOf(habit, routines) {
+  const id = habit?.routine;
+  if (typeof id !== 'string' || id === '') return null;
+  return objects(routines).find((r) => r.id === id && !r.deletedAt) ?? null;
+}
+
+/** The sections of Today and Progress: one { routine, habits } per live routine in sortRoutines order (also
+ *  when it has no habits), then { routine: null, habits } with the loose habits. The last entry is present
+ *  when there are loose habits or no live routine at all. Habits inside an entry are in sortHabits order. */
+export function groupHabits(habits, routines) {
+  const live = sortRoutines(routines);
+  const sorted = sortHabits(objects(habits));
+  const out = live.map((routine) => ({ routine, habits: sorted.filter((h) => routineOf(h, live) === routine) }));
+  const loose = sorted.filter((h) => !routineOf(h, live));
+  if (loose.length || !live.length) out.push({ routine: null, habits: loose });
+  return out;
 }
 
 // ---------- reminder times ----------
@@ -270,17 +336,40 @@ export function dueWindows(from, slot, tz) {
   return out;
 }
 
-/** Habits that should send a reminder for local day `day`; `times` is one 'HH:MM' or a list (dueTimes). */
-export function dueHabits(habits, logs, day, times) {
+/** Whether a live habit still has something to do on `day`: the one test behind habit and routine reminders. */
+function stillToDo(h, logs, day) {
+  if (h.archived || h.deletedAt) return false;
+  if (isHit(h, logs, day)) return false;
+  // A weekly habit already logged today has had its turn for the day.
+  if (isWeekly(h) && countOn(logs, h.id, day) > 0) return false;
+  return true;
+}
+const hasTime = (x, want) => Array.isArray(x.times) && x.times.some((t) => want.has(t));
+
+/** Habits that should send a reminder of their own for local day `day`; `times` is one 'HH:MM' or a list
+ *  (dueTimes). Habits in a live routine are left out (the routine reminds for them, see dueRoutines), so a
+ *  caller that has routines must pass them; without `routines` every habit counts as loose. */
+export function dueHabits(habits, logs, day, times, routines) {
   const want = new Set([].concat(times || []));
-  return habits.filter((h) => {
-    if (h.archived || h.deletedAt) return false;
-    if (!Array.isArray(h.times) || !h.times.some((t) => want.has(t))) return false;
-    if (isHit(h, logs, day)) return false;
-    // A weekly habit already logged today has had its turn for the day.
-    if (isWeekly(h) && countOn(logs, h.id, day) > 0) return false;
-    return true;
-  });
+  const live = sortRoutines(routines);
+  return habits.filter((h) => !routineOf(h, live) && hasTime(h, want) && stillToDo(h, logs, day));
+}
+
+/** The habits of a live routine that still have something to do on `day`, in routine (sortHabits) order:
+ *  not archived or deleted, target not hit in the habit's own period (the day, or the Monday-to-Sunday week),
+ *  and for a weekly habit nothing logged on `day` yet. [] for a deleted or missing routine. */
+export function routineLeft(routine, habits, logs, day) {
+  if (!routine || typeof routine !== 'object' || routine.deletedAt) return [];
+  return sortHabits(objects(habits).filter((h) => routineOf(h, [routine]))).filter((h) => stillToDo(h, logs, day));
+}
+
+/** Routines that should send a reminder for local day `day`: live, with one of `times` ('HH:MM' or a list)
+ *  among their reminder times and at least one habit left. Returns [{ routine, left }] in sortRoutines order. */
+export function dueRoutines(routines, habits, logs, day, times) {
+  const want = new Set([].concat(times || []));
+  return sortRoutines(routines).filter((r) => hasTime(r, want))
+    .map((routine) => ({ routine, left: routineLeft(routine, habits, logs, day) }))
+    .filter((d) => d.left.length > 0);
 }
 
 export function reminderText(h, logs, day) {
@@ -291,4 +380,23 @@ export function reminderText(h, logs, day) {
     title: h.name,
     body: done === 0 ? `Not started ${span}. Target: ${h.target}${unit}.` : `${done} of ${h.target}${unit} done ${span}.`,
   };
+}
+
+export const REMINDER_BODY_MAX = 120;
+
+/** Text of a routine's reminder; `left` is routineLeft(). Body: "2 left: Take pills, Brush teeth". The body is
+ *  never longer than REMINDER_BODY_MAX: names that do not fit are dropped whole and the list ends with ", ...". */
+export function routineReminderText(routine, left) {
+  const title = String(routine?.name ?? '');
+  const names = objects(left).map((h) => String(h.name ?? ''));
+  if (!names.length) return { title, body: 'All done.' };
+  const head = `${names.length} left: `;
+  let body = head + names.join(', ');
+  if (body.length > REMINDER_BODY_MAX) {
+    let kept = names.length - 1;
+    const cut = () => `${head}${names.slice(0, kept).join(', ')}, ...`;
+    while (kept > 0 && cut().length > REMINDER_BODY_MAX) kept--;
+    body = kept > 0 ? cut() : `${(head + names[0]).slice(0, REMINDER_BODY_MAX - 3)}...`;
+  }
+  return { title, body };
 }

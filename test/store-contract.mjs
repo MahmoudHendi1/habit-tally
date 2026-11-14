@@ -63,7 +63,7 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
       const [first, next] = store.getState().habits;
       const { order, updatedAt, ...rest } = first;
       assert.deepEqual(rest, { id, name: 'Drink water', period: 'day', target: 8, unit: 'glasses', times: ['09:00', '15:00'],
-        created: today, archived: false, deletedAt: null });
+        routine: '', created: today, archived: false, deletedAt: null });
       assert.deepEqual([typeof order, typeof updatedAt], ['number', 'number']);
       assert.deepEqual([next.id, next.period, next.order > order], [second, 'week', true]);
       assert.equal(store.getState().habits.length, 2);
@@ -90,7 +90,7 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     await holds(() => {
       assert.deepEqual(store.getState().habits.map((h) => h.id), [id]);
       const { updatedAt, ...rest } = habit(id);
-      assert.deepEqual(rest, { id, ...WATER, created: today, archived: false, deletedAt: null, order: 1 });
+      assert.deepEqual(rest, { id, ...WATER, routine: '', created: today, archived: false, deletedAt: null, order: 1 });
       assert.ok(updatedAt > 5);
     });
   });
