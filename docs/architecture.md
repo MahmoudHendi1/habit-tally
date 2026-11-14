@@ -67,6 +67,23 @@ Rules of the model:
   until someone signs in again.
 - No composite indexes. The job's `devices where uid == X` query uses the automatic single-field index.
 
+**Routines (added 14 Nov 2026, contract v1.3).** A routine is a named, ordered list of habits done together
+(R15), with its own reminder times:
+
+```
+users/{uid}/routines/{routineId}   { name, times: ["07:00"], order: number, deletedAt: null | <ms>, updatedAt: <ms> }
+users/{uid}/habits/{habitId}       gains  routine: "" | <routineId>   (eleven fields)
+```
+
+- A habit belongs to at most one routine and then has no times of its own (`times` is empty; the rules
+  enforce it). The link is stored on the habit, so moving a habit is one write and deleting a routine writes
+  nothing but the routine.
+- The rules cannot check that the named routine exists. A habit whose routine is missing or soft-deleted is
+  therefore treated everywhere as a loose habit; one shared function (`routineOf`) decides.
+- Order is a plain number on habits and on routines, renumbered 1..n when the owner reorders. Two devices
+  reordering at once can leave ties; sorting breaks them the same way everywhere and the next reorder removes
+  them.
+
 ## 4. Reminder flow
 
 1. GitHub starts the workflow at :26 or :56 (often several minutes late). `concurrency: { group: reminders,
@@ -98,6 +115,13 @@ Rules of the model:
 9. On the phone, Chrome wakes the service worker, which always shows a notification (`tag: habitId`,
    `renotify: true`, so a later reminder for the same habit replaces the earlier one and buzzes again). Tapping it
    opens or focuses the app.
+
+Routines (contract v1.3): in step 5 the job also lists the user's routines (one more request per user and
+run, at most 50 records; for one user that is about 50 more reads a day against the 50,000 quota). A habit in
+a live routine gets no reminder of its own. In step 7 the job sends, per due routine and device, one message
+`data: { title: routine name, body: "2 left: Take pills, Brush teeth", tag: routineId, url: "/" }` built by
+`dueRoutines` and `routineReminderText`; it is skipped when no habit of the routine is left. The service
+worker needs no change, and the log still holds counts only.
 
 Trade-off, stated plainly: because the slot is claimed before sending, a run that crashes while sending drops that
 slot's remaining reminders instead of repeating them. The red run makes that visible. A manual run with the
