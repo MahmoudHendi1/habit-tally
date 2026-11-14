@@ -1,0 +1,34 @@
+/* Sign-in, the waiting screen, Settings and the time-zone prompt (package A5).
+   Colours, sizes and the shared classes come from styles.css (vocabulary: src/ui/common.js, rule 8). */
+
+/* ---------- sign-in ---------- */
+.account-lede { max-width: 34ch; margin-inline: auto; color: var(--muted); text-align: center; text-wrap: balance; }
+.account-form { width: 100%; max-width: 420px; margin-inline: auto; padding: 20px 16px; }
+.account-form h1 { font-size: 22px; }
+.account-form h1:focus { outline: none; }
+.account-password { display: flex; gap: 8px; }
+.account-password .input { flex: 1; min-width: 0; }
+.account-password .btn { flex: none; min-width: 72px; }
+.account-form .input[aria-invalid="true"] { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
+.account-form .field-error { padding: 8px 12px; border-radius: var(--r-sm); background: var(--danger-soft); }
+.account-ok { background: var(--accent-soft); color: var(--accent-text); }
+.account-switch { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0 4px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--muted); font-size: 15px; }
+.account-busy { opacity: 0.65; cursor: progress; }
+
+/* ---------- waiting for approval ---------- */
+.account-facts { display: grid; gap: 12px; margin: 0; }
+.account-facts dt { font-size: 14px; font-weight: 600; color: var(--muted); }
+.account-facts dd { margin: 2px 0 0; overflow-wrap: anywhere; }
+.account-id { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.account-id code { flex: 1 1 180px; min-width: 0; padding: 10px 12px; border-radius: var(--r-sm); background: var(--sunk); font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; user-select: all; -webkit-user-select: all; }
+.account-id .btn { flex: none; min-width: 96px; }
+
+/* ---------- Settings ---------- */
+.account-who { display: grid; gap: 2px; }
+.account-email { font-weight: 600; overflow-wrap: anywhere; }
+.account-zone { display: grid; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
+.account-zone h3 { margin: 0; font-size: 14px; font-weight: 600; color: var(--muted); }
+
+/* ---------- the time-zone prompt above every screen ---------- */
+.account-tz { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); background: var(--accent-soft); color: var(--ink); font-size: 15px; }
+.account-tz strong { overflow-wrap: anywhere; }
