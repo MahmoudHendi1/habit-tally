@@ -1,0 +1,89 @@
+# Sends the habit reminders. See docs/architecture.md section 4 and docs/contracts.md section 9.
+#
+# The log of this workflow is public (public repository). The script prints only counts, the slot time,
+# HTTP statuses and error codes. Do not add steps that print the environment or any response body.
+
+name: Send reminders
+
+on:
+  schedule:
+    # Minutes 26 and 56 of every hour, UTC. The script rounds "now + 5 minutes" down to the half hour, so
+    # these runs serve the :30 and :00 slots even though GitHub often starts scheduled runs late.
+    - cron: '26,56 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'force: send the reminders of the current half hour again, as a test (changes nothing else)'
+        type: boolean
+        default: false
+
+# contents: read is for the checkout. actions: write is only for the keepalive step at the end of the job.
+permissions:
+  contents: read
+  actions: write
+
+# One run at a time, and a run that has started is never cancelled: it may be in the middle of sending.
+concurrency:
+  group: reminders
+  cancel-in-progress: false
+
+jobs:
+  send:
+    name: Send reminders
+    # Never in a fork: a fork has no key, and its runs would only fail.
+    if: github.repository == 'MahmoudHendi1/habit-tally'
+    runs-on: ubuntu-latest
+    # The script stops itself after 120 s (contracts section 9); this limit is the backstop.
+    timeout-minutes: 3
+    steps:
+      # NOTE FOR THE LEAD: pinned to the major tag, not to a commit SHA. No copy of these actions was on disk
+      # to verify a SHA against, and the work package may not call the GitHub API. Before release, replace each
+      # tag with the full commit SHA of the release and keep the version in a comment, for example
+      #   uses: actions/checkout@<40-character SHA> # v5.x.y
+      - name: Check out the repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # No "npm install" or "npm ci": the script has no dependencies.
+
+      # The only step that sees the key. FCM_BASE_URL and FIRESTORE_EMULATOR_HOST are test overrides and must
+      # never be set here. REMINDERS_FORCE is exported only when the "force" box of a manual run is ticked;
+      # on a scheduled run inputs.force is empty, so FORCE is "false".
+      - name: Send reminders
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          FORCE: ${{ inputs.force == true }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            export REMINDERS_FORCE=1
+          fi
+          node scripts/send-reminders.mjs
+
+      # Keepalive. In a public repository GitHub disables scheduled workflows after 60 days without
+      # repository activity (no commits), and then the reminders stop without any error. Asking the API to
+      # enable this workflow again, while it is still enabled, starts the 60 days afresh. That is one PUT
+      # request with the job's own token (hence "actions: write"): no extra secret, no dummy commits and no
+      # third-party action. It is the same call the "Enable workflow" button makes.
+      #
+      # It runs on scheduled runs on Mondays (UTC) only: many chances a week, so late or dropped runs do
+      # not matter, and a week is far inside 60 days. It runs even when the step above failed, and a
+      # failure here turns the run red so that it is noticed long before the 60 days are over.
+      # If it is ever too late: docs/owner-setup.md, "If reminders stop".
+      - name: Keep the schedule enabled
+        if: ${{ !cancelled() && github.event_name == 'schedule' }}
+        timeout-minutes: 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%u)" != "1" ]; then
+            echo "Not Monday (UTC): nothing to do."
+            exit 0
+          fi
+          gh api --method PUT --silent "repos/$GITHUB_REPOSITORY/actions/workflows/reminders.yml/enable"
+          echo "Asked GitHub to keep this workflow enabled."
