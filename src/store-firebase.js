@@ -37,7 +37,7 @@ import {
 } from 'firebase/auth';
 import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache,
-  memoryLruGarbageCollector, connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, increment,
+  memoryLruGarbageCollector, connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, updateDoc, increment, runTransaction,
 } from 'firebase/firestore';
 import { LIMITS, keyOf, monthId, countOn, recentDays, cleanHabit, validateHabit, sortHabits } from '../shared/logic.js';
 import { firebaseConfig, emulatorConfig } from './firebase-config.js';
@@ -426,13 +426,19 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     }
   }
 
+  /** Device records go to the server now or not at all. An ordinary write would wait in the offline queue,
+   *  and reach the server long after push.js had given up and Settings had said otherwise; a transaction
+   *  is never queued. One attempt only, so that nothing is sent again later either. */
+  const deviceWrite = (fid, write) => runTransaction(db, async (tx) => void write(tx, doc(db, 'devices', fid)), { maxAttempts: 1 });
+
   async function saveDevice(fid) {
     const uid = auth.currentUser?.uid;
     if (!uid) throw new StoreError('not-ready', 'Sign in to turn on reminders.');
     if (typeof fid !== 'string' || !DEVICE_ID_RE.test(fid)) throw new StoreError('invalid', 'This device cannot be registered for reminders.');
     const ua = String(globalThis.navigator?.userAgent ?? '').slice(0, UA_MAX);
     try {
-      await setDoc(doc(db, 'devices', fid), { uid, ua, updatedAt: now().getTime() });
+      const record = { uid, ua, updatedAt: now().getTime() };
+      await deviceWrite(fid, (tx, ref) => tx.set(ref, record));
     } catch (err) {
       throw new StoreError('not-saved', 'Reminders could not be turned on for this device. Try again in a moment.');
     }
@@ -443,7 +449,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   async function removeDevice(fid) {
     if (!auth.currentUser || typeof fid !== 'string' || !DEVICE_ID_RE.test(fid)) return;
     try {
-      await deleteDoc(doc(db, 'devices', fid));
+      await deviceWrite(fid, (tx, ref) => tx.delete(ref));
     } catch (err) {
       if (err?.code !== 'permission-denied') throw new StoreError('not-saved', 'This device could not be removed. Try again in a moment.');
     }

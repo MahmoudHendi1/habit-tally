@@ -92,6 +92,25 @@ function open({ tz = 'Europe/London' } = {}) {
   };
 }
 
+/** A store whose Firestore cannot be reached at all, while Auth can: a blocker, or a first visit with the
+ *  connection gone. Nothing listens on port 1. */
+function openUnreachable(options) {
+  const port = emulatorConfig.firestorePort;
+  emulatorConfig.firestorePort = 1;
+  try {
+    return open(options);
+  } finally {
+    emulatorConfig.firestorePort = port;
+  }
+}
+
+/** `promise`, or a failure when it has not settled within 3 seconds. */
+function soon(promise, what) {
+  let timer;
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`not settled within 3 s: ${what}`)), 3000); });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
 /** A store that is signed in and ready on a fresh, invited account. */
 async function readyStore(options) {
   const account = await newAccount();
@@ -660,4 +679,27 @@ test('devices: saved with exactly uid, ua and updatedAt; taken over by the next 
   await until(nobody.store, (state) => state.status === 'signedOut', 'signed out');
   await rejects(nobody.store.saveDevice(fid), 'not-ready');
   assert.equal(await nobody.store.removeDevice(fid), undefined);
+});
+
+test('devices are written on the server at once or not at all, never queued for later', async () => {
+  const a = await readyStore();
+  const fid = 'bm90LXF1ZXVlZC1kZXZpY2', path = `devices/${fid}`;
+
+  // With the cache's network off an ordinary write would wait in the queue. These do not go through it.
+  await disableNetwork(a.db);
+  await soon(a.store.saveDevice(fid), 'saveDevice');
+  assert.equal((await stored(path)).uid, a.uid);
+  await soon(a.store.removeDevice(fid), 'removeDevice');
+  assert.equal(await stored(path), null);
+  await enableNetwork(a.db);
+
+  // Firestore out of reach: both calls fail, and nothing arrives later.
+  const cut = openUnreachable();
+  await rejects(cut.store.signIn(a.email, a.password), 'offline');
+  await rejects(soon(cut.store.saveDevice(fid), 'saveDevice'), 'not-saved');
+  await a.store.saveDevice(fid);
+  await rejects(soon(cut.store.removeDevice(fid), 'removeDevice'), 'not-saved');
+  await sleep(300);
+  assert.equal((await stored(path)).uid, a.uid);
+  assert.equal(a.store.getState().lastError, null);
 });
