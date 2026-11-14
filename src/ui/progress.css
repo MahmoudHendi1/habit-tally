@@ -1,1 +1,89 @@
-/* Placeholder. Package A4 (Progress screen) owns this file: styles for the Progress screen only. */
+/* Habit Tally: the Progress screen (package A4). Markup: src/ui/progress.js.
+   The calendar shades are the shared tokens --heat0 to --heat3 from styles.css (light and dark values
+   there). Level 0 = nothing logged, 1 = some, 2 = at least half, 3 = target met. */
+
+.progress-list { display: grid; gap: 12px; }
+.progress-habit { display: grid; gap: 16px; min-width: 0; padding: 16px 16px 14px; }
+.progress-habit dl, .progress-habit dd { margin: 0; }
+.progress-head { display: grid; gap: 2px; min-width: 0; }
+.progress-head h2 { font-size: 19px; overflow-wrap: anywhere; }
+
+/* ---------- the current streak, with the best one beside it ---------- */
+.progress-hero { display: grid; gap: 10px; padding: 14px 16px; border-radius: var(--r-sm); background: var(--sunk); }
+.progress-hero.is-running { background: var(--accent-soft); }
+.progress-hero dl { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.progress-hero dt { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.progress-streak dd { font-size: 18px; font-weight: 650; line-height: 1.1; }
+.progress-streak strong { font-size: 48px; font-weight: 750; line-height: 1; letter-spacing: -0.03em; }
+.is-running .progress-streak dd { color: var(--accent-text); }
+.progress-best { text-align: right; }
+.progress-best dd { font-size: 18px; font-weight: 650; line-height: 1.3; }
+.progress-note { display: flex; align-items: flex-start; gap: 6px; font-size: 14px; }
+.progress-note .icon { margin-top: 1px; }
+.progress-note.is-met { color: var(--accent-text); font-weight: 600; }
+
+/* ---------- target met and total ---------- */
+.progress-stats { display: grid; gap: 10px; }
+.progress-stats > div { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 6px 12px; }
+.progress-stats dt { color: var(--muted); font-size: 15px; }
+.progress-stats dd { text-align: right; font-size: 15px; }
+.progress-stats strong { font-weight: 650; }
+.progress-stats .muted { margin-left: 4px; }
+.progress-bar { grid-column: 1 / -1; }
+.progress-bar svg { display: block; }
+.progress-bar rect { fill: var(--heat0); }
+.progress-bar rect.on { fill: var(--heat3); }
+
+/* ---------- calendar: 15 week columns, Monday at the top ----------
+   The squares take the width they are given: about 15px on a 360px phone, 30px at most. A row is as
+   high as a column is wide, which the container unit (cqw) works out from the calendar's own width. */
+.progress-cal { container-type: inline-size; display: grid; gap: 10px; padding-top: 14px; border-top: 1px solid var(--line); border-radius: 2px; }
+.progress-cal:focus-visible { outline-offset: 6px; border-radius: var(--r-sm); }
+.progress-cal-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0 12px; }
+.progress-cal-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
+.progress-grid {
+  --progress-side: 20px;
+  --progress-cell: 18px;
+  width: 100%;
+  max-width: 470px;
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+@supports (width: 1cqw) {
+  .progress-grid { --progress-cell: calc((min(100cqw, 470px) - var(--progress-side)) / 15); }
+}
+.progress-grid th, .progress-grid td { padding: 0; }
+.progress-grid thead td { width: var(--progress-side); }
+.progress-grid th { color: var(--muted); font-size: 12px; font-weight: 600; line-height: 1; text-align: left; }
+.progress-grid thead th { height: 18px; padding: 0 0 6px 2px; vertical-align: bottom; white-space: nowrap; }
+.progress-grid tbody tr { height: var(--progress-cell); }
+
+.progress-day, .progress-swatch { border: 1.5px solid transparent; border-radius: 5px; background: var(--heat0) padding-box; }
+.progress-habit [data-level="1"] { background-color: var(--heat1); }
+.progress-habit [data-level="2"] { background-color: var(--heat2); }
+.progress-habit [data-level="3"] { background-color: var(--heat3); }
+/* A day after today is blank. A day before the habit began is a dot: not started, which is not "missed". */
+.progress-day.is-future { background: none; }
+.progress-habit .is-before { background: radial-gradient(circle, var(--line-strong) 0 1.5px, transparent 2px) padding-box; }
+/* Today has a ring inside the square; the picked day has one around it. */
+.progress-habit .is-today { box-shadow: inset 0 0 0 2px var(--ink), inset 0 0 0 3.5px var(--surface); }
+.progress-day.is-picked { border-color: var(--ink); box-shadow: inset 0 0 0 1.5px var(--surface); }
+.progress-day.is-picked.is-today { box-shadow: inset 0 0 0 2px var(--ink), inset 0 0 0 3.5px var(--surface); }
+.progress-day[data-day] { cursor: pointer; }
+
+/* Weekly habits: a tick under every week that met its target. */
+.progress-grid .progress-weekrow { height: auto; }
+.progress-weekrow td { padding-top: 4px; color: var(--accent-text); }
+.progress-weekrow .icon { width: 100%; max-width: 16px; height: auto; margin-inline: auto; stroke-width: 3; }
+
+.progress-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 0; padding: 0; color: var(--muted); font-size: 12px; }
+.progress-legend li { display: inline-flex; align-items: center; gap: 5px; }
+.progress-legend .icon { color: var(--accent-text); stroke-width: 3; }
+.progress-swatch { flex: none; width: 15px; height: 15px; }
+.progress-detail { min-height: 20px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .progress-day { transition: background-color 0.25s; }
+  .progress-bar rect.on { transition: width 0.25s; }
+}
