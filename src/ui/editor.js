@@ -133,8 +133,9 @@ export function addTimes(times, extra, max = LIMITS.timesMax) {
 }
 
 /** Why times were not added: the list would have gone over the limit.
- *  @param {number} over what `addTimes` returned @param {number} [max] @returns {string} plain text */
-export const overLimitMessage = (over, max = LIMITS.timesMax) => `That would make ${over} reminder times, and a habit can have at most ${max}. `
+ *  @param {number} over what `addTimes` returned @param {number} [max] @param {string} [what] whose times they are
+ *  @returns {string} plain text */
+export const overLimitMessage = (over, max = LIMITS.timesMax, what = 'a habit') => `That would make ${over} reminder times, and ${what} can have at most ${max}. `
   + 'Nothing was added: remove some times first, or choose a wider gap.';
 
 /** @param {number} n */
@@ -161,11 +162,11 @@ export function quickFillSummary({ start, hours, filled, added }) {
  *  before the start runs past midnight. When the result would go over the limit the list stays as it
  *  was and `problem` says why; otherwise `summary` says what was added.
  *  @param {string[]} times @param {string} start @param {string} end @param {number} hours @param {number} [max]
- *  @returns {{ times: string[], summary: string, problem: string }} */
-export function quickFill(times, start, end, hours, max = LIMITS.timesMax) {
+ *  @param {string} [what] whose times they are, for the message @returns {{ times: string[], summary: string, problem: string }} */
+export function quickFill(times, start, end, hours, max = LIMITS.timesMax, what = 'a habit') {
   const filled = everyHours(start, end, hours);
   const result = addTimes(times, filled, max);
-  if (result.over) return { times: result.times, summary: '', problem: overLimitMessage(result.over, max) };
+  if (result.over) return { times: result.times, summary: '', problem: overLimitMessage(result.over, max, what) };
   const summary = quickFillSummary({ start: filled.includes(start) ? start : filled[0] ?? '', hours, filled, added: result.added.length });
   return { times: result.times, summary, problem: '' };
 }
@@ -180,22 +181,62 @@ export function pushNote(status) {
   return 'Reminders are not turned on for this device yet.';
 }
 
+/** @typedef {{ time: string, every: string, from: string, to: string }} Picks the selects of the reminders part */
+
+/** What the reminder selects show when a sheet opens. @returns {Picks} */
+export const firstPicks = () => ({ time: '09:00', every: '2', from: '09:00', to: '21:00' });
+
+/** One press on a button of the reminders part (`remindersView`), for the habit editor and the routine
+ *  editor alike. Returns null when `action` is not one of its buttons; otherwise the new list, what to
+ *  say about it (`note`), why nothing was added (`refused`, shown as the error of the times) and the
+ *  selector of the control that should have the focus if the pressed one is gone.
+ *  @param {string[]} before @param {Picks} picks @param {string | undefined} action
+ *  @param {{ time?: string, what?: string }} [more] the time of a pressed chip; whose times they are
+ *  @returns {{ times: string[], note: string, refused: string, focus: string } | null} */
+export function changeTimes(before, picks, action, { time = '', what = 'a habit' } = {}) {
+  const focus = '#editor-time';
+  if (action === 'add-time') {
+    const { times, added, over } = addTimes(before, [picks.time]);
+    if (over) return { times, note: '', refused: overLimitMessage(over, LIMITS.timesMax, what), focus };
+    return { times, note: added.length > 0 ? `Added ${added[0]}.` : `${picks.time} is already in the list.`, refused: '', focus };
+  }
+  if (action === 'fill') {
+    const { times, summary, problem } = quickFill(before, picks.from, picks.to, Number(picks.every), LIMITS.timesMax, what);
+    return { times, note: summary, refused: problem, focus };
+  }
+  if (action === 'remove-time') {
+    const times = before.filter((t) => t !== time);
+    // Focus goes to the time that took its place, so several can be removed in a row from the keyboard.
+    const next = times[Math.min(before.indexOf(time), times.length - 1)];
+    return { times, note: `Removed ${time}.`, refused: '', focus: next ? `[data-time="${next}"]` : focus };
+  }
+  if (action === 'clear') return { times: [], note: `Removed all ${countTimes(before.length)}.`, refused: '', focus };
+  return null;
+}
+
 // ================================ the sheet ================================
 
-/** @typedef {object} Session one open editor
+/** What the habit editor and the routine editor (routine.js) have in common: a sheet with a draft.
+ *  @typedef {object} Draft
+ *  @property {boolean} confirming "Discard changes?" is showing in place of Cancel and Save
+ *  @property {Element | null} back what had the focus when that question came up
+ *  @property {Problem | null} problem
+ *  @property {boolean} gone the record was deleted somewhere else while the sheet was open
+ *  @property {HTMLElement | null} body
+ *  @property {() => string} view the whole content of the sheet, as HTML
+ *  @property {() => void} sync take what the person typed and chose into the draft
+ *  @property {() => boolean} changed whether the draft differs from what the sheet opened with */
+
+/** @typedef {Draft & SessionOnly} Session one open habit editor */
+/** @typedef {object} SessionOnly
  *  @property {Ctx} ctx
  *  @property {string | null} id the habit being changed, null for a new one
  *  @property {string} savedName its name in the store, for the "Deleted" message
  *  @property {FormValues} form the draft: read back from the DOM before every render
  *  @property {FormValues} opened the form as it was when the sheet opened
- *  @property {boolean} confirming "Discard changes?" is showing in place of Cancel and Save
- *  @property {Element | null} back what had the focus when that question came up
- *  @property {{ time: string, every: string, from: string, to: string }} picks the reminder selects
- *  @property {Problem | null} problem
+ *  @property {Picks} picks the reminder selects
  *  @property {string} note what the last change to the reminder times did
  *  @property {string} spoken for screen readers only: the target after a press of minus or plus
- *  @property {boolean} gone the habit was deleted somewhere else while the sheet was open
- *  @property {HTMLElement | null} body
  *  @property {() => void} close
  *  @property {() => void} end stop following the store; safe to call twice */
 
@@ -203,53 +244,59 @@ export function pushNote(status) {
 let session = null;
 
 /** @param {string} name @param {string[]} values @param {string} chosen @param {(value: string) => string} [label] */
-const options = (name, values, chosen, label = (v) => v) => values
+export const options = (name, values, chosen, label = (v) => v) => values
   .map((v) => `<option value="${esc(v)}"${v === chosen ? ' selected' : ''}>${esc(label(v))}</option>`).join('');
 
 /** @param {string} value */
 const everyLabel = (value) => (value === '0.5' ? '30 min' : value === '1' ? '1 hour' : `${value} hours`);
 
-/** The attributes that tie a control to its error and hint. @param {Session} s @param {Field} field @param {string[]} hints */
-function describe(s, field, hints = []) {
+/** The attributes that tie a control to its error and hint. @param {{ problem: Problem | null }} s @param {Field} field @param {string[]} hints */
+export function describe(s, field, hints = []) {
   const bad = s.problem?.field === field;
   const ids = [...(bad ? [`editor-${field}-error`] : []), ...hints];
   return `${bad ? ' aria-invalid="true"' : ''}${ids.length ? ` aria-describedby="${ids.join(' ')}"` : ''}`;
 }
 
-/** @param {Session} s @param {Field} field */
-const errorOf = (s, field) => (s.problem?.field === field
+/** @param {{ problem: Problem | null }} s @param {Field} field */
+export const errorOf = (s, field) => (s.problem?.field === field
   ? `<p class="field-error" id="editor-${field}-error" role="alert">${esc(s.problem.message)}</p>` : '');
 
-/** @param {Session} s */
-function remindersView(s) {
-  const { times, period } = s.form;
-  const status = s.ctx.push.getStatus();
+/** "5 of 60 characters" under a text field, once `limitNote` has something to say.
+ *  @param {string} field @param {{ text: string, over: boolean }} note */
+export const countView = (field, note) => (note.text
+  ? `<p class="field-hint num editor-count${note.over ? ' is-over' : ''}" id="editor-${field}-count">${note.text}</p>` : '');
+
+/** The reminders part of a sheet: the chosen times, "Add a time" and the "Every N hours" quick fill. Its
+ *  buttons carry data-action add-time, fill, remove-time and clear: hand those to `changeTimes`.
+ *  @param {{ times: string[], picks: Picks, problem: Problem | null, note: string, status: PushStatus, hint: string }} r
+ *    `hint` is plain text: when the reminders arrive and stop */
+export function remindersView({ times, picks, problem, note, status, hint }) {
+  const s = { problem };
   const full = times.length >= LIMITS.timesMax;
   const chips = times.map((t) => `<li data-key="${t}"><button type="button" class="editor-time num" data-action="remove-time" data-time="${t}" `
     + `aria-label="Remove ${t}">${t}${icon('close', 14)}</button></li>`).join('');
   return `<section class="editor-reminders" aria-labelledby="editor-reminders-title">
     <h3 id="editor-reminders-title">Reminders</h3>
-    <p class="field-hint" id="editor-reminders-hint">Reminders arrive at about the chosen time (they can be up to 20 minutes late), stop for the
-      ${period === 'week' ? 'week' : 'day'} once the target is reached, and need “Turn on reminders” in Settings.</p>
+    <p class="field-hint" id="editor-reminders-hint">${esc(hint)}</p>
     ${status === 'on' ? '' : `<div class="notice editor-push${times.length > 0 && status !== 'demo' ? ' notice-warn' : ''}" id="editor-push">
       <p>${esc(pushNote(status))}</p></div>`}
     <div class="editor-add">
       <div class="field"><label for="editor-time">Add a time</label>
-        <select class="input num" id="editor-time" name="time"${describe(s, 'times')}>${options('time', HALF_HOURS, s.picks.time)}</select></div>
+        <select class="input num" id="editor-time" name="time"${describe(s, 'times')}>${options('time', HALF_HOURS, picks.time)}</select></div>
       <button type="button" class="btn" data-action="add-time">${icon('plus', 20)}Add</button>
     </div>
     <fieldset class="editor-quick">
       <legend>Or fill in a whole day</legend>
       <div class="field"><label for="editor-every">Every</label>
-        <select class="input num" id="editor-every" name="every">${options('every', EVERY_CHOICES.map(String), s.picks.every, everyLabel)}</select></div>
+        <select class="input num" id="editor-every" name="every">${options('every', EVERY_CHOICES.map(String), picks.every, everyLabel)}</select></div>
       <div class="field"><label for="editor-from">between</label>
-        <select class="input num" id="editor-from" name="from">${options('from', HALF_HOURS, s.picks.from)}</select></div>
+        <select class="input num" id="editor-from" name="from">${options('from', HALF_HOURS, picks.from)}</select></div>
       <div class="field"><label for="editor-to">and</label>
-        <select class="input num" id="editor-to" name="to">${options('to', HALF_HOURS, s.picks.to)}</select></div>
+        <select class="input num" id="editor-to" name="to">${options('to', HALF_HOURS, picks.to)}</select></div>
       <button type="button" class="btn btn-block" data-action="fill">Fill in these times</button>
     </fieldset>
     ${errorOf(s, 'times')}
-    <p class="editor-note" id="editor-note" role="status">${esc(s.note)}</p>
+    <p class="editor-note" id="editor-note" role="status">${esc(note)}</p>
     <div class="spread editor-chosen" id="editor-chosen">
       <p class="num"><strong>${times.length === 0 ? 'No reminder times yet' : countTimes(times.length).replace('time', 'reminder time')}</strong>${
   full ? '<span class="muted">: every half hour, the most there can be</span>' : ''}</p>
@@ -259,12 +306,60 @@ function remindersView(s) {
   </section>`;
 }
 
+/** The bottom of a sheet: a note when the record is gone, the problem that belongs to no field, and
+ *  Cancel and Save, or "Discard changes?" with its two answers.
+ *  @param {Draft} s @param {{ save: string, goneText: string }} words the Save button's name; plain text */
+export function footView(s, { save, goneText }) {
+  return `<div class="editor-foot" id="editor-foot">
+      ${s.gone ? `<p class="notice notice-warn" id="editor-gone" role="alert">${esc(goneText)}</p>` : ''}
+      ${errorOf(s, 'form')}
+      ${s.confirming ? `<div class="sheet-actions editor-confirm" id="editor-confirm" role="group" aria-labelledby="editor-confirm-text">
+        <p id="editor-confirm-text">Discard changes?</p>
+        <button type="button" class="btn" data-action="keep" id="editor-keep">Keep editing</button>
+        <button type="button" class="btn btn-danger" data-action="discard">Discard</button>
+      </div>` : `<div class="sheet-actions" id="editor-actions">
+        <button type="button" class="btn" data-sheet-close id="editor-cancel">${s.gone ? 'Close' : 'Cancel'}</button>
+        ${s.gone ? '' : `<button type="button" class="btn btn-primary" data-action="save">${esc(save)}</button>`}
+      </div>`}
+    </div>`;
+}
+
+/** The "Routine" choice and what follows from it: the name of a new routine, or the sentence that takes
+ *  the place of the reminder times. @param {Session} s */
+function routineView(s) {
+  const { routine, routineName } = s.form;
+  const routines = s.ctx.store.getState().routines ?? [];
+  const chosen = routines.find((r) => r.id === routine);
+  const limit = limitNote(routineName, LIMITS.routineNameMax);
+  const times = chosen ? cleanTimes(chosen.times) : [];
+  const from = routine === NEW_ROUTINE ? 'Once it is saved, tap its name on Today to choose its reminder times.'
+    : !chosen ? '' : times.length === 0 ? `“${chosen.name}” has no reminder times yet. Tap its name on Today to choose them.`
+      : `“${chosen.name}” reminds at ${times.length > 4 ? `${times.slice(0, 4).join(', ')} and ${times.length - 4} more` : times.join(', ')}, `
+        + 'with one reminder for all of its habits that are still to do.';
+  return `<div class="field">
+      <label for="editor-routine">Routine</label>
+      <select class="input" id="editor-routine" name="routine"${describe(s, 'routine', ['editor-routine-hint'])}>
+        <option value="" data-key="none"${routine === '' ? ' selected' : ''}>None</option>
+        ${routines.map((r) => `<option value="${esc(r.id)}" data-key="r-${esc(r.id)}"${r.id === routine ? ' selected' : ''}>${esc(r.name)}</option>`).join('')}
+        <option value="${NEW_ROUTINE}" data-key="new"${routine === NEW_ROUTINE ? ' selected' : ''}>New routine...</option>
+      </select>
+      ${errorOf(s, 'routine')}
+      <p class="field-hint" id="editor-routine-hint">A routine is a list of habits you do together, like your morning, with one reminder for all of them.</p>
+    </div>
+    ${routine === NEW_ROUTINE ? `<div class="field" id="editor-new-routine">
+      <label for="editor-routine-name">Name of the new routine</label>
+      <input class="input" id="editor-routine-name" name="routineName" type="text" value="${esc(routineName)}" placeholder="Morning"
+        autocomplete="off" autocapitalize="sentences" enterkeyhint="done"${describe(s, 'routineName', limit.text ? ['editor-routineName-count'] : [])}>
+      ${errorOf(s, 'routineName')}${countView('routineName', limit)}
+    </div>` : ''}
+    ${routine ? `<div class="notice editor-from-routine" id="editor-from-routine"><p><strong>Reminders come from the routine.</strong> ${esc(from)}</p></div>` : ''}`;
+}
+
 /** The whole content of the sheet for a session. @param {Session} s @returns {string} HTML */
 function view(s) {
   const { form, id } = s;
   const nameLimit = limitNote(form.name, LIMITS.nameMax), unitLimit = limitNote(form.unit, LIMITS.unitMax);
-  const count = (/** @type {string} */ field, /** @type {{ text: string, over: boolean }} */ note) => (note.text
-    ? `<p class="field-hint num editor-count${note.over ? ' is-over' : ''}" id="editor-${field}-count">${note.text}</p>` : '');
+  const count = countView;
   const target = toInput(form).target;
   // The error about the target already names the range, so the hint does not repeat it under it.
   const targetHint = [s.problem?.field === 'target' ? '' : `A whole number from ${LIMITS.targetMin} to ${LIMITS.targetMax}.`,
@@ -303,23 +398,26 @@ function view(s) {
       ${errorOf(s, 'unit')}${count('unit', unitLimit)}
       <p class="field-hint" id="editor-unit-hint">${esc(unitHint(form))}</p>
     </div>
-    ${remindersView(s)}
+    ${routineView(s)}
+    ${form.routine ? '' : remindersView({
+    times: form.times, picks: s.picks, problem: s.problem, note: s.note, status: s.ctx.push.getStatus(),
+    hint: `Reminders arrive at about the chosen time (they can be up to 20 minutes late), stop for the ${
+      form.period === 'week' ? 'week' : 'day'} once the target is reached, and need “Turn on reminders” in Settings.`,
+  })}
     ${id && !s.gone ? `<div class="editor-danger" id="editor-danger">
       <button type="button" class="btn btn-danger" data-action="delete">Delete habit</button>
       <p class="field-hint">You can undo this straight afterwards.</p></div>` : ''}
-    <div class="editor-foot" id="editor-foot">
-      ${s.gone ? '<p class="notice notice-warn" id="editor-gone" role="alert">This habit has been deleted, perhaps on another device, so changes to it cannot be saved.</p>' : ''}
-      ${errorOf(s, 'form')}
-      ${s.confirming ? `<div class="sheet-actions editor-confirm" id="editor-confirm" role="group" aria-labelledby="editor-confirm-text">
-        <p id="editor-confirm-text">Discard changes?</p>
-        <button type="button" class="btn" data-action="keep" id="editor-keep">Keep editing</button>
-        <button type="button" class="btn btn-danger" data-action="discard">Discard</button>
-      </div>` : `<div class="sheet-actions" id="editor-actions">
-        <button type="button" class="btn" data-sheet-close id="editor-cancel">${s.gone ? 'Close' : 'Cancel'}</button>
-        ${s.gone ? '' : '<button type="button" class="btn btn-primary" data-action="save">Save habit</button>'}
-      </div>`}
-    </div>
+    ${footView(s, { save: 'Save habit', goneText: 'This habit has been deleted, perhaps on another device, so changes to it cannot be saved.' })}
   </form>`;
+}
+
+/** The reminder selects, read from a sheet's form. @param {FormData} data @param {Picks} picks @returns {Picks} */
+export function readPicks(data, picks) {
+  const text = (/** @type {keyof Picks} */ name) => {
+    const value = data.get(name);
+    return typeof value === 'string' ? value : picks[name];
+  };
+  return { time: text('time'), every: text('every'), from: text('from'), to: text('to') };
 }
 
 /** Take what the person typed and chose into the draft (contract rule 2b: the DOM owns live values).
@@ -332,30 +430,50 @@ function sync(s) {
     const value = data.get(name);
     return typeof value === 'string' ? value : fallback;
   };
-  s.form = { ...s.form, name: text('name', s.form.name), period: text('period', s.form.period), target: text('target', s.form.target), unit: text('unit', s.form.unit) };
-  s.picks = { time: text('time', s.picks.time), every: text('every', s.picks.every), from: text('from', s.picks.from), to: text('to', s.picks.to) };
+  s.form = {
+    ...s.form, name: text('name', s.form.name), period: text('period', s.form.period), target: text('target', s.form.target),
+    unit: text('unit', s.form.unit), routine: text('routine', s.form.routine), routineName: text('routineName', s.form.routineName),
+  };
+  s.picks = readPicks(data, s.picks);
 }
 
 /** Bring the sheet up to date with the draft, and keep the keyboard focus inside it when the control
  *  that had it is gone (a removed time, "Clear all"). Focus that is on its way from one control to the
  *  next (a `change` event fires while nothing has it) is left alone.
- *  @param {Session} s @param {string} [fallback] selector */
-function draw(s, fallback = '#editor-time') {
+ *  @param {Draft} s @param {string} [fallback] selector */
+export function draw(s, fallback = '#editor-time') {
   if (!s.body) return;
   const inside = s.body.contains(document.activeElement);
-  patch(s.body, view(s));
-  if (inside && !s.body.contains(document.activeElement)) /** @type {HTMLElement | null} */ (s.body.querySelector(fallback))?.focus();
+  patch(s.body, s.view());
+  if (inside && !s.body.contains(document.activeElement)) {
+    /** @type {HTMLElement | null} */ (s.body.querySelector(fallback) ?? s.body.querySelector('#editor-name'))?.focus();
+  }
 }
 
-const FOCUS = { name: '#editor-name', period: 'input[name="period"]:checked', target: '#editor-target', unit: '#editor-unit', times: '#editor-time', form: '' };
+const FOCUS = {
+  name: '#editor-name', period: 'input[name="period"]:checked', target: '#editor-target', unit: '#editor-unit', times: '#editor-time',
+  routine: '#editor-routine', routineName: '#editor-routine-name', form: '',
+};
 
-/** Show a problem at its field and put the cursor there. @param {Session} s @param {Problem} problem */
-function fail(s, problem) {
+/** Show a problem at its field and put the cursor there. @param {Draft} s @param {Problem} problem */
+export function fail(s, problem) {
   s.problem = problem;
   draw(s);
   const control = FOCUS[problem.field] ? s.body?.querySelector(FOCUS[problem.field]) : null;
   if (control instanceof HTMLElement) control.focus();
   s.body?.querySelector(`#editor-${problem.field}-error`)?.scrollIntoView({ block: 'nearest' });
+}
+
+/** Set the "Routine" choice from code (contract rule 2b: the DOM owns the live value). A routine that is
+ *  not in the list (deleted meanwhile) becomes None. @param {Session} s @param {string} routine */
+function choose(s, routine) {
+  const choice = s.body?.querySelector('#editor-routine');
+  if (!(choice instanceof HTMLSelectElement)) return;
+  choice.value = [...choice.options].some((o) => o.value === routine) ? routine : '';
+  if (s.form.routine !== choice.value) {
+    s.form.routine = choice.value;
+    draw(s);
+  }
 }
 
 /** @param {Session} s */
@@ -364,8 +482,23 @@ function save(s) {
   if (s.gone) return;
   const { input, problem } = checkForm(s.form, s.id);
   if (problem) return fail(s, problem);
+  let { routine } = input;
+  if (s.form.routine === NEW_ROUTINE) {
+    const named = checkRoutineName(s.form.routineName);
+    if (named.problem) return fail(s, named.problem);
+    try {
+      routine = s.ctx.store.saveRoutine(named.input);
+    } catch (err) {
+      if (!(err instanceof StoreError)) throw err;
+      return fail(s, { field: 'routineName', message: err.message });
+    }
+    // The routine exists from here on: should the habit be refused, Save must not make a second one.
+    s.form = { ...s.form, routine, routineName: '' };
+    draw(s);
+    choose(s, routine);
+  }
   try {
-    s.ctx.store.saveHabit(input);
+    s.ctx.store.saveHabit({ ...input, routine });
   } catch (err) {
     if (!(err instanceof StoreError)) throw err;
     return fail(s, { field: err.code === 'invalid' ? fieldOf(err.message) : 'form', message: err.message });
@@ -397,10 +530,10 @@ function remove(s) {
 
 /** The answer to openSheet's canClose (Escape, Back, the backdrop, the close button, Cancel): yes when
  *  there is nothing to lose. Otherwise the sheet stays open and asks "Discard changes?" in its foot.
- *  @param {Session} s @returns {boolean} */
-function mayClose(s) {
-  sync(s);
-  if (s.gone || !formChanged(s.form, s.opened)) return true;
+ *  @param {Draft} s @returns {boolean} */
+export function mayClose(s) {
+  s.sync();
+  if (s.gone || !s.changed()) return true;
   if (!s.confirming) {
     s.back = document.activeElement;
     s.confirming = true;
@@ -411,8 +544,8 @@ function mayClose(s) {
 }
 
 /** "Keep editing": the Cancel and Save row comes back and the focus returns to where it was.
- *  @param {Session} s */
-function keepEditing(s) {
+ *  @param {Draft} s */
+export function keepEditing(s) {
   s.confirming = false;
   draw(s);
   const sheet = s.body?.closest('dialog');
@@ -440,39 +573,18 @@ function act(s, el) {
     if (s.problem?.field === 'target') s.problem = null;
     return draw(s);
   }
-  const before = s.form.times;
-  /** Set when the times asked for do not fit: shown as the error of the reminders, nothing is added. */
-  let refused = '';
-  if (action === 'add-time') {
-    const { times, added, over } = addTimes(before, [s.picks.time]);
-    s.form.times = times;
-    refused = over ? overLimitMessage(over) : '';
-    s.note = over ? '' : added.length > 0 ? `Added ${added[0]}.` : `${s.picks.time} is already in the list.`;
-  } else if (action === 'fill') {
-    const { times, summary, problem } = quickFill(before, s.picks.from, s.picks.to, Number(s.picks.every));
-    s.form.times = times;
-    refused = problem;
-    s.note = summary;
-  } else if (action === 'remove-time') {
-    const time = el.dataset.time ?? '';
-    s.form.times = before.filter((t) => t !== time);
-    s.note = `Removed ${time}.`;
-    if (s.problem?.field === 'times') s.problem = null;
-    // Focus goes to the time that took its place, so several can be removed in a row from the keyboard.
-    const next = s.form.times[Math.min(before.indexOf(time), s.form.times.length - 1)];
-    return draw(s, next ? `[data-time="${next}"]` : '#editor-time');
-  } else if (action === 'clear') {
-    s.form.times = [];
-    s.note = `Removed all ${countTimes(before.length)}.`;
-  } else return undefined;
-  if (refused) { // the focus stays on the button that was pressed; the message is an alert
-    s.problem = { field: 'times', message: refused };
+  const change = changeTimes(s.form.times, s.picks, action, { time: el.dataset.time });
+  if (!change) return undefined;
+  s.form.times = change.times;
+  s.note = change.note;
+  if (change.refused) { // the focus stays on the button that was pressed; the message is an alert
+    s.problem = { field: 'times', message: change.refused };
     draw(s);
     s.body?.querySelector('#editor-times-error')?.scrollIntoView({ block: 'nearest' });
     return undefined;
   }
   if (s.problem?.field === 'times') s.problem = null;
-  return draw(s);
+  return draw(s, change.focus);
 }
 
 /** Open the editor for one habit, or for a new habit when `habitId` is null.
@@ -490,11 +602,12 @@ export function openEditor(habitId, ctx) {
     ctx,
     id: habit ? habit.id : null,
     savedName: habit ? habit.name : '',
-    form: habit ? formOf(habit) : blankForm(),
-    opened: habit ? formOf(habit) : blankForm(),
+    form: habit ? formOf(habit, ctx.store.getState().routines) : blankForm(),
+    opened: habit ? formOf(habit, ctx.store.getState().routines) : blankForm(),
     confirming: false, back: null,
-    picks: { time: '09:00', every: '2', from: '09:00', to: '21:00' },
+    picks: firstPicks(),
     problem: null, note: '', spoken: '', gone: false, body: null,
+    view: () => view(s), sync: () => sync(s), changed: () => formChanged(s.form, s.opened),
     close: () => {},
     end: () => {
       unsubscribe();
@@ -512,7 +625,7 @@ export function openEditor(habitId, ctx) {
   on(sheet.body, 'submit', 'form', (event) => {
     event.preventDefault();
   });
-  on(sheet.body, 'keydown', '#editor-name, #editor-target, #editor-unit', (event, el) => {
+  on(sheet.body, 'keydown', '#editor-name, #editor-target, #editor-unit, #editor-routine-name', (event, el) => {
     if (event.key !== 'Enter' || event.isComposing) return;
     event.preventDefault();
     el.blur();
@@ -531,6 +644,10 @@ export function openEditor(habitId, ctx) {
       // the focus leaves it for "Keep editing", which must not take the question away again.
       if (type === 'input') s.confirming = false;
       draw(s);
+      // "New routine..." asks for the name right here, in the same sheet.
+      if (type === 'change' && name === 'routine' && s.form.routine === NEW_ROUTINE) {
+        /** @type {HTMLElement | null | undefined} */ (s.body?.querySelector('#editor-routine-name'))?.focus();
+      }
     });
   }
   on(sheet.body, 'keydown', '#editor-target', (event, el) => {
@@ -543,11 +660,19 @@ export function openEditor(habitId, ctx) {
   });
 
   // A habit can be deleted on another device while it is open here: say so instead of saving into it.
+  // The same goes for the routine that is chosen: the choice falls back to None.
+  let routineIds = (ctx.store.getState().routines ?? []).map((r) => r.id).join();
   unsubscribe = ctx.store.subscribe((state) => {
-    if (!s.id || s.gone || state.habits.some((h) => h.id === s.id)) return;
-    s.gone = true;
-    s.confirming = false;
+    const ids = (state.routines ?? []).map((r) => r.id).join();
+    const habitGone = Boolean(s.id) && !s.gone && !state.habits.some((h) => h.id === s.id);
+    if (!habitGone && ids === routineIds) return;
+    routineIds = ids;
     sync(s);
+    if (habitGone) {
+      s.gone = true;
+      s.confirming = false;
+    }
     draw(s);
+    choose(s, s.form.routine); // a routine that is no longer in the list is no longer chosen
   });
 }

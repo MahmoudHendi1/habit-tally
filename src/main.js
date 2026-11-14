@@ -10,6 +10,7 @@ import * as progress from './ui/progress.js';
 import * as settings from './ui/settings.js';
 import * as signin from './ui/signin.js';
 import { openEditor } from './ui/editor.js';
+import { openRoutine } from './ui/routine.js';
 
 /** @typedef {import('./ui/common.js').State} State */
 /** @typedef {import('./ui/common.js').Ctx} Ctx */
@@ -47,6 +48,7 @@ const ctx = {
     location.hash = `#/${tab}`;
   },
   openEditor: (habitId = null) => openEditor(habitId, ctx),
+  openRoutine: (routineId = null) => openRoutine(routineId, ctx),
   toast, signOut, getTheme, setTheme,
   refresh: update,
 };

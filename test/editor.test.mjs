@@ -9,6 +9,7 @@ import {
   HALF_HOURS, EVERY_CHOICES, blankForm, formOf, toInput, fieldOf, checkForm, limitNote, unitHint, stepTarget,
   addTimes, overLimitMessage, quickFill, quickFillSummary, pushNote, openEditor, formChanged, NEW_ROUTINE, checkRoutineName,
 } from '../src/ui/editor.js';
+import { openRoutine, blankRoutine, routineFormOf, checkRoutine, routineChanged, membersText } from '../src/ui/routine.js';
 import { movedHabits, movedRoutines, canReorder } from '../src/ui/today.js';
 import { groupHabits } from '../shared/logic.js';
 
@@ -386,4 +387,40 @@ test('a move through the store keeps the order after the swap', () => {
   store.reorderHabits(movedHabits(habits, routines, ids[1], -1));
   const after = store.getState();
   assert.deepEqual(groupHabits(after.habits, after.routines).map((g) => g.habits.map((h) => h.name)), [['Teeth', 'Pills'], ['Water']]);
+});
+
+// ---------- the routine editor (v1.3) ----------
+
+test('routine.js loads without a DOM and does not import CSS', () => {
+  assert.equal(typeof openRoutine, 'function');
+  for (const file of ['routine.js', 'today.js', 'progress.js']) {
+    assert.doesNotMatch(readFileSync(new URL(`../src/ui/${file}`, import.meta.url), 'utf8'), /import[^;]*\.css['"]/, file);
+  }
+});
+
+test('checkRoutine: a name is needed, times are tidied, and the store takes the input as it is', () => {
+  assert.equal(checkRoutine(blankRoutine()).problem?.field, 'name');
+  assert.equal(checkRoutine({ name: 'x'.repeat(LIMITS.routineNameMax + 1), times: [] }).problem?.field, 'name');
+  const { input, problem } = checkRoutine({ name: '  Morning   pills ', times: ['07:30', '07:00', '07:00'] });
+  assert.equal(problem, null);
+  assert.deepEqual(input, { name: 'Morning pills', times: ['07:00', '07:30'] });
+  const store = openStore();
+  const id = store.saveRoutine(input);
+  const saved = store.getState().routines.find((r) => r.id === id);
+  assert.deepEqual(routineFormOf(saved), { name: 'Morning pills', times: ['07:00', '07:30'] });
+  const edit = checkRoutine({ ...routineFormOf(saved), name: 'Morning' }, id);
+  assert.equal(edit.input.id, id);
+  assert.equal(store.saveRoutine(edit.input), id);
+  assert.equal(store.getState().routines.find((r) => r.id === id).name, 'Morning');
+  assert.equal(routineChanged({ name: ' Morning ', times: ['07:30', '07:00'] }, routineFormOf(store.getState().routines[0])), false);
+  assert.equal(routineChanged({ name: 'Morning', times: ['07:00'] }, routineFormOf(store.getState().routines[0])), true);
+});
+
+test('the quick fill and the limit message speak of a routine in the routine editor', () => {
+  const { problem } = quickFill(HALF_HOURS.slice(0, 47), '00:00', '23:30', 0.5, 40, 'a routine');
+  assert.match(problem, /a routine can have at most 40/);
+  assert.match(overLimitMessage(49), /a habit can have at most 48/);
+  assert.match(membersText([]), /No habits in this routine yet/);
+  assert.match(membersText(['Take pills']), /^1 habit: Take pills\./);
+  assert.match(membersText(['Take pills', 'Brush teeth']), /^2 habits: Take pills, Brush teeth\./);
 });
