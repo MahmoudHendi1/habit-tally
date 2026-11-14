@@ -72,3 +72,6 @@
 @media (min-width: 640px) {
   .editor-foot .btn-primary { flex: 0 1 200px; }
 }
+
+/* ---------- the Routine choice (habit editor) ---------- */
+.editor-from-routine { overflow-wrap: anywhere; }

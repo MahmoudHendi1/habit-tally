@@ -16,6 +16,9 @@ Used mostly on an Android phone (installed from the browser, no Play Store) and 
 - R8  Same data on phone and computer (sync).
 - R9  Installs to the Android home screen (PWA).
 - R10 Sign up with email; each person sees only their own data.
+- R15 Routines: a named list of habits done together (for example Morning), shown as its own section on Today
+      in an order the owner chooses; habits and routines can be reordered; a routine has its own reminder times
+      and sends one reminder with how many of its habits are left (confirmed by the owner, 14 Nov 2026).
 ## Should
 - R11 Free to run: Firebase free (Spark) plan, no payment card. No Cloud Functions.
 - R12 Logging works offline and syncs later.
