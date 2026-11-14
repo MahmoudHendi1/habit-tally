@@ -235,6 +235,9 @@ function view(s) {
   const count = (/** @type {string} */ field, /** @type {{ text: string, over: boolean }} */ note) => (note.text
     ? `<p class="field-hint num editor-count${note.over ? ' is-over' : ''}" id="editor-${field}-count">${note.text}</p>` : '');
   const target = toInput(form).target;
+  // The error about the target already names the range, so the hint does not repeat it under it.
+  const targetHint = [s.problem?.field === 'target' ? '' : `A whole number from ${LIMITS.targetMin} to ${LIMITS.targetMax}.`,
+    form.period === 'week' ? 'Weeks run Monday to Sunday.' : ''].filter(Boolean).join(' ');
   const edge = (/** @type {boolean} */ at) => (at ? ' aria-disabled="true"' : '');
   return `<form class="editor" id="editor-form" novalidate>
     <div class="field">
@@ -247,10 +250,10 @@ function view(s) {
       <div class="field">
         <label for="editor-target">Target</label>
         <div class="editor-stepper">
-          <button type="button" class="btn-round" data-action="step" data-delta="-1" aria-label="Lower the target"${edge(target <= LIMITS.targetMin)}>${icon('minus', 20)}</button>
+          <button type="button" class="btn-round" data-action="step" data-delta="-1" aria-label="Decrease by 1"${edge(target <= LIMITS.targetMin)}>${icon('minus', 20)}</button>
           <input class="input num" id="editor-target" name="target" type="text" inputmode="numeric" value="${esc(form.target)}"
-            autocomplete="off" enterkeyhint="done"${describe(s, 'target', ['editor-target-hint'])}>
-          <button type="button" class="btn-round" data-action="step" data-delta="1" aria-label="Raise the target"${edge(target >= LIMITS.targetMax)}>${icon('plus', 20)}</button>
+            autocomplete="off" enterkeyhint="done"${describe(s, 'target', targetHint ? ['editor-target-hint'] : [])}>
+          <button type="button" class="btn-round" data-action="step" data-delta="1" aria-label="Increase by 1"${edge(target >= LIMITS.targetMax)}>${icon('plus', 20)}</button>
         </div>
       </div>
       <fieldset class="segmented"${describe(s, 'period')}>
@@ -259,8 +262,7 @@ function view(s) {
         <label><input type="radio" name="period" value="week"${form.period === 'week' ? ' checked' : ''}><span>Per week</span></label>
       </fieldset>
       ${errorOf(s, 'target')}${errorOf(s, 'period')}
-      <p class="field-hint" id="editor-target-hint">A whole number from ${LIMITS.targetMin} to ${LIMITS.targetMax}.${
-  form.period === 'week' ? ' Weeks run Monday to Sunday.' : ''}</p>
+      ${targetHint ? `<p class="field-hint" id="editor-target-hint">${targetHint}</p>` : ''}
       <p class="sr-only" role="status">${esc(s.spoken)}</p>
     </div>
     <div class="field">
@@ -300,11 +302,14 @@ function sync(s) {
 }
 
 /** Bring the sheet up to date with the draft, and keep the keyboard focus inside it when the control
- *  that had it is gone (a removed time, "Clear all"). @param {Session} s @param {string} [fallback] selector */
+ *  that had it is gone (a removed time, "Clear all"). Focus that is on its way from one control to the
+ *  next (a `change` event fires while nothing has it) is left alone.
+ *  @param {Session} s @param {string} [fallback] selector */
 function draw(s, fallback = '#editor-time') {
   if (!s.body) return;
+  const inside = s.body.contains(document.activeElement);
   patch(s.body, view(s));
-  if (!s.body.contains(document.activeElement)) /** @type {HTMLElement | null} */ (s.body.querySelector(fallback))?.focus();
+  if (inside && !s.body.contains(document.activeElement)) /** @type {HTMLElement | null} */ (s.body.querySelector(fallback))?.focus();
 }
 
 const FOCUS = { name: '#editor-name', period: 'input[name="period"]:checked', target: '#editor-target', unit: '#editor-unit', times: '#editor-time', form: '' };
