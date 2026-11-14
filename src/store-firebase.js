@@ -51,6 +51,9 @@ const SHARED = ['user', 'habits', 'logs', 'lastError'];
  *  counts as "offline". Listening again to a record the server once reported missing gives that cached
  *  answer first even while online; the server's own answer then follows within a moment. */
 const OFFLINE_GRACE_MS = 1500;
+/** Waits before listening again after a listener failed; the last one repeats. */
+const LISTEN_AGAIN_MS = [2000, 5000, 15_000, 60_000];
+const NOTHING_HEARD = { user: false, habits: false, logs: false };
 const inBrowser = typeof window !== 'undefined' && typeof indexedDB !== 'undefined';
 
 const AUTH_ERRORS = {
@@ -73,6 +76,7 @@ const authError = (err) => (err instanceof StoreError ? err
 
 /** Why the account's data is not there yet; shown as `lastError` until it is. */
 const OFFLINE = { code: 'offline', message: 'You seem to be offline. Your habits will load when the connection is back.' };
+const NOT_LOADED = { code: 'unknown', message: 'Your habits could not be loaded. Trying again shortly.' };
 const NOT_SET_UP = { code: 'not-saved', message: 'Your account could not be set up. Try again in a moment.' };
 
 const notSaved = (err) => ({
@@ -178,7 +182,9 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
    *  changes, is refused or signs out, so late answers for an old session are easy to ignore.
    *  `denied`: the rules refused it; it shows as waiting until a retry() gets all the way to ready.
    *  `creating`: the user record is being written ('sending') or was refused ('refused').
-   *  `trouble`: why the data is not loading, if something is wrong; it is the state's `lastError` meanwhile. */
+   *  `trouble`: why the data is not loading, if something is wrong; it is the state's `lastError` meanwhile.
+   *  `heard`: which listeners the server has answered since they were last attached; `failures` counts
+   *  the listener failures since all three were last heard, and `again` is the timer of the next attempt. */
   let session = null;
   let authKnown = false;
   let lastError = null;
@@ -187,6 +193,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
 
   const newSession = (uid, email, denied = false) => ({
     uid, email, denied, stops: [], live: false, creating: false, trouble: null, offline: null,
+    heard: NOTHING_HEARD, failures: 0, again: null,
     has: { user: false, habits: false, logs: false }, base: { tz, habits: {}, logs: {} }, ops: [],
   });
   const current = () => session.ops.reduce(applyOp, session.base);
@@ -229,7 +236,9 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     session.stops = [];
     session.live = false;
     clearTimeout(session.offline);
-    session.offline = null;
+    clearTimeout(session.again);
+    session.offline = session.again = null;
+    session.heard = NOTHING_HEARD;
   }
 
   /** There is no user record in the cache and the server has not answered: nothing can be shown. Unless
@@ -269,10 +278,30 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     const userRef = doc(db, 'users', s.uid);
     const failed = (err) => {
       if (session !== s) return;
-      if (err?.code !== 'permission-denied') return console.error(err);
-      stop();
-      session = newSession(s.uid, s.email, true);
+      stop(); // a failed listener is over, and the other two are attached again with it
+      if (err?.code === 'permission-denied') {
+        session = newSession(s.uid, s.email, true);
+        return refresh();
+      }
+      // Anything else (the service is down, a quota is used up): what is on the screen may be out of date
+      // or missing. Say so and listen again, a little later each time; retry() does it at once.
+      console.error(err);
+      s.trouble = NOT_LOADED;
+      s.again = setTimeout(() => {
+        s.again = null;
+        if (session === s) watch(s);
+      }, LISTEN_AGAIN_MS[Math.min(s.failures++, LISTEN_AGAIN_MS.length - 1)]);
+      s.again.unref?.(); // under Node (tests) this must not keep the process alive
       refresh();
+    };
+    /** A listener delivered. Trouble with listening is over once the server has answered all three. */
+    const heard = (part, snap) => {
+      s.has[part] = true;
+      if (!snap.metadata.fromCache) s.heard = { ...s.heard, [part]: true };
+      if (s.heard.user && s.heard.habits && s.heard.logs) {
+        s.failures = 0;
+        if (s.trouble === NOT_LOADED) s.trouble = null;
+      }
     };
     s.stops.push(onSnapshot(userRef, { includeMetadataChanges: true }, (snap) => {
       if (session !== s) return;
@@ -284,6 +313,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
           // Allowed, and the server (not just an empty cache) says there is no record yet: create it.
           reachable(s);
           if (!s.creating) createRecord(s, userRef);
+          else if (s.creating === 'refused') s.trouble = NOT_SET_UP;
         }
         return refresh();
       }
@@ -293,13 +323,13 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
         return;
       }
       reachable(s);
-      s.trouble = null;
+      if (s.trouble === NOT_SET_UP) s.trouble = null;
       const zone = snap.data().tz;
       s.base = { ...s.base, tz: isZone(zone) ? zone : tz };
-      s.has.user = true;
+      heard('user', snap);
       if (!s.live) {
         s.live = true;
-        watchData(s, userRef, failed);
+        watchData(s, userRef, failed, heard);
       }
       refresh();
     }, failed));
@@ -321,11 +351,13 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     });
   }
 
-  function watchData(s, userRef, failed) {
-    s.stops.push(onSnapshot(collection(userRef, 'habits'), (snap) => {
+  /** Both with includeMetadataChanges: the logs for the reason at the top of this file, and both so that
+   *  the server's first answer is noticed even when it brings nothing the cache did not have. */
+  function watchData(s, userRef, failed, heard) {
+    s.stops.push(onSnapshot(collection(userRef, 'habits'), { includeMetadataChanges: true }, (snap) => {
       if (session !== s) return;
       s.base = { ...s.base, habits: Object.fromEntries(snap.docs.map((d) => [d.id, { id: d.id, ...d.data() }])) };
-      s.has.habits = true;
+      heard('habits', snap);
       refresh();
     }, failed));
     s.stops.push(onSnapshot(collection(userRef, 'logs'), { includeMetadataChanges: true }, (snap) => {
@@ -333,7 +365,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       // See the top of this file: a month in which a tap of ours is still waiting keeps what `base` has.
       const months = snap.docs.map((d) => [d.id, s.ops.some((op) => op.month === d.id) ? s.base.logs[d.id] : readDays(d.data())]);
       s.base = { ...s.base, logs: Object.fromEntries(months.filter(([, days]) => days)) };
-      s.has.logs = true;
+      heard('logs', snap);
       refresh();
     }, failed));
   }
@@ -508,7 +540,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       adopt(null);
       await authSignOut(auth);
     },
-    /** Listen again: for an account that was refused, or whose user record was. */
+    /** Listen again, now: for an account that was refused, one whose user record was, or after a listener failed. */
     retry() {
       const s = session;
       if (!s) return;
