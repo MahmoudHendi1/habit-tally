@@ -173,7 +173,7 @@ export function render(state, ctx) {
   if (habits.length === 0) {
     return head + emptyState({
       title: 'Your progress will show here',
-      text: 'Add a habit on the Today tab and tap + each time you do it. Your totals, your streaks and a calendar of the last 15 weeks build up from there.',
+      text: `Add a habit, then tap + on the Today tab each time you do it. Your totals, your streaks and a calendar of the last ${CALENDAR_WEEKS} weeks build up from there.`,
       actionLabel: 'Add a habit', action: 'new',
     });
   }

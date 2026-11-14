@@ -38,6 +38,7 @@
    The squares take the width they are given: about 15px on a 360px phone, 30px at most. A row is as
    high as a column is wide, which the container unit (cqw) works out from the calendar's own width. */
 .progress-cal { container-type: inline-size; display: grid; gap: 10px; padding-top: 14px; border-top: 1px solid var(--line); border-radius: 2px; }
+.progress-cal:focus-visible { outline-offset: 6px; border-radius: var(--r-sm); }
 .progress-cal-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0 12px; }
 .progress-cal-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
 .progress-grid {
