@@ -1,5 +1,5 @@
 {
-  "about": "What stats() must give for sampleData(today) from src/sample-data.js. Worked out by hand from the two tables in that file; test/store-local.test.mjs asserts them. To see exactly this data in the app, open ?demo=sample with the clock set to noon on `today`.",
+  "about": "What stats() must give for sampleData(today) from src/sample-data.js. Worked out by hand from the tables in that file; test/store-local.test.mjs asserts them. The first two habits are loose; the last two belong to the routine under `routines`. To see exactly this data in the app, open ?demo=sample with the clock set to noon on `today`.",
   "today": "2026-11-13",
   "firstDay": "2026-07-27",
   "habits": [
@@ -12,8 +12,26 @@
       "id": "sampleRunHabit000001", "name": "Go for a run", "period": "week", "target": 3,
       "expected": { "total": 40, "periods": 16, "hitPeriods": 10, "best": 3, "streak": 3 },
       "why": "16 weeks. Weeks hit: 2, 3, 5, 6, 7, 10, 11, 13, 14, 15. This week (2 of 3) is still in progress."
+    },
+    {
+      "id": "sampleVitaminsHabit1", "name": "Take vitamins", "period": "day", "target": 1,
+      "expected": { "total": 85, "periods": 110, "hitPeriods": 85, "best": 18, "streak": 18 },
+      "why": "110 days. 80 days done in the 15 full weeks, 4 from Monday to Thursday, and today. Best and current run are the same one: 27 Oct to 13 Nov, today (1 of 1) included."
+    },
+    {
+      "id": "sampleTeethHabit0001", "name": "Brush teeth", "period": "day", "target": 1,
+      "expected": { "total": 86, "periods": 110, "hitPeriods": 86, "best": 11, "streak": 4 },
+      "why": "110 days. 82 days done in the 15 full weeks and 4 from Monday to Thursday. Best run: 30 Aug to 9 Sep (and again 20 to 30 Oct). Current run: 9 to 12 Nov; today (0 of 1) is still in progress."
     }
   ],
+  "routines": [
+    {
+      "id": "sampleMorningRoutine", "name": "Morning", "times": ["07:00"], "order": 1,
+      "habits": ["sampleVitaminsHabit1", "sampleTeethHabit0001"],
+      "today": { "done": 1, "total": 2, "left": ["sampleTeethHabit0001"], "reminder": "1 left: Brush teeth" }
+    }
+  ],
+  "loose": ["sampleWaterHabit0001", "sampleRunHabit000001"],
   "counts": [
     ["2026-07-27", "sampleWaterHabit0001", 6],
     ["2026-07-30", "sampleWaterHabit0001", 0],
@@ -21,6 +39,15 @@
     ["2026-11-13", "sampleWaterHabit0001", 2],
     ["2026-09-13", "sampleRunHabit000001", 1],
     ["2026-11-11", "sampleRunHabit000001", 1],
-    ["2026-11-13", "sampleRunHabit000001", 0]
+    ["2026-11-13", "sampleRunHabit000001", 0],
+    ["2026-07-27", "sampleVitaminsHabit1", 1],
+    ["2026-08-01", "sampleVitaminsHabit1", 0],
+    ["2026-09-16", "sampleVitaminsHabit1", 0],
+    ["2026-11-12", "sampleVitaminsHabit1", 1],
+    ["2026-11-13", "sampleVitaminsHabit1", 1],
+    ["2026-08-24", "sampleTeethHabit0001", 0],
+    ["2026-09-17", "sampleTeethHabit0001", 1],
+    ["2026-11-12", "sampleTeethHabit0001", 1],
+    ["2026-11-13", "sampleTeethHabit0001", 0]
   ]
 }

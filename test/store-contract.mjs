@@ -4,10 +4,11 @@
 // optimistic and must show before the call returns, and again after `settle()`, because a backend that
 // confirms a little later must not take the change back.
 import assert from 'node:assert/strict';
-import { LIMITS, addDays, countOn, monthId, startDay, stats } from '../shared/logic.js';
+import { LIMITS, addDays, countOn, groupHabits, monthId, routineOf, sortRoutines, startDay, stats } from '../shared/logic.js';
 import { StoreError } from '../src/store.js';
 
 const WATER = { name: 'Water', period: 'day', target: 3, unit: 'glasses', times: ['09:00'] };
+const MORNING = { name: 'Morning', times: ['07:00'] };
 const shortWait = () => new Promise((resolve) => setTimeout(resolve, 5));
 const anotherZone = (store) => (store.getState().user.tz === 'Africa/Cairo' ? 'Asia/Tokyo' : 'Africa/Cairo');
 const UNKNOWN_ID = 'noSuchHabit000000000';
@@ -34,9 +35,10 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
       expectation();
     };
     const habit = (id) => store.getState().habits.find((h) => h.id === id);
+    const routine = (id) => store.getState().routines.find((r) => r.id === id);
     const count = (id, day = today) => countOn(store.getState().logs, id, day);
     try {
-      await body({ store, today, holds, settle, habit, count, advance, t });
+      await body({ store, today, holds, settle, habit, routine, count, advance, t });
       await settle();
       assert.equal(store.getState().lastError, null, 'the backend refused none of these writes');
     } finally {
@@ -46,11 +48,11 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
 
   check('a fresh account is ready and empty', async ({ store, holds }) => {
     await holds(() => {
-      const { status, mode, user, habits, logs, lastError } = store.getState();
+      const { status, mode, user, habits, routines, logs, lastError } = store.getState();
       assert.equal(status, 'ready');
       assert.ok(['demo', 'emulator', 'firebase'].includes(mode));
       assert.deepEqual([typeof user.uid, typeof user.email, typeof user.tz], ['string', 'string', 'string']);
-      assert.deepEqual({ habits, logs, lastError }, { habits: [], logs: {}, lastError: null });
+      assert.deepEqual({ habits, routines, logs, lastError }, { habits: [], routines: [], logs: {}, lastError: null });
     });
   });
 
@@ -330,15 +332,335 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     }
   });
 
+  // ---------- routines (contract v1.3) ----------
+
+  check('add a routine: cleaned, with id and order set by the store, and in the state before the call returns', async ({ store, holds }) => {
+    const id = store.saveRoutine({ name: '  Morning   things ', times: ['07:30', '07:10', '07:00'], order: 99, deletedAt: 5, updatedAt: 5, colour: 'red' });
+    assert.match(id, /^[A-Za-z0-9]{20}$/);
+    assert.deepEqual(store.getState().routines.map((r) => r.id), [id]);
+    const second = store.saveRoutine({ name: 'Evening' });
+    assert.notEqual(second, id);
+    await holds(() => {
+      const [first, next] = store.getState().routines;
+      const { updatedAt, ...rest } = first;
+      assert.deepEqual(rest, { id, name: 'Morning things', times: ['07:00', '07:30'], order: 1, deletedAt: null });
+      assert.ok(updatedAt > 5, 'updatedAt is set by the store');
+      const { updatedAt: later, ...other } = next;
+      assert.deepEqual(other, { id: second, name: 'Evening', times: [], order: 2, deletedAt: null });
+      assert.equal(typeof later, 'number');
+      assert.equal(store.getState().routines.length, 2);
+    });
+  });
+
+  check('edit a routine: id and order never change; a deleted routine can be edited and stays deleted', async ({ store, holds, routine, advance }) => {
+    const id = store.saveRoutine(MORNING);
+    const before = routine(id);
+    advance?.(1000);
+    const same = store.saveRoutine({ id, name: ' Early ', times: ['06:00'], order: 99, deletedAt: 5 });
+    assert.equal(same, id);
+    await holds(() => {
+      const { updatedAt, ...rest } = routine(id);
+      const { updatedAt: savedBefore, ...old } = before;
+      assert.deepEqual(rest, { ...old, name: 'Early', times: ['06:00'] });
+      assert.ok(advance ? updatedAt - savedBefore >= 1000 : updatedAt >= savedBefore, 'updatedAt is set again');
+      assert.equal(store.getState().routines.length, 1);
+    });
+    store.deleteRoutine(id);
+    assert.equal(store.saveRoutine({ id, name: 'Edited while deleted' }), id);
+    await holds(() => assert.deepEqual(store.getState().routines, []));
+    store.restoreRoutine(id);
+    await holds(() => {
+      const { name, times, order, deletedAt } = routine(id);
+      assert.deepEqual({ name, times, order, deletedAt }, { name: 'Edited while deleted', times: [], order: 1, deletedAt: null });
+    });
+  });
+
+  check('saveRoutine: an unknown id throws "not-found", and so does the id of a habit', async ({ store, holds }) => {
+    const habitId = store.saveHabit(WATER);
+    for (const id of [UNKNOWN_ID, habitId]) assert.throws(() => store.saveRoutine({ ...MORNING, id }), fails('not-found'), id);
+    await holds(() => assert.deepEqual(store.getState().routines, []));
+  });
+
+  check('invalid routines throw StoreError "invalid" and change nothing', async ({ store, holds, routine }) => {
+    const id = store.saveRoutine(MORNING);
+    const before = routine(id);
+    const bad = [{ name: '' }, { name: '   ' }, { name: undefined }, { name: 'x'.repeat(LIMITS.routineNameMax + 1) }];
+    for (const change of bad) {
+      for (const input of [{ ...MORNING, ...change }, { ...MORNING, ...change, id }]) {
+        assert.throws(() => store.saveRoutine(input), (err) => fails('invalid')(err)
+          && Array.isArray(err.details) && err.details.length > 0 && err.message === err.details[0], JSON.stringify(input));
+      }
+    }
+    assert.throws(() => store.saveRoutine({}), fails('invalid'));
+    assert.equal(store.saveRoutine({ name: 'x'.repeat(LIMITS.routineNameMax), times: [] }).length, 20);
+    await holds(() => {
+      assert.equal(store.getState().routines.length, 2);
+      assert.deepEqual(routine(id), before);
+    });
+  });
+
+  check(`at most ${LIMITS.routinesMax} live routines: one more, created or restored, throws StoreError "too-many"`, async ({ store, holds }) => {
+    const ids = Array.from({ length: LIMITS.routinesMax }, (_, i) => store.saveRoutine({ name: `Routine ${i + 1}` }));
+    assert.equal(new Set(ids).size, LIMITS.routinesMax);
+    assert.throws(() => store.saveRoutine(MORNING), fails('too-many'));
+    store.saveRoutine({ id: ids[0], name: 'Editing is still allowed' });
+    await holds(() => assert.equal(store.getState().routines.length, LIMITS.routinesMax));
+    store.deleteRoutine(ids[0]);
+    store.saveRoutine({ name: 'Fits again' });
+    await holds(() => {
+      const names = store.getState().routines.map((r) => r.name);
+      assert.deepEqual([names.length, names[0], names.at(-1)], [LIMITS.routinesMax, 'Routine 2', 'Fits again']);
+    });
+    assert.throws(() => store.restoreRoutine(ids[0]), fails('too-many'));
+    await holds(() => assert.deepEqual(store.getState().routines.map((r) => r.id).slice(0, 2), [ids[1], ids[2]]));
+    store.deleteRoutine(ids[1]);
+    store.restoreRoutine(ids[0]);
+    await holds(() => {
+      const live = store.getState().routines.map((r) => r.id);
+      assert.deepEqual([live.length, live[0], live[1]], [LIMITS.routinesMax, ids[0], ids[2]]);
+    });
+  });
+
+  check('deleteRoutine hides the routine and restoreRoutine brings it back with its own order; routines are numbered apart from habits', async ({ store, holds, routine }) => {
+    store.saveHabit(WATER);
+    store.saveHabit({ ...WATER, name: 'Other' });
+    const first = store.saveRoutine(MORNING);
+    const deleted = store.saveRoutine({ name: 'Deleted, then restored' });
+    store.deleteRoutine(deleted);
+    await holds(() => assert.deepEqual(store.getState().routines.map((r) => [r.id, r.order]), [[first, 1]]));
+    const created = store.saveRoutine({ name: 'Created meanwhile' });
+    await holds(() => assert.deepEqual(store.getState().routines.map((r) => [r.id, r.order]), [[first, 1], [created, 3]]));
+    store.restoreRoutine(deleted);
+    await holds(() => {
+      assert.deepEqual(store.getState().routines.map((r) => [r.id, r.order]), [[first, 1], [deleted, 2], [created, 3]]);
+      assert.equal(routine(deleted).deletedAt, null);
+    });
+  });
+
+  check('state.routines is in sortRoutines order: by order, then name, then id', async ({ store, holds }) => {
+    const [beta, gamma, alpha, zed, twin] = ['Beta', 'Gamma', 'Alpha', 'Zed', 'Alpha'].map((name) => store.saveRoutine({ name }));
+    const names = () => store.getState().routines.map((r) => r.name);
+    await holds(() => assert.deepEqual(names(), ['Beta', 'Gamma', 'Alpha', 'Zed', 'Alpha']));
+    // Naming one routine alone gives it order 1 next to the one that already has it: a tie, settled by name.
+    for (const id of [alpha, zed]) store.reorderRoutines([id]);
+    await holds(() => {
+      assert.deepEqual(store.getState().routines.map((r) => [r.id, r.order]), [[alpha, 1], [beta, 1], [zed, 1], [gamma, 2], [twin, 5]]);
+    });
+    store.reorderRoutines([twin]); // the same order and the same name as `alpha`: settled by id
+    await holds(() => {
+      const { routines } = store.getState();
+      assert.deepEqual(routines.map((r) => r.id), [...[alpha, twin].sort(), beta, zed, gamma]);
+      assert.deepEqual(routines, sortRoutines(routines));
+    });
+  });
+
+  check('a habit saved with a live routine has no times of its own; with an unknown or deleted routine it is loose and keeps its times', async ({ store, holds, habit }) => {
+    const live = store.saveRoutine(MORNING);
+    const member = store.saveHabit({ ...WATER, name: 'Member', routine: live }); // at once: the routine is already in the state
+    const gone = store.saveRoutine({ name: 'Gone' });
+    store.deleteRoutine(gone);
+    const notRoutines = { unknown: UNKNOWN_ID, deleted: gone, 'a habit id': member, missing: undefined, empty: '', 'not a string': 42, 'not an id': 'Morning' };
+    const loose = Object.entries(notRoutines).map(([name, value]) => [name, store.saveHabit({ ...WATER, name, routine: value })]);
+    await holds(() => {
+      assert.deepEqual([habit(member).routine, habit(member).times], [live, []]);
+      assert.equal(routineOf(habit(member), store.getState().routines)?.id, live);
+      for (const [name, id] of loose) {
+        assert.deepEqual([habit(id).routine, habit(id).times], ['', WATER.times], `routine ${name}`);
+        assert.equal(routineOf(habit(id), store.getState().routines), null, `routine ${name}`);
+      }
+    });
+  });
+
+  check('saveHabit moves a habit into and out of a routine; it keeps its id, start date and order', async ({ store, holds, habit }) => {
+    const id = store.saveHabit(WATER);
+    store.saveHabit({ ...WATER, name: 'Other' });
+    const morning = store.saveRoutine(MORNING);
+    const { updatedAt: _, ...before } = habit(id);
+    const withoutUpdatedAt = () => { const { updatedAt, ...rest } = habit(id); return rest; };
+    store.saveHabit({ ...WATER, id, routine: morning });
+    await holds(() => assert.deepEqual(withoutUpdatedAt(), { ...before, routine: morning, times: [] }));
+    store.saveHabit({ ...WATER, id }); // the whole editor data: no `routine` means none
+    await holds(() => assert.deepEqual(withoutUpdatedAt(), before));
+    store.saveHabit({ ...WATER, id, routine: morning });
+    store.deleteRoutine(morning);
+    store.saveHabit({ ...WATER, id, routine: morning }); // saved again while its routine is deleted: it leaves it for good
+    store.restoreRoutine(morning);
+    await holds(() => assert.deepEqual(withoutUpdatedAt(), before));
+  });
+
+  check('deleting a routine leaves its habits unchanged and loose; restoring it brings them back', async ({ store, today, holds, settle, routine, count }) => {
+    const morning = store.saveRoutine(MORNING);
+    const [pills, teeth] = ['Pills', 'Teeth'].map((name) => store.saveHabit({ ...WATER, name, routine: morning }));
+    const alone = store.saveHabit({ ...WATER, name: 'Alone' });
+    await settle();
+    const habitsBefore = store.getState().habits;
+    const sections = () => groupHabits(store.getState().habits, store.getState().routines)
+      .map((entry) => [entry.routine?.id ?? null, entry.habits.map((h) => h.id)]);
+    await holds(() => assert.deepEqual(sections(), [[morning, [pills, teeth]], [null, [alone]]]));
+
+    store.deleteRoutine(morning);
+    await holds(() => {
+      assert.deepEqual(store.getState().routines, []);
+      assert.deepEqual(store.getState().habits, habitsBefore, 'no habit was written: same routine value, no times, same updatedAt');
+      assert.deepEqual(sections(), [[null, [pills, teeth, alone]]]);
+    });
+    store.addCount(today, pills, 1); // counting does not look at routines
+    await holds(() => assert.equal(count(pills), 1));
+
+    store.restoreRoutine(morning);
+    await holds(() => {
+      assert.equal(routine(morning).deletedAt, null);
+      assert.deepEqual(store.getState().habits, habitsBefore);
+      assert.deepEqual(sections(), [[morning, [pills, teeth]], [null, [alone]]]);
+      assert.equal(count(pills), 1);
+    });
+  });
+
+  // What reorderHabits and reorderRoutines share. `kind` names the calls and the list in the state.
+  const reorderChecks = (kind) => {
+    const [list, reorder, save, remove, restore] = kind === 'habits'
+      ? ['habits', 'reorderHabits', (store, name) => store.saveHabit({ ...WATER, name }), 'deleteHabit', 'restoreHabit']
+      : ['routines', 'reorderRoutines', (store, name) => store.saveRoutine({ name }), 'deleteRoutine', 'restoreRoutine'];
+    check(`${reorder}: order 1..n in the given sequence; unknown, deleted and repeated ids are dropped; only moved ones are written; listeners are told once`, async ({ store, holds, settle, advance }) => {
+      const [a, b, c, d, gone] = ['A', 'B', 'C', 'D', 'Gone'].map((name) => save(store, name));
+      store[remove](gone);
+      await settle();
+      const item = (id) => store.getState()[list].find((x) => x.id === id);
+      const orders = () => Object.fromEntries(store.getState()[list].map((x) => [x.id, x.order]));
+      // Everything but `order` and `updatedAt` stays; `updatedAt` moves on only where `order` changed.
+      const written = (id, was) => {
+        const { order, updatedAt, ...rest } = item(id);
+        const { order: orderBefore, updatedAt: savedBefore, ...old } = was;
+        assert.deepEqual(rest, old);
+        assert.notEqual(order, orderBefore);
+        assert.ok(advance ? updatedAt - savedBefore >= 1000 : updatedAt >= savedBefore, 'a new updatedAt');
+      };
+      let calls = 0;
+      store.subscribe(() => calls++);
+
+      let before = Object.fromEntries(store.getState()[list].map((x) => [x.id, x]));
+      advance?.(1000);
+      store[reorder]([a, UNKNOWN_ID, c, gone, c, b, a]); // a is first already; d is not named
+      assert.equal(calls, 2, 'one listener call, though two records were written');
+      await holds(() => {
+        assert.deepEqual(store.getState()[list].map((x) => x.id), [a, c, b, d]);
+        assert.deepEqual(orders(), { [a]: 1, [c]: 2, [b]: 3, [d]: 4 });
+        for (const id of [a, d]) assert.deepEqual(item(id), before[id], 'order unchanged: not written');
+        for (const id of [c, b]) written(id, before[id]);
+      });
+
+      before = Object.fromEntries(store.getState()[list].map((x) => [x.id, x]));
+      calls = 1;
+      advance?.(1000);
+      store[reorder]([d, c]); // only those named are numbered: d shares order 1 with a from now on
+      assert.equal(calls, 2);
+      await holds(() => {
+        assert.deepEqual(orders(), { [a]: 1, [d]: 1, [c]: 2, [b]: 3 });
+        for (const id of [a, b, c]) assert.deepEqual(item(id), before[id], 'order unchanged: not written');
+        written(d, before[d]);
+      });
+
+      store[restore](gone); // it was never renumbered, and it still counts towards the highest order
+      const added = save(store, 'Added');
+      await holds(() => assert.deepEqual([item(gone).order, item(added).order], [5, 6]));
+    });
+  };
+  reorderChecks('habits');
+  reorderChecks('routines');
+
+  check('ignored routine and reorder calls change nothing and tell no listener', async ({ store, settle }) => {
+    const [first, second] = [store.saveRoutine(MORNING), store.saveRoutine({ name: 'Evening' })];
+    const gone = store.saveRoutine({ name: 'Gone' });
+    store.deleteRoutine(gone);
+    const [water, tea] = [store.saveHabit(WATER), store.saveHabit({ ...WATER, name: 'Tea' })];
+    const goneHabit = store.saveHabit({ ...WATER, name: 'Gone' });
+    store.deleteHabit(goneHabit);
+    await settle();
+    let calls = 0;
+    store.subscribe(() => calls++);
+    const before = store.getState();
+    const ignored = {
+      'deleting an unknown routine': () => store.deleteRoutine(UNKNOWN_ID),
+      'deleting a deleted routine': () => store.deleteRoutine(gone),
+      'deleting a routine by the id of a habit': () => store.deleteRoutine(water),
+      'restoring an unknown routine': () => store.restoreRoutine(UNKNOWN_ID),
+      'restoring a live routine': () => store.restoreRoutine(first),
+      'reorderHabits without a list': () => store.reorderHabits(),
+      'reorderHabits with null': () => store.reorderHabits(null),
+      'reorderHabits with one id instead of a list': () => store.reorderHabits(tea),
+      'reorderHabits with an object': () => store.reorderHabits({ 0: tea, 1: water, length: 2 }),
+      'reorderHabits with an empty list': () => store.reorderHabits([]),
+      'reorderHabits with no id of a live habit': () => store.reorderHabits([UNKNOWN_ID, goneHabit, first, null, 7]),
+      'reorderHabits with the order they already have': () => store.reorderHabits([water, tea]),
+      'reorderRoutines without a list': () => store.reorderRoutines(),
+      'reorderRoutines with null': () => store.reorderRoutines(null),
+      'reorderRoutines with one id instead of a list': () => store.reorderRoutines(second),
+      'reorderRoutines with an object': () => store.reorderRoutines({ 0: second, 1: first, length: 2 }),
+      'reorderRoutines with an empty list': () => store.reorderRoutines([]),
+      'reorderRoutines with no id of a live routine': () => store.reorderRoutines([UNKNOWN_ID, gone, water, null, 7]),
+      'reorderRoutines with the order they already have': () => store.reorderRoutines([first, second]),
+    };
+    for (const [name, call] of Object.entries(ignored)) {
+      call();
+      assert.equal(store.getState(), before, `${name}: the state object is the same`);
+      assert.equal(calls, 1, `${name}: no listener call`);
+    }
+    await settle();
+    assert.deepEqual(store.getState(), before);
+  });
+
+  check('every routine change and reorder tells listeners once, before the call returns, with a new state that leaves the earlier ones alone', async ({ store, settle }) => {
+    const [water, tea] = [store.saveHabit(WATER), store.saveHabit({ ...WATER, name: 'Tea' })];
+    const first = store.saveRoutine(MORNING);
+    await settle();
+    const seen = [];
+    store.subscribe((state) => seen.push(state));
+    let id;
+    const changes = {
+      create: () => { id = store.saveRoutine({ name: 'Evening', times: ['21:00'] }); },
+      edit: () => store.saveRoutine({ id, name: 'Night', times: [] }),
+      delete: () => store.deleteRoutine(id),
+      restore: () => store.restoreRoutine(id),
+      'reorder routines': () => store.reorderRoutines([id, first]),
+      'reorder habits': () => store.reorderHabits([tea, water]),
+    };
+    const earlier = [];
+    for (const [name, change] of Object.entries(changes)) {
+      const calls = seen.length, before = store.getState();
+      earlier.push([before, structuredClone(before)]);
+      change();
+      assert.equal(seen.length, calls + 1, `${name}: one listener call before the call returned`);
+      assert.notEqual(store.getState(), before, `${name}: a new state`);
+      assert.equal(seen.at(-1), store.getState(), `${name}: listener got the current state`);
+      await settle();
+      assert.equal(seen.at(-1), store.getState(), `${name}: listener still has the current state`);
+      for (const [state, copy] of earlier) assert.deepEqual(state, copy, `${name}: an earlier state was changed`);
+    }
+  });
+
+  check('quick routine save, edit, delete, restore: no listener ever sees an earlier step come back', async ({ store, holds, routine }) => {
+    const seen = [];
+    store.subscribe((state) => seen.push(state));
+    const id = store.saveRoutine(MORNING);
+    store.saveRoutine({ id, name: 'Early' });
+    store.deleteRoutine(id);
+    store.restoreRoutine(id);
+    await holds(() => assert.equal(routine(id)?.name, 'Early'));
+    const names = seen.map((state) => state.routines.find((r) => r.id === id)?.name ?? null);
+    const steps = names.filter((name, i) => name !== names[i - 1]);
+    assert.deepEqual(steps, [null, 'Morning', 'Early', null, 'Early'], `the routine as listeners saw it: ${names}`);
+  });
+
   check('sign-out clears the data from the state', async ({ store, today, settle }) => {
     const id = store.saveHabit(WATER);
+    store.saveRoutine(MORNING);
     store.addCount(today, id, 1);
     await settle();
     const seen = [];
     store.subscribe((state) => seen.push(state.status));
     await store.signOut();
-    const { status, user, habits, logs } = store.getState();
-    assert.deepEqual({ status, user, habits, logs }, { status: 'signedOut', user: null, habits: [], logs: {} });
+    const { status, user, habits, routines, logs } = store.getState();
+    assert.deepEqual({ status, user, habits, routines, logs }, { status: 'signedOut', user: null, habits: [], routines: [], logs: {} });
     assert.equal(seen.at(-1), 'signedOut');
   });
 }
