@@ -55,8 +55,8 @@
 //    re-rendered, before `store.addCount(...)` returns.
 //
 // 3. SHEETS (the editor, any dialog)
-//    openSheet({ title, html, onClose }) shows a modal bottom sheet (a centred dialog on wide screens)
-//    and returns { body, close }. A sheet is NOT re-rendered by main.js, on store changes or otherwise:
+//    openSheet({ title, html, onClose, canClose }) shows a modal bottom sheet (a centred dialog on wide
+//    screens) and returns { body, close }. A sheet is NOT re-rendered by main.js, on store changes or otherwise:
 //    its content belongs to the module that opened it. Keep a draft in module-level variables, attach
 //    delegated listeners to `sheet.body`, and when the draft changes call patch(sheet.body, html)
 //    yourself (rules 2a to 2c apply, so typed text and focus survive). If the sheet must react to the
@@ -64,7 +64,12 @@
 //    into the sheet (to the element with `autofocus`, else the first control) and returns to the opener
 //    (when the opener is gone, as after a delete: to the toast's action button, else the screen's h1);
 //    Escape, the backdrop, the close button and any element with data-sheet-close close it; the page
-//    behind is inert. One sheet at a time. Toasts appear on the page, not above an open sheet: show a
+//    behind is inert. A sheet with a draft to lose passes canClose(): boolean. It is asked before each
+//    of those four ways of closing (Android's Back counts as Escape); when it returns false the sheet
+//    stays open, and canClose itself shows why inside the sheet ("Discard changes?"). It is not asked
+//    by the close() that openSheet returned, which is how the opener closes after a save or a discard,
+//    nor by closeSheet(), which the shell calls when the screen behind changes. A second Back in a
+//    row closes without asking: browsers do not let a page hold on to it. One sheet at a time. Toasts appear on the page, not above an open sheet: show a
 //    sheet's errors inside the sheet.
 //
 // 4. EVENTS
@@ -331,9 +336,10 @@ export function closeSheet() {
 }
 
 /** Show a modal sheet (contract rule 3).
- *  @param {{ title: string, html: string, onClose?: () => void }} options `title` is plain text
+ *  @param {{ title: string, html: string, onClose?: () => void, canClose?: () => boolean }} options
+ *    `title` is plain text; `canClose` may refuse a close the person asked for (not close() or closeSheet())
  *  @returns {{ body: HTMLElement, close: () => void }} `body` holds `html`: bind and patch that element */
-export function openSheet({ title, html, onClose }) {
+export function openSheet({ title, html, onClose, canClose }) {
   closeSheet();
   const opener = document.activeElement;
   const dialog = document.createElement('dialog');
@@ -352,8 +358,20 @@ export function openSheet({ title, html, onClose }) {
   });
   dialog.addEventListener('click', (event) => {
     const target = /** @type {Element} */ (event.target);
-    if ((target === dialog && downOnBackdrop) || target.closest('[data-sheet-close]')) dialog.close();
+    if (((target === dialog && downOnBackdrop) || target.closest('[data-sheet-close]')) && (!canClose || canClose())) dialog.close();
   });
+  if (canClose) {
+    // Escape is answered here, on the key itself: after one refused `cancel` event a browser closes
+    // the dialog on the next Escape without asking again.
+    dialog.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
+      event.preventDefault();
+      if (canClose()) dialog.close();
+    });
+    dialog.addEventListener('cancel', (event) => { // Android's Back button
+      if (!canClose()) event.preventDefault();
+    });
+  }
   dialog.addEventListener('close', () => {
     dialog.remove();
     if (openDialog === dialog) openDialog = null;

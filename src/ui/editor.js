@@ -65,6 +65,13 @@ export function checkForm(form, id = null) {
   return { input, problem: message ? { field: fieldOf(message), message } : null };
 }
 
+/** Whether a draft differs from the form the editor opened with, in what would be saved.
+ *  @param {FormValues} form @param {FormValues} opened @returns {boolean} */
+export function formChanged(form, opened) {
+  const key = (/** @type {FormValues} */ f) => JSON.stringify([f.name.trim(), f.period, f.target.trim(), f.unit.trim(), cleanTimes(f.times)]);
+  return key(form) !== key(opened);
+}
+
 /** "5 of 60 characters", once the text is within a quarter of its limit (or over it); '' before that.
  *  Counts what will be saved: trimmed, runs of spaces as one.
  *  @param {string} text @param {number} max @returns {{ text: string, over: boolean }} */
@@ -158,6 +165,9 @@ export function pushNote(status) {
  *  @property {string | null} id the habit being changed, null for a new one
  *  @property {string} savedName its name in the store, for the "Deleted" message
  *  @property {FormValues} form the draft: read back from the DOM before every render
+ *  @property {FormValues} opened the form as it was when the sheet opened
+ *  @property {boolean} confirming "Discard changes?" is showing in place of Cancel and Save
+ *  @property {Element | null} back what had the focus when that question came up
  *  @property {{ time: string, every: string, from: string, to: string }} picks the reminder selects
  *  @property {Problem | null} problem
  *  @property {string} note what the last change to the reminder times did
@@ -278,10 +288,14 @@ function view(s) {
     <div class="editor-foot" id="editor-foot">
       ${s.gone ? '<p class="notice notice-warn" id="editor-gone" role="alert">This habit has been deleted, perhaps on another device, so changes to it cannot be saved.</p>' : ''}
       ${errorOf(s, 'form')}
-      <div class="sheet-actions">
-        <button type="button" class="btn" data-sheet-close>${s.gone ? 'Close' : 'Cancel'}</button>
+      ${s.confirming ? `<div class="sheet-actions editor-confirm" id="editor-confirm" role="group" aria-labelledby="editor-confirm-text">
+        <p id="editor-confirm-text">Discard changes?</p>
+        <button type="button" class="btn" data-action="keep" id="editor-keep">Keep editing</button>
+        <button type="button" class="btn btn-danger" data-action="discard">Discard</button>
+      </div>` : `<div class="sheet-actions" id="editor-actions">
+        <button type="button" class="btn" data-sheet-close id="editor-cancel">${s.gone ? 'Close' : 'Cancel'}</button>
         ${s.gone ? '' : '<button type="button" class="btn btn-primary" data-action="save">Save habit</button>'}
-      </div>
+      </div>`}
     </div>
   </form>`;
 }
@@ -359,9 +373,41 @@ function remove(s) {
   });
 }
 
+/** The answer to openSheet's canClose (Escape, Back, the backdrop, the close button, Cancel): yes when
+ *  there is nothing to lose. Otherwise the sheet stays open and asks "Discard changes?" in its foot.
+ *  @param {Session} s @returns {boolean} */
+function mayClose(s) {
+  sync(s);
+  if (s.gone || !formChanged(s.form, s.opened)) return true;
+  if (!s.confirming) {
+    s.back = document.activeElement;
+    s.confirming = true;
+    draw(s);
+  }
+  /** @type {HTMLElement | null | undefined} */ (s.body?.querySelector('#editor-keep'))?.focus();
+  return false;
+}
+
+/** "Keep editing": the Cancel and Save row comes back and the focus returns to where it was.
+ *  @param {Session} s */
+function keepEditing(s) {
+  s.confirming = false;
+  draw(s);
+  const sheet = s.body?.closest('dialog');
+  const back = s.back instanceof HTMLElement && s.back !== sheet && sheet?.contains(s.back) ? s.back : s.body?.querySelector('#editor-cancel');
+  s.back = null;
+  if (back instanceof HTMLElement) back.focus();
+}
+
 /** A click on one of the editor's own buttons. @param {Session} s @param {HTMLElement} el */
 function act(s, el) {
   const { action } = el.dataset;
+  if (action === 'keep') return keepEditing(s);
+  if (action === 'discard') {
+    s.end();
+    return s.close();
+  }
+  s.confirming = false; // carrying on with the form answers the question
   if (action === 'delete') return remove(s);
   if (action === 'save') return save(s);
   sync(s);
@@ -423,6 +469,8 @@ export function openEditor(habitId, ctx) {
     id: habit ? habit.id : null,
     savedName: habit ? habit.name : '',
     form: habit ? formOf(habit) : blankForm(),
+    opened: habit ? formOf(habit) : blankForm(),
+    confirming: false, back: null,
     picks: { time: '09:00', every: '2', from: '09:00', to: '21:00' },
     problem: null, note: '', spoken: '', gone: false, body: null,
     close: () => {},
@@ -433,7 +481,7 @@ export function openEditor(habitId, ctx) {
     },
   };
   session = s;
-  const sheet = openSheet({ title: habit ? 'Edit habit' : 'New habit', html: view(s), onClose: s.end });
+  const sheet = openSheet({ title: habit ? 'Edit habit' : 'New habit', html: view(s), onClose: s.end, canClose: () => mayClose(s) });
   s.body = sheet.body;
   s.close = sheet.close;
 
@@ -457,6 +505,7 @@ export function openEditor(habitId, ctx) {
       sync(s);
       const name = el.getAttribute('name');
       if (s.problem && (s.problem.field === name || s.problem.field === 'form')) s.problem = null;
+      s.confirming = false;
       draw(s);
     });
   }
@@ -473,6 +522,7 @@ export function openEditor(habitId, ctx) {
   unsubscribe = ctx.store.subscribe((state) => {
     if (!s.id || s.gone || state.habits.some((h) => h.id === s.id)) return;
     s.gone = true;
+    s.confirming = false;
     sync(s);
     draw(s);
   });

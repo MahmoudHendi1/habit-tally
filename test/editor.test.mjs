@@ -7,7 +7,7 @@ import { createLocalStore } from '../src/store-local.js';
 import { LIMITS, cleanHabit, validateHabit } from '../shared/logic.js';
 import {
   HALF_HOURS, EVERY_CHOICES, blankForm, formOf, toInput, fieldOf, checkForm, limitNote, unitHint, stepTarget,
-  addTimes, overLimitMessage, quickFill, quickFillSummary, pushNote, openEditor,
+  addTimes, overLimitMessage, quickFill, quickFillSummary, pushNote, openEditor, formChanged,
 } from '../src/ui/editor.js';
 
 const form = (changes = {}) => ({ ...blankForm(), name: 'Drink water', ...changes });
@@ -246,6 +246,16 @@ test('pushNote says why reminders will not arrive on this device', () => {
   assert.equal(pushNote('on'), '');
   for (const status of ['demo', 'unsupported', 'blocked', 'off']) assert.ok(pushNote(status).length > 0, status);
   assert.notEqual(pushNote('blocked'), pushNote('off'));
+});
+
+test('formChanged: a draft differs from the opened form only in what would be saved', () => {
+  const opened = form({ name: 'Drink water', target: '8', unit: 'glasses', times: ['09:00', '11:00'] });
+  assert.equal(formChanged({ ...opened, times: [...opened.times] }, opened), false);
+  assert.equal(formChanged({ ...opened, name: ' Drink water ', target: '8 ', times: ['11:00', '09:00'] }, opened), false);
+  assert.equal(formChanged(blankForm(), blankForm()), false);
+  for (const change of [{ name: 'Drink tea' }, { period: 'week' }, { target: '9' }, { unit: '' }, { times: ['09:00'] }, { times: [...opened.times, '13:00'] }]) {
+    assert.equal(formChanged({ ...opened, ...change }, opened), true, JSON.stringify(change));
+  }
 });
 
 test('what the editor hands over is saved unchanged by the store; what it refuses, the store refuses too', () => {

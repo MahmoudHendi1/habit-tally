@@ -66,6 +66,8 @@
   background: var(--surface);
 }
 .editor-foot .sheet-actions { flex-wrap: nowrap; }
+.editor-foot .editor-confirm { flex-wrap: wrap; align-items: center; }
+.editor-confirm p { flex: 1 1 auto; font-weight: 650; }
 .editor-foot .btn-primary { flex: 1; }
 @media (min-width: 640px) {
   .editor-foot .btn-primary { flex: 0 1 200px; }
