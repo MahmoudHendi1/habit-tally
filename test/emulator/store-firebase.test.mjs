@@ -405,6 +405,25 @@ test('a tap here while a tap from another device is on its way: both are counted
   assert.deepEqual(await stored(`users/${a.uid}/logs/2026-11`), { days: { [TODAY]: Object.fromEntries(ids.map((id) => [id, 2])) } });
 });
 
+test('two devices undo the same tap: the server ends at -1, every store shows 0', async () => {
+  const a = await readyStore();
+  const id = a.store.saveHabit(WATER);
+  a.store.addCount(TODAY, id, 1);
+  await a.settle();
+  const b = open();
+  await b.store.signIn(a.email, a.password);
+  assert.equal(countOn(b.store.getState().logs, id, TODAY), 1);
+
+  a.store.addCount(TODAY, id, -1);
+  b.store.addCount(TODAY, id, -1); // b has not heard of a's undo yet
+  await Promise.all([a.settle(), b.settle()]);
+  await sleep(300);
+  assert.deepEqual(await stored(`users/${a.uid}/logs/2026-11`), { days: { [TODAY]: { [id]: -1 } } }, 'increments add up on the server');
+  const late = open();
+  await late.store.signIn(a.email, a.password);
+  for (const { store } of [a, b, late]) assert.equal(store.getState().logs['2026-11'][TODAY][id], 0);
+});
+
 test('offline: changes show at once and stay; with cached data and no connection sign-in still reaches ready; then it all syncs', async () => {
   const a = await readyStore();
   const id = a.store.saveHabit(WATER);

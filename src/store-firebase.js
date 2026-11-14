@@ -102,10 +102,12 @@ function same(a, b) {
 }
 
 /** The days of one month document: { day: { habitId: count } }. The rules cannot look inside `days`, so
- *  anything that is not a number is left out here. */
+ *  anything that is not a number is left out here. A count below 0 is read as 0: two devices that each
+ *  undo the same tap leave -1 on the server, because increments are added up there, not compared. */
 function readDays(data) {
   const days = Object.entries(isObject(data?.days) ? data.days : {}).filter(([, counts]) => isObject(counts));
-  return Object.fromEntries(days.map(([day, counts]) => [day, Object.fromEntries(Object.entries(counts).filter(([, n]) => Number.isFinite(n)))]));
+  const numbers = (counts) => Object.entries(counts).filter(([, n]) => Number.isFinite(n)).map(([id, n]) => [id, Math.max(0, n)]);
+  return Object.fromEntries(days.map(([day, counts]) => [day, Object.fromEntries(numbers(counts))]));
 }
 
 /** One change laid over { tz, habits: { id: habit }, logs }. Returns new data; nothing is mutated.
