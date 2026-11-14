@@ -382,6 +382,29 @@ test('a tap on another device in the middle of a burst of local taps: the count 
   assert.deepEqual(await stored(`users/${a.uid}/logs/2026-11`), { days: { [TODAY]: { [id]: 31 } } });
 });
 
+test('a tap here while a tap from another device is on its way: both are counted, for every habit tried', async () => {
+  const a = await readyStore();
+  const ids = Array.from({ length: 12 }, (_, i) => a.store.saveHabit({ ...WATER, name: `Habit ${i + 1}` }));
+  await a.settle();
+  const b = open();
+  await b.store.signIn(a.email, a.password);
+  const seen = Object.fromEntries(ids.map((id) => [id, []]));
+  a.store.subscribe((state) => { for (const id of ids) seen[id].push(countOn(state.logs, id, TODAY)); });
+  // The other device's tap is saved on the server, and this one taps before, while or just after the news
+  // arrives. When it arrives while our tap is waiting, the snapshot is skipped and nothing but the change
+  // from "pending" to "confirmed" follows: the store must still end up showing both.
+  for (const [i, id] of ids.entries()) {
+    b.store.addCount(TODAY, id, 1);
+    await waitForPendingWrites(b.db);
+    await sleep(i % 3);
+    a.store.addCount(TODAY, id, 1);
+  }
+  await until(a.store, (state) => ids.every((id) => countOn(state.logs, id, TODAY) === 2), 'both taps counted for every habit');
+  await a.settle();
+  for (const id of ids) neverDown(seen[id]);
+  assert.deepEqual(await stored(`users/${a.uid}/logs/2026-11`), { days: { [TODAY]: Object.fromEntries(ids.map((id) => [id, 2])) } });
+});
+
 test('offline: changes show at once and stay; with cached data and no connection sign-in still reaches ready; then it all syncs', async () => {
   const a = await readyStore();
   const id = a.store.saveHabit(WATER);
