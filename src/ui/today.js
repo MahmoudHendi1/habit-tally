@@ -1,7 +1,9 @@
 // @ts-check
 // The Today screen: one card per habit, one tap to log, and a day picker for the last 7 days (R2, R3, R6).
+// Habits that belong to a routine are shown under its heading, and "Reorder" turns the + and - of every
+// card into Move up and Move down (docs/contracts.md section 10, "Routines on the screens").
 // Screen contract: src/ui/common.js.
-import { countOn, periodCount, isHit, isWeekly, summary, recentDays, weekStart } from '../../shared/logic.js';
+import { countOn, periodCount, isHit, isWeekly, summary, recentDays, weekStart, groupHabits } from '../../shared/logic.js';
 import { esc, on, icon, tallyMarks, formatDay, emptyState, announce } from './common.js';
 
 /** @typedef {import('./common.js').State} State */
@@ -10,6 +12,9 @@ import { esc, on, icon, tallyMarks, formatDay, emptyState, announce } from './co
 
 /** A past day chosen in the picker. null = today, which follows the clock. @type {string | null} */
 let picked = null;
+
+/** Reorder mode: cards and routine headings show Move up and Move down instead of the logging buttons. */
+let reordering = false;
 
 /** The day being logged: the picked day while it can still be logged, otherwise today.
  *  @param {string} today */
@@ -45,6 +50,41 @@ function progressText(habit, logs, day, today) {
   return { main: `${main} ${week}`, extra: `${countOn(logs, habit.id, day) || 'None'} logged ${onDay}` };
 }
 
+// ---------- the order of habits and routines (pure) ----------
+
+/** @param {string[]} ids @param {string} id @param {number} delta -1 up, +1 down
+ *  @returns {string[] | null} the list with `id` one place further, or null when it cannot move */
+function swapped(ids, id, delta) {
+  const from = ids.indexOf(id), to = from + (delta < 0 ? -1 : 1);
+  if (from < 0 || to < 0 || to >= ids.length) return null;
+  const out = [...ids];
+  [out[from], out[to]] = [out[to], out[from]];
+  return out;
+}
+
+/** The argument of `store.reorderHabits()` that moves one habit one place inside its own section: every
+ *  live habit id in the new display order (sections in order, the loose habits last).
+ *  @param {{ id: string }[]} habits @param {{ id: string }[]} routines @param {string} id @param {number} delta
+ *  @returns {string[] | null} null when the habit is first (or last) in its section, or unknown */
+export function movedHabits(habits, routines, id, delta) {
+  /** @type {string[][]} */
+  const sections = groupHabits(habits, routines).map((/** @type {{ habits: { id: string }[] }} */ entry) => entry.habits.map((h) => h.id));
+  const at = sections.findIndex((ids) => ids.includes(id));
+  const moved = at < 0 ? null : swapped(sections[at], id, delta);
+  if (!moved) return null;
+  sections[at] = moved;
+  return sections.flat();
+}
+
+/** The argument of `store.reorderRoutines()` that moves one routine one place.
+ *  @param {{ id: string }[]} routines `state.routines` @param {string} id @param {number} delta
+ *  @returns {string[] | null} */
+export const movedRoutines = (routines, id, delta) => swapped(routines.map((r) => r.id), id, delta);
+
+/** Whether "Reorder" has anything to do: two routines, or two habits in one section.
+ *  @param {{ habits: unknown[] }[]} groups `groupHabits()` @param {unknown[]} routines */
+export const canReorder = (groups, routines) => routines.length > 1 || groups.some((g) => g.habits.length > 1);
+
 /** @param {string} today @param {string} day @param {State} state */
 function dayPicker(today, day, { habits, logs }) {
   // Today comes first for keyboards and screen readers; the stylesheet lays the row out right to left,
@@ -61,48 +101,123 @@ function dayPicker(today, day, { habits, logs }) {
   return `<div class="days" role="group" aria-label="Day to log">${buttons.join('')}</div>`;
 }
 
-/** @param {Habit} habit @param {State['logs']} logs @param {string} day @param {string} today */
-function habitCard(habit, logs, day, today) {
+/** Move up and Move down for one habit or routine, shown in Reorder mode.
+ *  @param {'habit' | 'routine'} kind @param {string} id escaped @param {string} name escaped
+ *  @param {{ first: boolean, last: boolean }} at */
+function moveButtons(kind, id, name, at) {
+  const button = (/** @type {number} */ delta, /** @type {boolean} */ off) => `<button type="button" class="btn-round" data-action="move" `
+    + `data-kind="${kind}" data-id="${id}" data-delta="${delta}" aria-label="Move ${delta < 0 ? 'up' : 'down'}: ${name}"${off ? ' disabled' : ''}>`
+    + `${icon(delta < 0 ? 'up' : 'down', 22)}</button>`;
+  return `<div class="habit-controls move-controls">${button(-1, at.first)}${button(1, at.last)}</div>`;
+}
+
+/** @param {Habit} habit @param {State['logs']} logs @param {string} day @param {string} today
+ *  @param {{ tag: 'h2' | 'h3', move: { first: boolean, last: boolean } | null }} how the heading level of the
+ *    name (h3 under a section heading), and where the card is in its section while reordering */
+function habitCard(habit, logs, day, today, { tag, move }) {
   const id = esc(habit.id), name = esc(habit.name);
   const done = isHit(habit, logs, day);
   const { main, extra } = progressText(habit, logs, day, today);
   return `<li class="card habit${done ? ' is-done' : ''}" data-key="${id}">
     <div class="habit-info">
-      <h2><button type="button" class="habit-edit" data-action="edit" data-id="${id}">
-        <span>${name}<span class="sr-only">, edit habit</span></span>${icon('edit', 16)}</button></h2>
+      <${tag} class="habit-name"><button type="button" class="habit-edit" data-action="edit" data-id="${id}">
+        <span>${name}<span class="sr-only">, edit habit</span></span>${icon('edit', 16)}</button></${tag}>
       ${tallyMarks(periodCount(habit, logs, day), habit.target)}
       <p class="habit-progress num">${done ? icon('check', 18) : ''}<span>${esc(main)}</span>${done ? '<span class="sr-only">, done</span>' : ''}</p>
       ${extra ? `<p class="muted small num">${esc(extra)}</p>` : ''}
     </div>
-    <div class="habit-controls">
+    ${move ? moveButtons('habit', id, name, move) : `<div class="habit-controls">
       <button type="button" class="btn-round" data-action="undo" data-id="${id}" aria-label="Undo one: ${name}"
         ${countOn(logs, habit.id, day) === 0 ? 'aria-disabled="true"' : ''}>${icon('minus', 20)}</button>
       <button type="button" class="btn-round btn-plus" data-action="add" data-id="${id}" aria-label="Add one: ${name}">${icon('plus', 28)}</button>
-    </div>
+    </div>`}
   </li>`;
+}
+
+/** The cards of one section. @param {Habit[]} list @param {State['logs']} logs @param {string} day
+ *  @param {string} today @param {'h2' | 'h3'} tag */
+const cards = (list, logs, day, today, tag) => list.map((h, i) => habitCard(h, logs, day, today,
+  { tag, move: reordering ? { first: i === 0, last: i === list.length - 1 } : null })).join('');
+
+/** One section of Today: a routine with its habits, or the loose habits under "Other habits".
+ *  @param {{ routine: State['routines'][number] | null, habits: Habit[] }} entry from groupHabits()
+ *  @param {{ first: boolean, last: boolean }} at among the routines
+ *  @param {State['logs']} logs @param {string} day @param {string} today */
+function section(entry, at, logs, day, today) {
+  const { routine, habits } = entry;
+  const list = `<ul class="habits" role="list">${cards(habits, logs, day, today, 'h3')}</ul>`;
+  if (!routine) {
+    return `<section class="routine" data-key="loose" aria-labelledby="routine-title-loose">
+      <div class="routine-head"><h2 id="routine-title-loose">Other habits</h2></div>${list}</section>`;
+  }
+  const id = esc(routine.id), name = esc(routine.name);
+  const { done, total } = summary(habits, logs, day);
+  return `<section class="routine" data-key="routine-${id}" aria-labelledby="routine-title-${id}">
+    <div class="routine-head">
+      <h2 id="routine-title-${id}"><button type="button" class="habit-edit" data-action="edit-routine" data-id="${id}">
+        <span>${name}<span class="sr-only">, edit routine</span></span>${icon('edit', 16)}</button></h2>
+      ${total > 0 ? `<p class="routine-count num${done === total ? ' is-all' : ''}">${done === total ? icon('check', 16) : ''}${done} of ${total} done</p>` : ''}
+      ${reordering ? moveButtons('routine', id, name, at) : ''}
+    </div>
+    ${total > 0 ? list : '<p class="routine-empty muted small">No habits in this routine yet. Open a habit, or add one, and choose this routine in it.</p>'}
+  </section>`;
 }
 
 /** @param {State} state @param {Ctx} ctx @returns {string} */
 export function render(state, ctx) {
   const today = ctx.today(), day = dayShown(today), past = day !== today;
-  const { habits, logs } = state;
+  const { habits, logs, routines = [] } = state;
   const head = `<header class="screen-head"><p class="eyebrow${past ? ' eyebrow-past' : ''}">${howLongAgo(day, today)}</p>`
     + `<h1 tabindex="-1">${esc(formatDay(day))}</h1></header>`;
-  if (habits.length === 0) {
-    return head + emptyState({
-      title: 'Start your first habit',
-      text: 'Add something you want to do every day or every week, like drinking water 8 times a day or going to the gym 3 times a week. Then tap + each time you do it.',
-      actionLabel: 'Add a habit', action: 'new',
-    });
-  }
+  const empty = habits.length === 0 ? emptyState({
+    title: 'Start your first habit',
+    text: 'Add something you want to do every day or every week, like drinking water 8 times a day or going to the gym 3 times a week. Then tap + each time you do it.',
+    actionLabel: 'Add a habit', action: 'new',
+  }) : '';
+  if (empty && routines.length === 0) return head + empty;
+
+  const groups = groupHabits(habits, routines);
   const { done, total } = summary(habits, logs, day);
+  const count = `<p class="summary${done === total ? ' summary-all' : ''}"><strong class="num">${done} of ${total}</strong> ${total === 1 ? 'habit' : 'habits'} done</p>`;
+  // One button that stays where it is and changes its name, so the focus stays on it.
+  const bar = reordering || canReorder(groups, routines)
+    ? `<div class="today-bar" data-key="bar">${count}<button type="button" class="btn ${reordering ? 'btn-primary' : 'btn-quiet'} today-reorder" data-action="reorder">`
+      + `${reordering ? `${icon('check', 18)}Done reordering` : `${icon('sort', 18)}Reorder`}</button></div>`
+    : count;
+  // With no routines Today is one plain list, as it was before there were routines.
+  const lists = routines.length === 0
+    ? `<ul class="habits" role="list" data-key="habits" data-day="${day}">${cards(habits, logs, day, today, 'h2')}</ul>`
+    : `<div class="routines" data-key="habits" data-day="${day}">${groups.map((entry, i) => section(entry,
+      { first: i === 0, last: i === routines.length - 1 }, logs, day, today)).join('')}</div>`;
   return `${head}
-    <p class="summary${done === total ? ' summary-all' : ''}"><strong class="num">${done} of ${total}</strong> ${total === 1 ? 'habit' : 'habits'} done</p>
-    ${dayPicker(today, day, state)}
-    ${past ? `<div class="notice notice-warn past-note" data-key="past-note"><p>You are logging for <strong>${esc(formatDay(day))}</strong>.</p>
+    ${empty || `${bar}
+    ${dayPicker(today, day, state)}`}
+    ${past && !empty ? `<div class="notice notice-warn past-note" data-key="past-note"><p>You are logging for <strong>${esc(formatDay(day))}</strong>.</p>
       <button type="button" class="btn" data-action="pick-day" data-day="${today}">Back to today</button></div>` : ''}
-    <ul class="habits" role="list" data-key="habits" data-day="${day}">${habits.map((h) => habitCard(h, logs, day, today)).join('')}</ul>
-    <button type="button" class="btn btn-dashed btn-block" data-key="new" data-action="new">${icon('plus', 20)}Add a habit</button>`;
+    ${lists}
+    ${empty ? '' : `<button type="button" class="btn btn-dashed btn-block" data-key="new" data-action="new">${icon('plus', 20)}Add a habit</button>`}
+    <button type="button" class="btn btn-quiet btn-block" data-key="new-routine" data-action="new-routine">${icon('plus', 20)}Add a routine</button>`;
+}
+
+/** One press of Move up or Move down. The store re-renders the screen before it returns; the focus then
+ *  goes back to the button that was pressed, or to its twin when the item has reached the end.
+ *  @param {HTMLElement} root @param {Ctx} ctx @param {HTMLElement} el */
+function move(root, ctx, el) {
+  const { kind, id = '' } = el.dataset, delta = Number(el.dataset.delta);
+  const { habits, routines = [] } = ctx.store.getState();
+  const item = (kind === 'routine' ? routines : habits).find((x) => x.id === id);
+  const ids = kind === 'routine' ? movedRoutines(routines, id, delta) : movedHabits(habits, routines, id, delta);
+  if (!item || !ids) return;
+  if (kind === 'routine') ctx.store.reorderRoutines(ids);
+  else ctx.store.reorderHabits(ids);
+  const twins = /** @type {HTMLButtonElement[]} */ ([...root.querySelectorAll('[data-action="move"]')])
+    .filter((b) => b.dataset.kind === kind && b.dataset.id === id);
+  const same = twins.find((b) => Number(b.dataset.delta) === delta);
+  (same && !same.disabled ? same : twins.find((b) => !b.disabled))?.focus();
+  const after = ctx.store.getState();
+  const list = kind === 'routine' ? (after.routines ?? [])
+    : groupHabits(after.habits, after.routines ?? []).map((/** @type {{ habits: Habit[] }} */ g) => g.habits).find((g) => g.some((h) => h.id === id)) ?? [];
+  announce(`${item.name} moved ${delta < 0 ? 'up' : 'down'}: now ${list.findIndex((x) => x.id === id) + 1} of ${list.length}`);
 }
 
 /** @param {HTMLElement} root @param {Ctx} ctx @returns {() => void} */
@@ -111,6 +226,13 @@ export function bind(root, ctx) {
     const { action, id = '' } = el.dataset;
     if (action === 'new') ctx.openEditor(null);
     else if (action === 'edit') ctx.openEditor(id);
+    else if (action === 'new-routine') ctx.openRoutine(null);
+    else if (action === 'edit-routine') ctx.openRoutine(id);
+    else if (action === 'reorder') {
+      reordering = !reordering;
+      ctx.refresh();
+      announce(reordering ? 'Reordering: use Move up and Move down.' : 'Done reordering.');
+    } else if (action === 'move') move(root, ctx, el);
     else if (action === 'pick-day') {
       picked = el.dataset.day === ctx.today() ? null : el.dataset.day ?? null;
       ctx.refresh();
@@ -135,5 +257,6 @@ export function bind(root, ctx) {
   });
   return () => {
     picked = null; // coming back to this tab starts on today again
+    reordering = false;
   };
 }

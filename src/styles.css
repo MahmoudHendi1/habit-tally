@@ -262,6 +262,20 @@ dialog.sheet::backdrop { background: var(--backdrop); }
 .habit-progress { display: flex; align-items: center; gap: 6px; font-size: 15px; }
 .habit.is-done .habit-progress { color: var(--accent-text); font-weight: 600; }
 .habit-controls { display: flex; align-items: center; gap: 10px; }
+.habit-name { margin: 0; font-size: 17px; line-height: 1.3; font-weight: 650; }
+
+/* Routines: a heading with "x of y done" above the habits done together; Reorder mode adds the arrows. */
+.today-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0 12px; margin-block: -8px; }
+.today-bar .summary { margin-top: 0; }
+.today-reorder { flex: none; margin-right: -10px; padding-inline: 10px; }
+.today-reorder.btn-primary { margin-right: 0; padding-inline: 14px; }
+.routines { display: grid; gap: 20px; }
+.routine { display: grid; gap: 8px; min-width: 0; }
+.routine-head { display: flex; align-items: center; gap: 12px; min-height: var(--tap); padding-left: 2px; }
+.routine-head h2 { flex: 1; min-width: 0; font-size: 19px; }
+.routine-count { flex: none; display: flex; align-items: center; gap: 4px; font-size: 14px; color: var(--muted); }
+.routine-count.is-all { font-weight: 600; color: var(--accent-text); }
+.routine-empty { padding: 12px 14px; border: 1px dashed var(--line-strong); border-radius: var(--r); }
 .habit.is-done .btn-plus { border-color: var(--accent-text); background: var(--accent-soft); color: var(--accent-text); }
 
 @media (prefers-reduced-motion: no-preference) {

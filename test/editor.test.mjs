@@ -9,6 +9,8 @@ import {
   HALF_HOURS, EVERY_CHOICES, blankForm, formOf, toInput, fieldOf, checkForm, limitNote, unitHint, stepTarget,
   addTimes, overLimitMessage, quickFill, quickFillSummary, pushNote, openEditor, formChanged, NEW_ROUTINE, checkRoutineName,
 } from '../src/ui/editor.js';
+import { movedHabits, movedRoutines, canReorder } from '../src/ui/today.js';
+import { groupHabits } from '../shared/logic.js';
 
 const form = (changes = {}) => ({ ...blankForm(), name: 'Drink water', ...changes });
 const hours = (from, to, step = 1) => {
@@ -352,4 +354,36 @@ test('the editor input creates a routine and a habit in it through the store', (
   assert.equal(formOf(saved, store.getState().routines).routine, routineId);
   store.deleteRoutine(routineId);
   assert.equal(formOf(saved, store.getState().routines).routine, '');
+});
+
+// ---------- Reorder mode on Today (v1.3) ----------
+
+test('Move up and Move down: every live id in the new order, moves stay inside a section', () => {
+  const A = 'A'.repeat(20), B = 'B'.repeat(20);
+  const routines = [{ id: A, name: 'Morning', order: 1, deletedAt: null }, { id: B, name: 'Evening', order: 2, deletedAt: null }];
+  const habit = (id, order, routine = '') => ({ id, name: id, order, routine, archived: false, deletedAt: null });
+  const habits = [habit('loose1', 1), habit('a1', 2, A), habit('loose2', 3), habit('a2', 4, A), habit('b1', 5, B)];
+  // Display order: Morning (a1, a2), Evening (b1), Other habits (loose1, loose2).
+  assert.deepEqual(movedHabits(habits, routines, 'a2', -1), ['a2', 'a1', 'b1', 'loose1', 'loose2']);
+  assert.deepEqual(movedHabits(habits, routines, 'loose1', 1), ['a1', 'a2', 'b1', 'loose2', 'loose1']);
+  assert.equal(movedHabits(habits, routines, 'a1', -1), null, 'the first of its section');
+  assert.equal(movedHabits(habits, routines, 'a2', 1), null, 'the last of its section, not into the next one');
+  assert.equal(movedHabits(habits, routines, 'b1', 1), null);
+  assert.equal(movedHabits(habits, routines, 'nobody', 1), null);
+  assert.deepEqual(movedRoutines(routines, B, -1), [B, A]);
+  assert.equal(movedRoutines(routines, A, -1), null);
+  assert.equal(movedRoutines(routines, B, 1), null);
+  assert.equal(canReorder(groupHabits(habits, routines), routines), true);
+  assert.equal(canReorder(groupHabits([habit('x', 1)], []), []), false);
+  assert.equal(canReorder(groupHabits([habit('x', 1), habit('y', 2)], []), []), true);
+});
+
+test('a move through the store keeps the order after the swap', () => {
+  const store = openStore();
+  const r = store.saveRoutine({ name: 'Morning', times: [] });
+  const ids = ['Pills', 'Teeth', 'Water'].map((name, i) => store.saveHabit({ name, period: 'day', target: 1, unit: '', times: [], routine: i < 2 ? r : '' }));
+  const { habits, routines } = store.getState();
+  store.reorderHabits(movedHabits(habits, routines, ids[1], -1));
+  const after = store.getState();
+  assert.deepEqual(groupHabits(after.habits, after.routines).map((g) => g.habits.map((h) => h.name)), [['Teeth', 'Pills'], ['Water']]);
 });

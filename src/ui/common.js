@@ -87,6 +87,7 @@
 //                                render() and in handlers and never keep the result
 //      ctx.navigate(tab)         'today' | 'progress' | 'settings' (sets the address to #/tab)
 //      ctx.openEditor(habitId)   open the editor for that habit; null or nothing = a new habit
+//      ctx.openRoutine(routineId) open the routine editor (src/ui/routine.js); null or nothing = a new routine
 //      ctx.toast(message, { actionLabel, onAction, duration })    e.g. ctx.toast('Deleted.', {
 //                                actionLabel: 'Undo', onAction: () => ctx.store.restoreHabit(id) })
 //      ctx.signOut(): Promise    THE sign-out sequence; every sign-out button calls this, nothing else
@@ -143,6 +144,7 @@ import { parseKey } from '../../shared/logic.js';
  * @property {() => string} today
  * @property {(tab: 'today' | 'progress' | 'settings') => void} navigate
  * @property {(habitId?: string | null) => void} openEditor
+ * @property {(routineId?: string | null) => void} openRoutine
  * @property {(message: string, options?: ToastOptions) => void} toast
  * @property {() => Promise<void>} signOut
  * @property {() => Theme} getTheme
@@ -277,6 +279,9 @@ const ICONS = {
   edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/>',
   back: '<path d="M15 6l-6 6 6 6"/>',
   forward: '<path d="M9 6l6 6-6 6"/>',
+  up: '<path d="M6 15l6-6 6 6"/>',
+  down: '<path d="M6 9l6 6 6-6"/>',
+  sort: '<path d="M8 20V4M4 8l4-4 4 4M16 4v16M12 16l4 4 4-4"/>',
 };
 
 /** An inline icon in the current text colour, hidden from screen readers (label the button instead).
