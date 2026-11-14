@@ -336,6 +336,9 @@ function routineView(s) {
     : !chosen ? '' : times.length === 0 ? `“${chosen.name}” has no reminder times yet. Tap its name on Today to choose them.`
       : `“${chosen.name}” reminds at ${times.length > 4 ? `${times.slice(0, 4).join(', ')} and ${times.length - 4} more` : times.join(', ')}, `
         + 'with one reminder for all of its habits that are still to do.';
+  // Saving into a routine drops the habit's own times (contracts section 3): say so before Save, not after.
+  const own = cleanTimes(s.opened.routine ? [] : s.form.times).length;
+  const lost = own > 0 ? ` This habit’s own ${own === 1 ? 'reminder time is' : `${own} reminder times are`} removed when you save.` : '';
   return `<div class="field">
       <label for="editor-routine">Routine</label>
       <select class="input" id="editor-routine" name="routine"${describe(s, 'routine', ['editor-routine-hint'])}>
@@ -352,7 +355,7 @@ function routineView(s) {
         autocomplete="off" autocapitalize="sentences" enterkeyhint="done"${describe(s, 'routineName', limit.text ? ['editor-routineName-count'] : [])}>
       ${errorOf(s, 'routineName')}${countView('routineName', limit)}
     </div>` : ''}
-    ${routine ? `<div class="notice editor-from-routine" id="editor-from-routine"><p><strong>Reminders come from the routine.</strong> ${esc(from)}</p></div>` : ''}`;
+    ${routine ? `<div class="notice editor-from-routine" id="editor-from-routine"><p><strong>Reminders come from the routine.</strong> ${esc(from + lost)}</p></div>` : ''}`;
 }
 
 /** The whole content of the sheet for a session. @param {Session} s @returns {string} HTML */

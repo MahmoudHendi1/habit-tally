@@ -154,9 +154,9 @@ function section(entry, at, logs, day, today) {
   const { done, total } = summary(habits, logs, day);
   return `<section class="routine" data-key="routine-${id}" aria-labelledby="routine-title-${id}">
     <div class="routine-head">
-      <h2 id="routine-title-${id}"><button type="button" class="habit-edit" data-action="edit-routine" data-id="${id}">
-        <span>${name}<span class="sr-only">, edit routine</span></span>${icon('edit', 16)}</button></h2>
-      ${total > 0 ? `<p class="routine-count num${done === total ? ' is-all' : ''}">${done === total ? icon('check', 16) : ''}${done} of ${total} done</p>` : ''}
+      <h2 id="routine-title-${id}"><button type="button" class="habit-edit" data-action="edit-routine" data-id="${id}"
+        aria-label="${name}, edit routine"><span>${name}</span>${icon('edit', 16)}</button></h2>
+      ${total > 0 && !reordering ? `<p class="routine-count num${done === total ? ' is-all' : ''}">${done === total ? icon('check', 16) : ''}${done} of ${total} done</p>` : ''}
       ${reordering ? moveButtons('routine', id, name, at) : ''}
     </div>
     ${total > 0 ? list : '<p class="routine-empty muted small">No habits in this routine yet. Open a habit, or add one, and choose this routine in it.</p>'}
@@ -179,10 +179,11 @@ export function render(state, ctx) {
   const groups = groupHabits(habits, routines);
   const { done, total } = summary(habits, logs, day);
   const count = `<p class="summary${done === total ? ' summary-all' : ''}"><strong class="num">${done} of ${total}</strong> ${total === 1 ? 'habit' : 'habits'} done</p>`;
-  // One button that stays where it is and changes its name, so the focus stays on it.
+  // One button that stays where it is and changes its name, so the focus stays on it. "Done" is short
+  // enough to stay beside the count on a narrow phone; its full name is "Done reordering".
   const bar = reordering || canReorder(groups, routines)
-    ? `<div class="today-bar" data-key="bar">${count}<button type="button" class="btn ${reordering ? 'btn-primary' : 'btn-quiet'} today-reorder" data-action="reorder">`
-      + `${reordering ? `${icon('check', 18)}Done reordering` : `${icon('sort', 18)}Reorder`}</button></div>`
+    ? `<div class="today-bar" data-key="bar">${count}<button type="button" class="btn ${reordering ? 'btn-primary' : 'btn-quiet'} today-reorder" data-action="reorder"`
+      + `${reordering ? ` aria-label="Done reordering">${icon('check', 18)}Done` : `>${icon('sort', 18)}Reorder`}</button></div>`
     : count;
   // With no routines Today is one plain list, as it was before there were routines.
   const lists = routines.length === 0
