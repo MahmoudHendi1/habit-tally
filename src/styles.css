@@ -21,8 +21,9 @@
   --danger: light-dark(#B3261E, #FF8A80);
   --danger-soft: light-dark(#FBE4E1, #3D1F1C);
   --heat0: light-dark(#E2E8E5, #22302B);
-  --heat1: light-dark(#B9DFD2, #1D4A3D);
-  --heat2: light-dark(#5FB89B, #23806A);
+  /* Contrast between neighbouring levels: light 1.42, 1.51, 1.97; dark 1.74, 1.64, 2.70. */
+  --heat1: light-dark(#93CFBC, #205B4B);
+  --heat2: light-dark(#55AE91, #23806A);
   --heat3: light-dark(#0B7A63, #4FD8B1);
   --mark-off: light-dark(#C3CFCA, #3A4C46);
   --focus: var(--accent-text);
@@ -52,6 +53,7 @@ body {
 }
 h1, h2, p, ul { margin: 0; }
 ul[role="list"] { padding: 0; list-style: none; }
+h1[tabindex="-1"]:focus { outline: none; } /* focus lands here when its control is gone; nothing to show */
 h1 { font-size: 26px; line-height: 1.15; font-weight: 700; letter-spacing: -0.015em; text-wrap: balance; }
 h2 { font-size: 17px; line-height: 1.3; font-weight: 650; }
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -163,9 +165,9 @@ main { padding-block: 16px calc(var(--tabbar) + 24px + env(safe-area-inset-botto
 .btn-round { border: 1px solid var(--line-strong); border-radius: 50%; background: var(--surface); color: var(--ink); }
 .btn-plus { width: 56px; height: 56px; border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
 .icon-btn { border: 0; border-radius: var(--r-sm); background: none; color: var(--muted); }
-.btn:disabled, .btn-round:disabled, .icon-btn:disabled { opacity: 0.4; cursor: default; }
+.btn:disabled, .btn-round:disabled, .icon-btn:disabled, .btn-round[aria-disabled="true"] { opacity: 0.4; cursor: default; }
 @media (hover: hover) {
-  .btn:not(:disabled):hover, .btn-round:not(:disabled):hover { border-color: var(--ink); }
+  .btn:not(:disabled):hover, .btn-round:not(:disabled, [aria-disabled="true"]):hover { border-color: var(--ink); }
   .btn-primary:not(:disabled):hover, .btn-plus:not(:disabled):hover { border-color: var(--accent-text); }
   .icon-btn:not(:disabled):hover { background: var(--sunk); color: var(--ink); }
 }
@@ -265,7 +267,7 @@ dialog.sheet::backdrop { background: var(--backdrop); }
 @media (prefers-reduced-motion: no-preference) {
   .btn, .btn-round, .day, .card, .tabs a, .tabs .icon { transition: background-color 0.15s, border-color 0.15s, color 0.15s, transform 0.1s; }
   .tally line { transition: stroke 0.25s; }
-  .btn-round:not(:disabled):active, .btn:not(:disabled):active { transform: scale(0.95); }
+  .btn-round:not(:disabled, [aria-disabled="true"]):active, .btn:not(:disabled):active { transform: scale(0.95); }
   dialog.sheet[open] { animation: sheet-in 0.2s ease-out; }
   .toast { animation: sheet-in 0.2s ease-out; }
   @keyframes sheet-in {

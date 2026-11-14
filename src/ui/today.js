@@ -64,7 +64,7 @@ function habitCard(habit, logs, day, today) {
     </div>
     <div class="habit-controls">
       <button type="button" class="btn-round" data-action="undo" data-id="${id}" aria-label="Undo one: ${name}"
-        ${countOn(logs, habit.id, day) === 0 ? 'disabled' : ''}>${icon('minus', 20)}</button>
+        ${countOn(logs, habit.id, day) === 0 ? 'aria-disabled="true"' : ''}>${icon('minus', 20)}</button>
       <button type="button" class="btn-round btn-plus" data-action="add" data-id="${id}" aria-label="Add one: ${name}">${icon('plus', 28)}</button>
     </div>
   </li>`;
@@ -75,7 +75,7 @@ export function render(state, ctx) {
   const today = ctx.today(), day = dayShown(today), past = day !== today;
   const { habits, logs } = state;
   const head = `<header class="screen-head"><p class="eyebrow${past ? ' eyebrow-past' : ''}">${howLongAgo(day, today)}</p>`
-    + `<h1>${esc(formatDay(day))}</h1></header>`;
+    + `<h1 tabindex="-1">${esc(formatDay(day))}</h1></header>`;
   if (habits.length === 0) {
     return head + emptyState({
       title: 'Start your first habit',
@@ -103,6 +103,9 @@ export function bind(root, ctx) {
       picked = el.dataset.day === ctx.today() ? null : el.dataset.day ?? null;
       ctx.refresh();
     } else if (action === 'add' || action === 'undo') {
+      // Nothing to undo: the button stays focusable (it is not `disabled`, which would strand the focus
+      // on a dead button after the last undo) and the tap does nothing.
+      if (el.getAttribute('aria-disabled') === 'true') return;
       // Log on the day the card was drawn for: just after midnight that can still be yesterday.
       const day = /** @type {HTMLElement} */ (el.closest('[data-day]')).dataset.day ?? ctx.today();
       ctx.store.addCount(day, id, action === 'add' ? 1 : -1);

@@ -58,7 +58,8 @@
 //    delegated listeners to `sheet.body`, and when the draft changes call patch(sheet.body, html)
 //    yourself (rules 2a to 2c apply, so typed text and focus survive). If the sheet must react to the
 //    store, subscribe yourself and unsubscribe in onClose. The container does the rest: focus moves
-//    into the sheet (to the element with `autofocus`, else the first control) and returns to the opener;
+//    into the sheet (to the element with `autofocus`, else the first control) and returns to the opener
+//    (when the opener is gone, as after a delete: to the toast's action button, else the screen's h1);
 //    Escape, the backdrop, the close button and any element with data-sheet-close close it; the page
 //    behind is inert. One sheet at a time. Toasts appear on the page, not above an open sheet: show a
 //    sheet's errors inside the sheet.
@@ -93,7 +94,7 @@
 //
 // 7. HELPERS EXPORTED HERE
 //    esc, patch, on, icon, tallyMarks, formatDay, screenHead, emptyState, openSheet, closeSheet, toast,
-//    announce, getTheme, setTheme. Dates, counts, streaks and validation come from shared/logic.js.
+//    clearToasts, announce, getTheme, setTheme. Dates, counts, streaks and validation come from shared/logic.js.
 //
 // 8. CSS VOCABULARY (all defined in styles.css; reuse before inventing)
 //    Colours, never literals: --bg page, --surface cards and sheets, --sunk recessed areas, --ink text,
@@ -103,10 +104,11 @@
 //      calendar levels (shared/logic.js calendarWeeks), --focus. Each has a light and a dark value.
 //    Sizes: --r, --r-sm radii; --tap (44px) smallest touch target; --gap (16px) page gutter.
 //    Layout: .stack (column, 16px gaps), .row (wrapping row, 8px gaps), .spread (row, ends apart).
-//    Text: .screen-head with .eyebrow and h1 (use screenHead()); h2; .muted; .small; .num (tabular
-//      figures); .sr-only.
+//    Text: .screen-head with .eyebrow and h1 (use screenHead(); an h1 written by hand carries
+//      tabindex="-1", so focus can fall back to it); h2; .muted; .small; .num (tabular figures); .sr-only.
 //    Surfaces: .card; .chip, .chip-done, .chip-warn; .notice, .notice-warn; .empty (use emptyState()).
-//    Buttons (all at least 44px high): .btn plus .btn-primary, .btn-danger, .btn-quiet (no border),
+//    Buttons (all at least 44px high; aria-disabled="true" on a .btn-round dims it like `disabled` but
+//      keeps the focus, and the handler must ignore the tap): .btn plus .btn-primary, .btn-danger, .btn-quiet (no border),
 //      .btn-block (full width), .btn-dashed; .btn-round (44px circle) plus .btn-plus (56px, filled);
 //      .icon-btn (44px square, icon only: give it an aria-label).
 //    Forms: .field > label + .input (+ .field-hint, .field-error); select.input;
@@ -303,7 +305,7 @@ export function tallyMarks(count, target = 0) {
 /** The heading block at the top of a screen. Both values are plain text.
  *  @param {{ title: string, eyebrow?: string }} head @returns {string} HTML */
 export function screenHead({ title, eyebrow = '' }) {
-  return `<header class="screen-head">${eyebrow ? `<p class="eyebrow">${esc(eyebrow)}</p>` : ''}<h1>${esc(title)}</h1></header>`;
+  return `<header class="screen-head">${eyebrow ? `<p class="eyebrow">${esc(eyebrow)}</p>` : ''}<h1 tabindex="-1">${esc(title)}</h1></header>`;
 }
 
 /** A friendly "nothing here yet" card, with an optional button that carries data-action="<action>".
@@ -353,6 +355,11 @@ export function openSheet({ title, html, onClose }) {
     dialog.remove();
     if (openDialog === dialog) openDialog = null;
     if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+    else { // the opener is gone (its habit was deleted): do not leave the focus on <body>
+      /** @type {HTMLElement | null} */
+      const next = document.querySelector('#toasts .toast-action') ?? document.querySelector('#screen h1[tabindex]');
+      next?.focus();
+    }
     onClose?.();
   }, { once: true });
   document.body.append(dialog);
@@ -365,9 +372,15 @@ export function openSheet({ title, html, onClose }) {
 
 let toastTimer = 0;
 
+/** Take away the toast that is showing, if any (main.js: when the person is signed out). */
+export function clearToasts() {
+  clearTimeout(toastTimer);
+  document.getElementById('toasts')?.replaceChildren();
+}
+
 /** Show a short message at the bottom of the page, optionally with one action ("Deleted." + Undo).
- *  It leaves by itself (4 s, or 8 s with an action; never while it is hovered or focused), and a new
- *  toast replaces the one showing. Screen readers hear it.
+ *  It leaves by itself (4 s, or 8 s with an action; never while it is hovered or has the keyboard's
+ *  focus), and a new toast replaces the one showing. Screen readers hear it.
  *  @param {string} message plain text @param {ToastOptions} [options] */
 export function toast(message, { actionLabel, onAction, duration } = {}) {
   const region = document.getElementById('toasts');
@@ -391,7 +404,12 @@ export function toast(message, { actionLabel, onAction, duration } = {}) {
     });
     box.append(action);
   }
-  for (const type of ['pointerenter', 'focusin']) box.addEventListener(type, () => clearTimeout(toastTimer));
+  box.addEventListener('pointerenter', () => clearTimeout(toastTimer));
+  // Focus that a script put on the action after a tap (a sheet closing) is not somebody reading the
+  // toast: only focus that shows a ring holds it, or it would stay until the next tap elsewhere.
+  box.addEventListener('focusin', () => {
+    if (box.querySelector(':focus-visible')) clearTimeout(toastTimer);
+  });
   for (const type of ['pointerleave', 'focusout']) box.addEventListener(type, wait);
   region.replaceChildren(box);
   wait();

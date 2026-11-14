@@ -66,6 +66,8 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
   const path = url.pathname;
+  // Firebase Hosting's own pages (/__/auth/action is the password-reset page): never the app shell.
+  if (path.startsWith('/__/')) return;
   if (path !== SHELL && (PRECACHED.has(path) || path.startsWith(ASSETS))) event.respondWith(cacheFirst(request, path));
   else if (request.mode === 'navigate') event.respondWith(shellNetworkFirst(request));
 });
