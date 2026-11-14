@@ -247,9 +247,19 @@ nothing". A demo build leaves Firebase chunks out of `files`. Service worker che
   `dueHabits(habits, logs, entry.day, entry.times)`; a habit due in more than one entry is sent once, with the
   text of the latest day; then devices. Only then **claim** the slot with a precondition
   (`ifUpdateTime`, or `ifMissing` on the first run), and send. The claim is written even when there is nothing
-  to send. A failed read before the claim fails the run without claiming, so the next run retries the slot.
-- Only a `PreconditionError` means "another run has the slot" (success, nothing sent). Any other error on the
-  claim, including a timeout, fails the run without sending.
+  to send. A failed read of one user's habits, logs or devices is tried once more (one retry per user, time
+  permitting); if it fails again, that user gets nothing for this slot and counts as `failed` (exit 1), while
+  the other users are served and the slot is claimed. Only when the bookmark, the user list or every user
+  cannot be read is nothing claimed, so the next run retries the slot.
+- Only a `PreconditionError` means "another run has claimed". The job then reads the bookmark again: if it
+  holds this run's slot or a later one, the run ends as a success with nothing sent; if it holds an older slot
+  (a late run got in first), the run plans, reads and claims again, once. Any other error on the claim,
+  including a timeout, fails the run without sending.
+- Time: the default deadline is 120 s. Nothing is claimed when reading ends less than 30 s before the deadline
+  (the run fails and the next one retries the slot), so a push started at the last moment still ends inside
+  the workflow's 3-minute limit.
+- The command's entry point is exported for tests: `main({ env, log, makeGoogle, now })` resolves the exit
+  code; `run()` also takes an injectable `sleep`.
 - `force: true` (environment `REMINDERS_FORCE=1`, set by the workflow's manual-run checkbox): ignore the
   bookmark, use the window of the current slot only, send without claiming and without changing the bookmark.
   For testing on a real phone.
