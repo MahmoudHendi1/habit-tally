@@ -1,1 +1,75 @@
-/* Placeholder. Package A3 (habit editor) owns this file: styles for the editor sheet only. */
+/* The habit editor sheet (package A3, src/ui/editor.js). Colours and sizes are the tokens of styles.css. */
+
+.editor { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.editor h3 { margin: 0; font-size: 17px; line-height: 1.3; font-weight: 650; }
+.editor .input[aria-invalid="true"] { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
+.editor .field-error { overflow-wrap: anywhere; }
+.editor-count.is-over { font-weight: 600; color: var(--danger); }
+
+/* The sheet scrolls under the Save row, which brings its own bottom padding: keep a focused field or a
+   new message clear of it. */
+.sheet-body:has(> .editor) { padding-bottom: 0; scroll-padding-block: 8px 88px; }
+
+/* ---------- target and how often ---------- */
+.editor-goal { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 16px; }
+.editor-goal > .field { flex: none; }
+/* Beside the target while both labels fit on one line each, otherwise on a row of its own. */
+.editor-goal > .segmented { flex: 1 1 150px; min-width: min-content; }
+.editor-goal > .segmented span { padding-inline: 6px; white-space: nowrap; }
+.editor-goal > p { flex: 0 0 100%; }
+.editor-stepper { display: flex; align-items: center; gap: 8px; }
+.editor-stepper .input { width: 56px; padding-inline: 4px; font-weight: 600; text-align: center; }
+.editor-stepper [aria-disabled="true"] { opacity: 0.4; cursor: default; }
+
+/* ---------- reminders ---------- */
+.editor-reminders { position: relative; display: grid; gap: 12px; min-width: 0; padding-top: 16px; border-top: 1px solid var(--line); }
+.editor-push { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+.editor-push p { flex: 1 1 180px; }
+.editor-add { display: flex; align-items: flex-end; gap: 8px; }
+.editor-add .field { flex: 1; min-width: 0; }
+.editor-quick { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; min-width: 0; margin: 0; padding: 4px 12px 12px; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.editor-quick legend { padding: 0 6px; margin-left: -6px; font-size: 14px; font-weight: 600; color: var(--muted); }
+.editor-quick .input { padding-inline: 8px; }
+.editor-quick .btn { grid-column: 1 / -1; }
+.editor-note { font-size: 14px; font-weight: 600; color: var(--accent-text); }
+.editor-note:empty { position: absolute; } /* out of the layout, still a live region */
+.editor-chosen { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 12px; min-height: var(--tap); }
+.editor-times { display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); gap: 8px; }
+.editor-time {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 4px 8px;
+  border: 1px solid var(--accent-text);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.editor-time .icon { flex: none; opacity: 0.8; }
+@media (hover: hover) {
+  .editor-time:hover { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+}
+
+/* ---------- delete, and the Save row that stays in view ---------- */
+.editor-danger { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding-top: 16px; border-top: 1px solid var(--line); }
+.editor-danger p { flex: 1 1 160px; }
+.editor-foot {
+  position: sticky;
+  z-index: 1;
+  bottom: 0;
+  display: grid;
+  gap: 8px;
+  margin: 0 -20px;
+  padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+}
+.editor-foot .sheet-actions { flex-wrap: nowrap; }
+.editor-foot .btn-primary { flex: 1; }
+@media (min-width: 640px) {
+  .editor-foot .btn-primary { flex: 0 1 200px; }
+}

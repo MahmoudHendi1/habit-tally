@@ -1,0 +1,279 @@
+// The habit editor's pure parts: form to habit, the messages, and the reminder-time helpers (R1, R4).
+// The module is loaded without a DOM here, which is itself part of the test.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { createLocalStore } from '../src/store-local.js';
+import { LIMITS, cleanHabit, validateHabit } from '../shared/logic.js';
+import {
+  HALF_HOURS, EVERY_CHOICES, blankForm, formOf, toInput, fieldOf, checkForm, limitNote, unitHint, stepTarget,
+  addTimes, overLimitMessage, quickFill, quickFillSummary, pushNote, openEditor,
+} from '../src/ui/editor.js';
+
+const form = (changes = {}) => ({ ...blankForm(), name: 'Drink water', ...changes });
+const hours = (from, to, step = 1) => {
+  const out = [];
+  for (let h = from; h <= to; h += step) out.push(`${String(h).padStart(2, '0')}:00`);
+  return out;
+};
+
+function fakeStorage() {
+  const map = new Map();
+  return { getItem: (k) => map.get(k) ?? null, setItem: (k, v) => void map.set(k, String(v)), removeItem: (k) => void map.delete(k) };
+}
+const openStore = () => createLocalStore({ storage: fakeStorage(), now: () => new Date('2026-11-03T12:00:00'), tz: 'Europe/London' });
+
+test('the module loads without a DOM and does not import CSS', () => {
+  assert.equal(typeof openEditor, 'function');
+  const source = readFileSync(new URL('../src/ui/editor.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /import[^;]*\.css['"]/);
+});
+
+test('HALF_HOURS is every :00 and :30 of the day, and nothing else', () => {
+  assert.equal(HALF_HOURS.length, 48);
+  assert.equal(HALF_HOURS[0], '00:00');
+  assert.equal(HALF_HOURS[1], '00:30');
+  assert.equal(HALF_HOURS.at(-1), '23:30');
+  assert.ok(HALF_HOURS.every((t) => /^([01]\d|2[0-3]):(00|30)$/.test(t)));
+  assert.deepEqual([...HALF_HOURS].sort(), HALF_HOURS);
+  assert.ok(EVERY_CHOICES.includes(1) && EVERY_CHOICES.includes(2) && EVERY_CHOICES.includes(4));
+});
+
+test('a blank form needs only a name to be a valid habit', () => {
+  assert.equal(checkForm(blankForm()).problem?.field, 'name');
+  const { input, problem } = checkForm(form());
+  assert.equal(problem, null);
+  assert.deepEqual(input, { name: 'Drink water', period: 'day', target: 1, unit: '', times: [] });
+  assert.deepEqual(validateHabit(input), []);
+});
+
+test('a checked form passes the shared validation and is already clean', () => {
+  const { input, problem } = checkForm(form({
+    name: '  Drink   water ', period: 'week', target: ' 8 ', unit: ' glasses ', times: ['21:00', '09:00', '09:00', '13:30'],
+  }), 'abc123');
+  assert.equal(problem, null);
+  assert.deepEqual(input, { id: 'abc123', name: 'Drink water', period: 'week', target: 8, unit: 'glasses', times: ['09:00', '13:30', '21:00'] });
+  assert.deepEqual(validateHabit(input), []);
+  const { id, ...fields } = input;
+  assert.deepEqual(cleanHabit(input), fields, 'the store finds nothing left to tidy');
+});
+
+test('toInput: id only when editing, target as typed', () => {
+  assert.equal('id' in toInput(form()), false);
+  assert.equal(toInput(form(), 'h1').id, 'h1');
+  assert.equal(toInput(form({ target: '12' })).target, 12);
+  assert.ok(Number.isNaN(toInput(form({ target: '' })).target));
+  assert.ok(Number.isNaN(toInput(form({ target: 'abc' })).target));
+});
+
+test('formOf and checkForm round-trip a stored habit', () => {
+  const habit = { id: 'h1', name: 'Gym', period: 'week', target: 3, unit: 'visits', times: ['18:00', '07:30'], created: '2026-11-01',
+    archived: false, deletedAt: null, order: 1, updatedAt: 1 };
+  const values = formOf(habit);
+  assert.deepEqual(values, { name: 'Gym', period: 'week', target: '3', unit: 'visits', times: ['07:30', '18:00'] });
+  assert.deepEqual(checkForm(values, habit.id), {
+    input: { id: 'h1', name: 'Gym', period: 'week', target: 3, unit: 'visits', times: ['07:30', '18:00'] }, problem: null,
+  });
+});
+
+test('an empty name cannot be saved, and the message says why', () => {
+  for (const name of ['', '   ', '\n\t']) {
+    const { problem } = checkForm(form({ name }));
+    assert.deepEqual(problem, { field: 'name', message: 'Give the habit a name.' });
+  }
+  const long = checkForm(form({ name: 'x'.repeat(LIMITS.nameMax + 1) })).problem;
+  assert.equal(long?.field, 'name');
+  assert.match(long?.message ?? '', /60 characters/);
+  assert.equal(checkForm(form({ name: 'x'.repeat(LIMITS.nameMax) })).problem, null);
+});
+
+test('a target outside 1 to 50 cannot be saved, and the message says why', () => {
+  for (const target of ['0', '51', '-3', '', 'abc', '2.5', '1e3', 'Infinity']) {
+    const { problem } = checkForm(form({ target }));
+    assert.equal(problem?.field, 'target', `target "${target}"`);
+    assert.equal(problem?.message, 'Target must be a whole number from 1 to 50.');
+  }
+  for (const target of ['1', '50', ' 7 ', '07']) assert.equal(checkForm(form({ target })).problem, null, `target "${target}"`);
+  assert.equal(checkForm(form({ target: '07' })).input.target, 7);
+});
+
+test('the unit is optional and limited to 20 characters', () => {
+  assert.equal(checkForm(form({ unit: '' })).problem, null);
+  assert.equal(checkForm(form({ unit: 'x'.repeat(LIMITS.unitMax) })).problem, null);
+  assert.equal(checkForm(form({ unit: 'x'.repeat(LIMITS.unitMax + 1) })).problem?.field, 'unit');
+});
+
+test('the first problem is reported, at its own field', () => {
+  assert.equal(checkForm(form({ name: '', target: '99' })).problem?.field, 'name');
+  assert.equal(checkForm(form({ target: '99', unit: 'x'.repeat(30) })).problem?.field, 'target');
+});
+
+test('fieldOf places every sentence of validateHabit', () => {
+  const sentences = {
+    name: validateHabit({ name: '', period: 'day', target: 1, unit: '', times: [] }),
+    period: validateHabit({ name: 'a', period: 'month', target: 1, unit: '', times: [] }),
+    target: validateHabit({ name: 'a', period: 'day', target: 0, unit: '', times: [] }),
+    unit: validateHabit({ name: 'a', period: 'day', target: 1, unit: 'x'.repeat(21), times: [] }),
+    times: [
+      ...validateHabit({ name: 'a', period: 'day', target: 1, unit: '', times: ['09:10'] }),
+      ...validateHabit({ name: 'a', period: 'day', target: 1, unit: '', times: ['09:00', '09:00'] }),
+      ...validateHabit({ name: 'a', period: 'day', target: 1, unit: '', times: [...HALF_HOURS, '09:00'] }),
+    ],
+  };
+  for (const [field, list] of Object.entries(sentences)) {
+    assert.ok(list.length > 0, field);
+    for (const message of list) assert.equal(fieldOf(message), field, message);
+  }
+  assert.equal(fieldOf('Something else went wrong.'), 'form');
+});
+
+test('checkForm never hands over invalid reminder times', () => {
+  const { input, problem } = checkForm(form({ times: ['09:10', '9:00', 'soon', '25:00', '09:00', '23:59'] }));
+  assert.equal(problem, null);
+  assert.deepEqual(input.times, ['09:00', '23:30']);
+  assert.deepEqual(validateHabit(input), []);
+  const all = checkForm(form({ times: [...HALF_HOURS, ...HALF_HOURS] }));
+  assert.equal(all.problem, null);
+  assert.equal(all.input.times.length, LIMITS.timesMax);
+});
+
+test('addTimes: several times can be added, each once, kept sorted', () => {
+  let list = addTimes([], ['09:00']);
+  assert.deepEqual(list, { times: ['09:00'], added: ['09:00'], over: 0 });
+  list = addTimes(list.times, ['07:30']);
+  assert.deepEqual(list, { times: ['07:30', '09:00'], added: ['07:30'], over: 0 });
+  list = addTimes(list.times, ['09:00']);
+  assert.deepEqual(list, { times: ['07:30', '09:00'], added: [], over: 0 });
+  assert.deepEqual(addTimes(['09:00'], ['12:10']).times, ['09:00', '12:00'], 'snapped to the half hour');
+});
+
+test('addTimes: going over the limit adds nothing and reports how many there would be', () => {
+  assert.deepEqual(addTimes(['09:00', '10:00'], ['11:00', '12:00'], 3), { times: ['09:00', '10:00'], added: [], over: 4 });
+  assert.deepEqual(addTimes(['09:00', '10:00'], ['11:00'], 3), { times: ['09:00', '10:00', '11:00'], added: ['11:00'], over: 0 });
+  assert.equal(addTimes(['09:00', '10:00', '11:00'], ['10:00'], 3).over, 0, 'a time already in a full list is not "over"');
+  const message = overLimitMessage(4, 3);
+  assert.match(message, /4 reminder times/);
+  assert.match(message, /at most 3/);
+  assert.match(message, /Nothing was added/);
+  assert.match(overLimitMessage(60), /at most 48/);
+  // With the real limit every half hour of the day fits, so the full day is accepted.
+  assert.deepEqual(addTimes(['09:00'], HALF_HOURS), { times: HALF_HOURS, added: HALF_HOURS.filter((t) => t !== '09:00'), over: 0 });
+});
+
+test('quick fill: every 2 hours between 09:00 and 21:00 gives 7 times', () => {
+  const { times, summary, problem } = quickFill([], '09:00', '21:00', 2);
+  assert.deepEqual(times, ['09:00', '11:00', '13:00', '15:00', '17:00', '19:00', '21:00']);
+  assert.equal(summary, 'Added 7 times: every 2 hours from 09:00 to 21:00.');
+  assert.equal(problem, '');
+});
+
+test('quick fill: every hour between 07:00 and 22:00 gives 16 times and is accepted', () => {
+  const { times, summary, problem } = quickFill([], '07:00', '22:00', 1);
+  assert.deepEqual(times, hours(7, 22));
+  assert.equal(times.length, 16);
+  assert.equal(summary, 'Added 16 times: every hour from 07:00 to 22:00.');
+  assert.equal(problem, '');
+  assert.equal(checkForm(form({ times })).problem, null);
+});
+
+test('quick fill: a range that ends before it starts runs past midnight', () => {
+  const { times, summary } = quickFill([], '22:00', '06:00', 4);
+  assert.deepEqual(times, ['02:00', '06:00', '22:00']);
+  assert.equal(summary, 'Added 3 times: every 4 hours from 22:00 to 06:00 (past midnight).');
+});
+
+test('quick fill: merges with the times already there and says what was new', () => {
+  const some = quickFill(['08:30', '11:00'], '09:00', '13:00', 2);
+  assert.deepEqual(some.times, ['08:30', '09:00', '11:00', '13:00']);
+  assert.equal(some.summary, 'Added 2 times: every 2 hours from 09:00 to 13:00. The other 1 was already in the list.');
+  const none = quickFill(some.times, '09:00', '13:00', 2);
+  assert.deepEqual(none.times, some.times);
+  assert.match(none.summary, /^Nothing added: all 3 times/);
+  const one = quickFill([], '09:00', '09:00', 2);
+  assert.deepEqual(one.times, ['09:00']);
+  assert.equal(one.summary, 'Added 1 time: at 09:00.');
+  assert.equal(quickFillSummary({ start: '', hours: 2, filled: [], added: 0 }), 'Nothing to add for that choice.');
+});
+
+test('quick fill: every 30 minutes round the clock is the 48 there can be; a fill never goes over the limit', () => {
+  const day = quickFill(['09:00'], '00:00', '23:30', 0.5);
+  assert.deepEqual(day.times, HALF_HOURS);
+  assert.equal(day.problem, '');
+  assert.equal(checkForm(form({ times: day.times })).problem, null);
+  // Every choice, from every start, on top of a full list: the result is always a list the store accepts.
+  for (const every of EVERY_CHOICES) {
+    for (const start of ['00:00', '09:00', '22:30']) {
+      const result = quickFill(HALF_HOURS, start, '06:00', every);
+      assert.ok(result.times.length <= LIMITS.timesMax);
+      assert.deepEqual(validateHabit(checkForm(form({ times: result.times })).input), []);
+    }
+  }
+  // A lower limit shows the refusal: the list is untouched and the message says why.
+  const refused = quickFill(['08:00'], '09:00', '21:00', 2, 6);
+  assert.deepEqual(refused.times, ['08:00']);
+  assert.equal(refused.summary, '');
+  assert.equal(refused.problem, overLimitMessage(8, 6));
+});
+
+test('stepTarget moves by one and stays within 1 to 50', () => {
+  assert.equal(stepTarget('1', 1), '2');
+  assert.equal(stepTarget('2', -1), '1');
+  assert.equal(stepTarget('1', -1), '1');
+  assert.equal(stepTarget('50', 1), '50');
+  assert.equal(stepTarget('99', -1), '50');
+  assert.equal(stepTarget('-4', 1), '1');
+  assert.equal(stepTarget('2.5', 1), '3');
+  assert.equal(stepTarget('2.5', -1), '2');
+  assert.equal(stepTarget('', 1), '1');
+  assert.equal(stepTarget('abc', -1), '1');
+});
+
+test('limitNote counts what will be saved and appears near the limit', () => {
+  assert.deepEqual(limitNote('Water', 60), { text: '', over: false });
+  assert.deepEqual(limitNote('x'.repeat(45), 60), { text: '45 of 60 characters', over: false });
+  assert.deepEqual(limitNote(`  ${'x'.repeat(60)}  `, 60), { text: '60 of 60 characters', over: false });
+  assert.deepEqual(limitNote('x'.repeat(61), 60), { text: '61 of 60 characters', over: true });
+});
+
+test('unitHint shows how progress will read', () => {
+  assert.match(unitHint(form({ target: '8', unit: 'glasses' })), /3 of 8 glasses today/);
+  assert.match(unitHint(form({ target: '3', unit: 'runs', period: 'week' })), /2 of 3 runs this week/);
+  assert.match(unitHint(form({ target: '1', unit: '' })), /Optional.*0 of 1 today/);
+  assert.match(unitHint(form({ target: 'abc', unit: '' })), /3 of 8 today/);
+});
+
+test('pushNote says why reminders will not arrive on this device', () => {
+  assert.equal(pushNote('on'), '');
+  for (const status of ['demo', 'unsupported', 'blocked', 'off']) assert.ok(pushNote(status).length > 0, status);
+  assert.notEqual(pushNote('blocked'), pushNote('off'));
+});
+
+test('what the editor hands over is saved unchanged by the store; what it refuses, the store refuses too', () => {
+  const store = openStore();
+  const { times } = quickFill(['07:30'], '09:00', '21:00', 2);
+  const { input, problem } = checkForm(form({ name: ' Drink  water ', target: '8', unit: 'glasses', times }));
+  assert.equal(problem, null);
+  const id = store.saveHabit(input);
+  const saved = store.getState().habits.find((h) => h.id === id);
+  assert.ok(saved);
+  assert.deepEqual(validateHabit(saved), []);
+  assert.deepEqual(
+    { name: saved.name, period: saved.period, target: saved.target, unit: saved.unit, times: saved.times },
+    { name: 'Drink water', period: 'day', target: 8, unit: 'glasses', times: ['07:30', '09:00', '11:00', '13:00', '15:00', '17:00', '19:00', '21:00'] },
+  );
+
+  // Edit: the form of the saved habit, changed, goes back in under the same id.
+  const edit = checkForm({ ...formOf(saved), period: 'week', target: '3', times: [] }, id);
+  assert.equal(edit.problem, null);
+  assert.equal(store.saveHabit(edit.input), id);
+  const after = store.getState().habits.find((h) => h.id === id);
+  assert.deepEqual([after?.period, after?.target, after?.times, after?.created, after?.order], ['week', 3, [], saved.created, saved.order]);
+  assert.equal(store.getState().habits.length, 1);
+
+  for (const bad of [form({ name: '' }), form({ target: '0' }), form({ target: '51' })]) {
+    const checked = checkForm(bad);
+    assert.ok(checked.problem);
+    assert.throws(() => store.saveHabit(toInput(bad)), (err) => err.code === 'invalid' && err.message === checked.problem.message);
+  }
+  assert.equal(store.getState().habits.length, 1);
+});
