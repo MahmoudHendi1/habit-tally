@@ -38,6 +38,7 @@ import {
 import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache,
   memoryLruGarbageCollector, connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, updateDoc, increment, runTransaction,
+  waitForPendingWrites, terminate, clearIndexedDbPersistence,
 } from 'firebase/firestore';
 import { LIMITS, keyOf, monthId, countOn, recentDays, cleanHabit, validateHabit, sortHabits } from '../shared/logic.js';
 import { firebaseConfig, emulatorConfig } from './firebase-config.js';
@@ -53,6 +54,9 @@ const SHARED = ['user', 'habits', 'logs', 'lastError'];
 const OFFLINE_GRACE_MS = 1500;
 /** Waits before listening again after a listener failed; the last one repeats. */
 const LISTEN_AGAIN_MS = [2000, 5000, 15_000, 60_000];
+/** Sign-out in a browser: how long to wait for writes that have not reached the server yet, and for the
+ *  browser to delete the offline cache. */
+const PENDING_WAIT_MS = 2000, CLEAR_WAIT_MS = 1000;
 const NOTHING_HEARD = { user: false, habits: false, logs: false };
 const inBrowser = typeof window !== 'undefined' && typeof indexedDB !== 'undefined';
 
@@ -141,29 +145,34 @@ function applyOp(data, op) {
 function connect(emulator, appName) {
   const config = emulator ? emulatorConfig.firebase : firebaseConfig;
   const app = getApps().find((a) => a.name === (appName ?? '[DEFAULT]')) ?? initializeApp(config, appName);
-  let auth, db;
+  let auth;
   try {
     auth = initializeAuth(app, inBrowser ? { persistence: [indexedDBLocalPersistence, browserLocalPersistence] } : undefined);
   } catch {
     auth = getAuth(app); // already set up on this app (for example after a hot reload)
   }
+  if (emulator) connectAuthEmulator(auth, emulatorConfig.authUrl, { disableWarnings: true });
   // Like the browser cache, the memory cache keeps documents that no listener is watching any more.
   const inMemory = () => memoryLocalCache({ garbageCollector: memoryLruGarbageCollector() });
-  try {
-    const localCache = inBrowser ? persistentLocalCache({ tabManager: persistentMultipleTabManager() }) : inMemory();
-    db = initializeFirestore(app, { localCache });
-  } catch {
+  /** A Firestore instance for the app; called again after the one before was terminated (sign-out in a
+   *  browser). `persistent`: it keeps its cache in IndexedDB, which sign-out then has to clear. */
+  function openDb(memoryOnly = false) {
+    let db, persistent = inBrowser && !memoryOnly;
     try {
-      db = initializeFirestore(app, { localCache: inMemory() });
+      const localCache = persistent ? persistentLocalCache({ tabManager: persistentMultipleTabManager() }) : inMemory();
+      db = initializeFirestore(app, { localCache });
     } catch {
-      db = getFirestore(app); // already set up on this app
+      try {
+        db = initializeFirestore(app, { localCache: inMemory() });
+        persistent = false;
+      } catch {
+        db = getFirestore(app); // already set up on this app
+      }
     }
+    if (emulator) connectFirestoreEmulator(db, emulatorConfig.firestoreHost, emulatorConfig.firestorePort);
+    return { db, persistent };
   }
-  if (emulator) {
-    connectAuthEmulator(auth, emulatorConfig.authUrl, { disableWarnings: true });
-    connectFirestoreEmulator(db, emulatorConfig.firestoreHost, emulatorConfig.firestorePort);
-  }
-  return { auth, db };
+  return { auth, openDb };
 }
 
 /**
@@ -175,7 +184,10 @@ function connect(emulator, appName) {
  */
 export function createFirebaseStore({ emulator = false, now = () => new Date(), tz = deviceZone(), appName } = {}) {
   const mode = emulator ? 'emulator' : 'firebase';
-  const { auth, db } = connect(emulator, appName);
+  const { auth, openDb } = connect(emulator, appName);
+  let { db, persistent } = openDb();
+  /** Settles when a sign-out's work on the offline cache is over; a sign-in waits for it. Never rejects. */
+  let leaving = Promise.resolve();
   const today = () => keyOf(now());
   const listeners = new Set();
   /** The signed-in account and everything that belongs to it; replaced, never reused, when the account
@@ -343,8 +355,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     const at = now().getTime();
     setDoc(userRef, { tz, createdAt: at, updatedAt: at }).then(() => {
       s.creating = false;
-    }, (err) => {
-      console.error(err);
+    }, () => {
       s.creating = 'refused';
       s.trouble = NOT_SET_UP;
       if (session === s) refresh();
@@ -475,6 +486,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   async function enter(call, email, password, shortCode, shortMessage) {
     const address = checkedEmail(email);
     if (typeof password !== 'string' || password.length < 6) throw new StoreError(shortCode, shortMessage);
+    await leaving;
     let user;
     try {
       ({ user } = await call(auth, address, password));
@@ -523,7 +535,67 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     }
   }
 
-  onAuthStateChanged(auth, adopt, (err) => console.error(err));
+  // ---------- the offline cache on a shared browser (browsers only: under Node the cache is in memory) ----------
+  //
+  // Sign-out must not leave the person's habits and counts readable in IndexedDB. The cache can only be
+  // deleted while no Firestore instance has it open, so the instance is terminated and a new one is made
+  // for whoever signs in next; the page is not reloaded. Writes that have not reached the server (a
+  // sign-out while offline) are worth more than that: then the cache is kept, and they are sent when the
+  // same account signs in again.
+
+  /** Whether everything written has reached the server, waiting up to 2 s to find out. Never rejects. */
+  function allWritten() {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, PENDING_WAIT_MS, false);
+      Promise.resolve().then(() => waitForPendingWrites(db)).then(() => true, () => false).then((answer) => {
+        clearTimeout(timer);
+        resolve(answer);
+      });
+    });
+  }
+
+  /** End this Firestore instance and start a new one; with `clear`, delete what the old one kept in
+   *  IndexedDB in between. If the browser has not deleted it within a second (another tab can hold it
+   *  open), the new instance keeps its cache in memory, so that nothing waits for the deletion and nobody
+   *  is handed the old cache. Never rejects. */
+  async function renew(clear) {
+    const old = db;
+    let memoryOnly = false;
+    try {
+      await terminate(old);
+      if (clear) {
+        memoryOnly = true;
+        const cleared = clearIndexedDbPersistence(old).then(() => { memoryOnly = false; }, (err) => console.error(err));
+        await Promise.race([cleared, new Promise((resolve) => { setTimeout(resolve, CLEAR_WAIT_MS); })]);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+    ({ db, persistent } = openDb(memoryOnly));
+  }
+
+  async function signOut() {
+    // Asked before Auth forgets the account: the queue of unsent writes is the account's own.
+    const clear = persistent && Boolean(auth.currentUser) && await allWritten();
+    const renewing = persistent;
+    adopt(null); // listeners are detached first: Firestore would otherwise report the sign-out as a refusal
+    const gone = authSignOut(auth).finally(() => (renewing ? renew(clear) : undefined));
+    leaving = gone.catch(() => {});
+    await gone;
+  }
+
+  /** Auth reported a change. One that this tab did not make comes from another tab: its sign-out may have
+   *  deleted the offline cache, and the SDK then ends this tab's Firestore instance without a word, so
+   *  listeners attached to it would wait for ever. Start a new instance before anything listens again. */
+  function authChanged(user) {
+    if (!persistent || !session || session.uid === user?.uid) return adopt(user);
+    adopt(null);
+    leaving = leaving.then(() => renew(false)).then(() => {
+      if (auth.currentUser) adopt(auth.currentUser);
+    }).catch((err) => console.error(err));
+  }
+
+  onAuthStateChanged(auth, authChanged, (err) => console.error(err));
 
   return {
     getState: () => state,
@@ -535,11 +607,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     signUp: (email, password) => enter(createUserWithEmailAndPassword, email, password, 'weak-password', 'Use a password of at least 6 characters.'),
     signIn: (email, password) => enter(signInWithEmailAndPassword, email, password, 'wrong-credentials', 'Wrong email or password.'),
     resetPassword,
-    /** Listeners are detached first: Firestore would otherwise report the sign-out as a refusal. */
-    async signOut() {
-      adopt(null);
-      await authSignOut(auth);
-    },
+    signOut,
     /** Listen again, now: for an account that was refused, one whose user record was, or after a listener failed. */
     retry() {
       const s = session;
