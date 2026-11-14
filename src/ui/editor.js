@@ -505,7 +505,9 @@ export function openEditor(habitId, ctx) {
       sync(s);
       const name = el.getAttribute('name');
       if (s.problem && (s.problem.field === name || s.problem.field === 'form')) s.problem = null;
-      s.confirming = false;
+      // Typing or choosing answers "Discard changes?". Not `change` alone: a text field fires it when
+      // the focus leaves it for "Keep editing", which must not take the question away again.
+      if (type === 'input') s.confirming = false;
       draw(s);
     });
   }
