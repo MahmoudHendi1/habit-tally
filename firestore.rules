@@ -1,9 +1,106 @@
 rules_version = '2';
+
+// Habit Tally security rules (docs/contracts.md section 8). Anything not allowed here is refused.
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Each signed-in person can reach only their own data. Everything else is closed.
-    match /users/{uid}/{document=**} {
-      allow read, write: if request.auth != null && request.auth.uid == uid;
+
+    // ---------- who may use the app ----------
+
+    // The invite list: Firebase Auth user ids. Keep it on this one line; the emulator tests replace it.
+    function invited() { return ['REPLACE_AT_GO_LIVE']; } // @invite-list
+
+    // Signed in and on the invite list.
+    function allowed() { return request.auth != null && request.auth.uid in invited(); }
+
+    // An invited person working on their own data.
+    function owner(uid) { return allowed() && request.auth.uid == uid; }
+
+    // ---------- shapes (docs/contracts.md section 4) ----------
+
+    // The document has exactly these fields: none missing, none extra.
+    function hasExactly(data, fields) { return data.keys().hasAll(fields) && data.keys().hasOnly(fields); }
+
+    // A habit id: 20 letters or digits.
+    function isHabitId(id) { return id.matches('^[A-Za-z0-9]{20}$'); }
+
+    // A day 'YYYY-MM-DD' and a month 'YYYY-MM', as the app writes them.
+    function isDay(s) { return s is string && s.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    function isMonth(s) { return s.matches('^[0-9]{4}-[0-9]{2}$'); }
+
+    // Reminder times: at most 48, none twice, each 'HH:MM' on the hour or half hour.
+    // Joined with commas the list must read T,T,T; the length check proves that every item is one T.
+    function validTimes(t) {
+      return t is list && t.size() <= 48 && t.toSet().size() == t.size()
+        && (t.size() == 0
+          || (t.join(',').size() == t.size() * 6 - 1
+            && t.join(',').matches('^([01][0-9]|2[0-3]):[03]0(,([01][0-9]|2[0-3]):[03]0)*$')));
     }
+
+    // A whole habit. Required on every write, so a partial write can never create or damage one.
+    function validHabit(h) {
+      return hasExactly(h, ['name', 'period', 'target', 'unit', 'times', 'created', 'archived', 'deletedAt',
+                            'order', 'updatedAt'])
+        && h.name is string && h.name.trim().size() >= 1 && h.name.size() <= 60 // not blank
+        && h.period in ['day', 'week']
+        && h.target is int && h.target >= 1 && h.target <= 50
+        && h.unit is string && h.unit.size() <= 20
+        && validTimes(h.times)
+        && isDay(h.created)
+        && h.archived is bool
+        && (h.deletedAt == null || h.deletedAt is int)
+        && h.order is number
+        && h.updatedAt is number;
+    }
+
+    // The account record: reminder time zone and two times in ms.
+    function validUser(u) {
+      return hasExactly(u, ['tz', 'createdAt', 'updatedAt'])
+        && u.tz is string && u.tz.size() >= 1 && u.tz.size() <= 64
+        && u.createdAt is number
+        && u.updatedAt is number;
+    }
+
+    // One month of counts: only the key 'days', a map of at most 31 days.
+    // (Rules cannot look inside a map with unknown keys, so the day keys and counts are not checked.)
+    function validLog(l) { return hasExactly(l, ['days']) && l.days is map && l.days.size() <= 31; }
+
+    // A device id (Firebase installation id): 1 to 64 letters, digits, '_' or '-'.
+    function isDeviceId(id) { return id.matches('^[A-Za-z0-9_-]{1,64}$'); }
+
+    // A browser install that gets reminders. It can only ever be written with the writer's own uid.
+    function validDevice(d) {
+      return hasExactly(d, ['uid', 'ua', 'updatedAt'])
+        && d.uid == request.auth.uid
+        && d.ua is string && d.ua.size() <= 500
+        && d.updatedAt is number;
+    }
+
+    // ---------- paths ----------
+
+    // The account record. No listing of accounts.
+    match /users/{uid} {
+      allow get, delete: if owner(uid);
+      allow create, update: if owner(uid) && validUser(request.resource.data);
+
+      match /habits/{habitId} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid) && isHabitId(habitId) && validHabit(request.resource.data);
+      }
+
+      match /logs/{month} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid) && isMonth(month) && validLog(request.resource.data);
+      }
+    }
+
+    // Devices. Writing over someone else's record is allowed, but only to make it your own
+    // (signing in on a shared browser takes the device over). No listing.
+    match /devices/{fid} {
+      allow get, delete: if allowed() && resource.data.uid == request.auth.uid;
+      allow create, update: if allowed() && isDeviceId(fid) && validDevice(request.resource.data);
+    }
+
+    // There is deliberately no rule for system/**, for collection-group queries or for any other path:
+    // what is not matched above is refused.
   }
 }

@@ -137,7 +137,7 @@ Already done by the owner: the Firebase and GitHub connections, the repository `
 
 Nothing in M0, M1 or M2 waits for the owner. `docs/owner-setup.md` (B6) gives the exact steps; it is sent as soon as it passes review so items 3 and 4 can be done while development continues.
 
-Points the lead settles in L0, with the default this plan assumes: "last 7 days" in R6 means today plus the 7 days before; sign-up is by invite list in the rules (the owner is asked to confirm); Google sign-in is not in v1.
+Points the lead settles in L0, with the default this plan assumes: "last 7 days" in R6 means today plus the 7 days before; sign-up is by invite list in the rules (confirmed by the owner); Google sign-in is not in v1.
 
 ## 6. Risks to the schedule
 
