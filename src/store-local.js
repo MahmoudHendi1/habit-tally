@@ -256,7 +256,7 @@ export function createLocalStore({ storage = defaultStorage(), now = () => new D
     /** @type {Map<string, number>} */
     const place = new Map();
     for (const id of ids) if (liveIds.has(id) && !place.has(id)) place.set(id, place.size + 1);
-    const moved = (/** @type {T} */ x) => liveIds.has(x.id) && place.has(x.id) && place.get(x.id) !== x.order;
+    const moved = (/** @type {T} */ x) => place.has(x.id) && place.get(x.id) !== x.order;
     if (!all.some(moved)) return null;
     const updatedAt = now().getTime();
     return all.map((x) => (moved(x) ? { ...x, order: /** @type {number} */ (place.get(x.id)), updatedAt } : x));
