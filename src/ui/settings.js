@@ -19,10 +19,11 @@ const PUSH = {
   blocked: { chip: 'Blocked', chipClass: ' chip-warn', text: 'Notifications are blocked for Habit Tally in this browser. Allow them in the browser’s settings for this site, then come back here.' },
   on: { chip: 'On', chipClass: ' chip-done', text: 'This device gets a notification at the reminder times you set for each habit.' },
 };
+const PUSH_TEST = { chip: 'Not in test mode', chipClass: '', text: 'Reminders are not available in test mode. They need the real app.' };
 const THEMES = [['system', 'System'], ['light', 'Light'], ['dark', 'Dark']];
 
 // The screen's own state (contract rule 2d). bind()'s clean-up puts it back.
-/** @type {'' | 'push' | 'sign-out'} */
+/** The data-action of the button whose work is under way. @type {'' | 'push-on' | 'push-off' | 'sign-out'} */
 let busy = '';
 let visit = 0; // goes up when the screen is unmounted, so a result that arrives later is dropped
 /** The declined zone, for a browser that blocks storage: then "Keep" lasts until the page is closed. */
@@ -130,7 +131,9 @@ function accountCard(state) {
 
 /** @param {State} state @param {Ctx} ctx */
 function remindersCard(state, ctx) {
-  const status = ctx.push.getStatus(), info = PUSH[status] ?? PUSH.unsupported;
+  const status = ctx.push.getStatus();
+  // The push status is 'demo' in every build without the real backend; the emulator build is not the demo.
+  const info = status === 'demo' && state.mode !== 'demo' ? PUSH_TEST : PUSH[status] ?? PUSH.unsupported;
   const account = state.user?.tz ?? '', device = deviceZone();
   const action = status === 'off' ? button('push-on', 'Turn on reminders', 'Turning on…', 'btn btn-primary')
     : status === 'on' ? button('push-off', 'Turn off reminders', 'Turning off…', 'btn') : '';
@@ -169,7 +172,7 @@ export function render(state, ctx) {
 }
 
 /** Run one of the screen's slow actions with its button marked busy.
- *  @param {'push' | 'sign-out'} what @param {Ctx} ctx @param {() => Promise<void>} work */
+ *  @param {'push-on' | 'push-off' | 'sign-out'} what @param {Ctx} ctx @param {() => Promise<void>} work */
 async function run(what, ctx, work) {
   if (busy) return;
   const mine = visit;
@@ -187,7 +190,7 @@ async function run(what, ctx, work) {
 
 /** Only ever called from a tap: enable() is what asks the browser for permission.
  *  @param {Ctx} ctx */
-const turnOn = (ctx) => run('push', ctx, async () => {
+const turnOn = (ctx) => run('push-on', ctx, async () => {
   /** @type {PushStatus | 'failed'} */
   let status = 'failed';
   try {
@@ -200,7 +203,7 @@ const turnOn = (ctx) => run('push', ctx, async () => {
 });
 
 /** @param {Ctx} ctx */
-const turnOff = (ctx) => run('push', ctx, async () => {
+const turnOff = (ctx) => run('push-off', ctx, async () => {
   try {
     await ctx.push.disable();
     ctx.toast('Reminders are off.');
