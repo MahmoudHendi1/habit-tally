@@ -143,7 +143,8 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
         habits: Habit[],            // sortHabits(): deleted ones left out
         routines: Routine[],        // sortRoutines(): deleted ones left out (v1.3)
         logs: Logs,
-        lastError: null | { code: string, message: string } }   // a write the backend refused later
+        lastError: null | { code: string, message: string } }   // code: 'not-saved', 'offline' or 'unknown';
+                                    // can be set while status is 'loading' (v1.3)
 ```
 
 - `waiting` = signed in, but the rules refuse this account (not on the invite list). Never happens in demo mode.
@@ -158,10 +159,10 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
 |---|---|
 | `getState(): State` | Current state |
 | `subscribe(fn): () => void` | Calls `fn(state)` at once and after every change; returns an unsubscribe function |
-| `signUp(email, password): Promise<void>` | Creates the account and signs in. Resolves once the status is `ready` or `waiting` |
-| `signIn(email, password): Promise<void>` | Resolves once the status is `ready` or `waiting` |
+| `signUp(email, password): Promise<void>` | Creates the account and signs in. Resolves once the status is `ready` or `waiting`. Can reject with `offline` or `unknown` while the session stays; see Errors (v1.3) |
+| `signIn(email, password): Promise<void>` | Resolves once the status is `ready` or `waiting`. Can reject with `offline` or `unknown` while the session stays; see Errors (v1.3) |
 | `resetPassword(email): Promise<void>` | Always resolves for a well-formed email (no account enumeration) |
-| `signOut(): Promise<void>` | Status becomes `signedOut`; habits, routines and logs are cleared from state (v1.3) |
+| `signOut(): Promise<void>` | Status becomes `signedOut`; habits, routines and logs are cleared from state. In a browser it waits up to 2 s for unsent writes before the status becomes `signedOut`, then clears the offline cache (v1.3) |
 | `retry(): void` | In `waiting`: checks again whether the account is now allowed |
 | `saveHabit(input): string` | `input` is editor data, with `id` to edit or without to create. The store runs `cleanHabit` and `validateHabit`; on problems it throws `StoreError('invalid', problems[0], problems)`. On create it sets `id`, `created` (device today), `order`, `archived: false`, `deletedAt: null`. Editing never changes `id`, `created`, `order`. Creating beyond `LIMITS.habitsMax` live habits throws `StoreError('too-many', ...)`. Returns the id. Before cleaning, an `input.routine` that is not the id of a routine in `state.routines` (missing, unknown, deleted) is taken as `''`, so such a habit keeps the reminder times it was given; with a live routine, `cleanHabit` empties `times`. `input` is the whole editor data: a missing `routine` means `''`, as a missing `times` means none (v1.3) |
 | `deleteHabit(id): void` | Soft delete: sets `deletedAt`. The habit leaves `state.habits`; its counts stay in `logs` |
@@ -206,6 +207,8 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
   look at routines. Moving a habit into or out of a routine is a `saveHabit`; it keeps its `order`. (v1.3)
 - `lastError` is `{ code: 'not-saved', message }` when a write could not be saved (the backend refused it, or
   browser storage failed). The optimistic state stays as it is; the next write that succeeds clears `lastError`.
+- `lastError.code` can also be `offline` or `unknown`, and `lastError` can be set while the status is
+  `loading`. (v1.3)
 - `removeDevice` resolves even when the record does not exist or now belongs to someone else.
 
 ### Errors
@@ -214,6 +217,9 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
 reject with one of: `invalid-email`, `wrong-credentials` (wrong password or unknown email, not told apart),
 `email-in-use`, `weak-password` (fewer than 6 characters), `too-many-requests`, `offline`, `unknown`.
 The message is a plain sentence the UI can show as is.
+
+`signIn` and `signUp` can reject with `offline` or `unknown` while the session stays: the person is signed in
+all the same, and the status becomes `ready` later by itself, without another call. (v1.3)
 
 ### Demo store
 
