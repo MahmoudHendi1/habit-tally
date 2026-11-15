@@ -1,4 +1,5 @@
-// The reminder job: run every 30 minutes by GitHub Actions, sends habit reminders as web push messages.
+// The reminder job: run every 30 minutes by GitHub Actions, sends habit and routine reminders as web push
+// messages. A routine (a named list of habits done together) gets one message for all its habits.
 // Zero npm dependencies. Contract: docs/contracts.md section 9; flow: docs/architecture.md section 4.
 // Everything about dates, zones and what is due is decided by shared/logic.js.
 //
@@ -7,7 +8,7 @@
 //   now     ms since epoch: decides the slot
 //   log     function taking one line of text. The Actions log of a public repository is public, so a line holds
 //           only counts, the slot time in UTC, HTTP statuses and error codes: never a key, token, email, uid,
-//           device id, habit name or anything a server answered.
+//           device id, habit name, routine name or id, or anything a server answered.
 //   force   true = a manual test run: the bookmark is neither read nor written, the window is the current
 //           slot only, and the reminders are sent even if the slot was already handled.
 //   deadlineMs, clock   the time the run may take, measured with clock(), a function returning ms (default: the
@@ -16,18 +17,20 @@
 //   sleep   function waiting the given ms before a failed read is tried again (tests pass one that does not wait).
 //
 //   Order: read the bookmark `system/reminders` and plan the run; read everything (users, then per user habits,
-//   logs and devices, one user after another); claim the slot; send. The claim is written even when there is
+//   routines, logs and devices, one user after another); claim the slot; send. The claim is written even when there is
 //   nothing to send, and always before the first push.
 //
 //   Result:
 //     slot     the slot (ms) this run handled; null when it did nothing: the slot was already claimed, another
 //              run won the claim, the bookmark is ahead of the clock, or the slot is left for the next run (no
 //              user could be read, reading left too little time to send, or two claims in a row were lost)
-//     sent     push messages FCM accepted (one per due habit per device)
+//     sent     push messages FCM accepted (one per due habit per device, and one per due routine per device)
 //     skipped  habits with a reminder time in the window that got no reminder because the logs show them done:
 //              target hit for the day or week, or a weekly habit already logged today. Not counted: habits
 //              without a time in the window, archived, deleted or invalid habits, habits over the per-user
-//              limit, and due habits of a user who has no device
+//              limit, and due habits of a user who has no device.
+//              Plus 1 for each routine with a reminder time in the window whose habits are all done in that
+//              sense. Not counted: deleted or invalid routines and routines without a live habit
 //     failed   users whose data could not be read + pushes that failed or were not sent for lack of time + device
 //              records that could not be deleted; 1 more when reading left too little time to send; 1 for a
 //              bookmark ahead of the clock or a slot left unclaimed after two lost claims
@@ -36,7 +39,7 @@
 //   Failures:
 //     - Reading the bookmark, listing the users or the claim fails (anything but a PreconditionError): run()
 //       rejects with that error. Nothing was sent, and unless the claim itself went wrong the slot is unclaimed.
-//     - Reading one user's habits, logs or devices fails: the read is tried once more (one retry per user, after
+//     - Reading one user's habits, routines, logs or devices fails: the read is tried once more (one retry per user, after
 //       1 s, and only while there is still time to claim). If that fails too, the user is counted in `failed` and
 //       gets nothing for this slot; the others are still served and the slot is claimed. If no user at all could
 //       be read (a Firestore outage, or the only user), nothing is claimed, so the next run catches the slot up.
@@ -61,11 +64,13 @@ import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { readServiceAccount, createGoogle, ConfigError, GoogleError, PreconditionError } from './lib/google.mjs';
 import {
-  planRun, dueWindows, dueHabits, reminderText, validateHabit, weekKeys, monthId, SLOT_MS,
+  planRun, dueWindows, dueHabits, dueRoutines, reminderText, routineReminderText, validateHabit, validateRoutine,
+  weekKeys, monthId, SLOT_MS,
 } from '../shared/logic.js';
 
 const BOOKMARK = 'system/reminders';
 const MAX_HABIT_DOCS = 300; // habit records read per user: 50 live ones plus room for soft-deleted ones
+const MAX_ROUTINE_DOCS = 50; // routine records read per user: 20 live ones plus room for soft-deleted ones
 const MAX_HABITS = 100; // habits with a reminder time in the window considered per user and run
 const MAX_DEVICES = 10; // per user: the most recently updated ones
 const TITLE_MAX = 60;
@@ -96,14 +101,25 @@ function describe(err) {
   return err instanceof Error && /^[A-Za-z]{1,40}$/.test(err.name) ? err.name : 'Error';
 }
 
-/** A stored habit as shared/logic.js wants it, or null when it is not a valid habit (hostile or broken data). */
+const order = (v) => (Number.isFinite(v) ? v : 0);
+
+/** A stored habit as shared/logic.js wants it, or null when it is not a valid habit (hostile or broken data).
+ *  `routine` is the stored string; whether it names a live routine is for routineOf in the shared logic. */
 function toHabit(doc) {
   const d = isMap(doc.data) ? doc.data : {};
   const habit = {
     id: doc.id, name: d.name, period: d.period, target: d.target, unit: d.unit, times: d.times,
+    routine: typeof d.routine === 'string' ? d.routine : '', order: order(d.order),
     archived: Boolean(d.archived), deletedAt: d.deletedAt || null,
   };
   return typeof doc.id === 'string' && doc.id && validateHabit(habit).length === 0 ? habit : null;
+}
+
+/** A stored routine as shared/logic.js wants it, or null when it is not a valid routine: its habits are then loose. */
+function toRoutine(doc) {
+  const d = isMap(doc.data) ? doc.data : {};
+  const routine = { id: doc.id, name: d.name, times: d.times, order: order(d.order), deletedAt: d.deletedAt || null };
+  return typeof doc.id === 'string' && doc.id && validateRoutine(routine).length === 0 ? routine : null;
 }
 
 /** One stored month as shared/logic.js wants it: `days` must be a map and each day a map. What a count is worth
@@ -134,11 +150,17 @@ async function readUser(google, user, plan, stats, mayRetry, sleep) {
   if (docs.length >= MAX_HABIT_DOCS) stats.atReadLimit += 1;
   const habits = docs.map(toHabit).filter(Boolean);
   stats.invalidHabits += docs.length - habits.length;
-  // Live habits with a reminder time in the window: the same test as dueHabits, before any count is known.
-  const inWindow = new Set(windows.flatMap((w) => dueHabits(habits, {}, w.day, w.times)));
+  const routineDocs = await read(() => google.listDocs(`users/${uid}/routines`, { limit: MAX_ROUTINE_DOCS }));
+  if (routineDocs.length >= MAX_ROUTINE_DOCS) stats.routinesAtReadLimit += 1;
+  const routines = routineDocs.map(toRoutine).filter(Boolean);
+  stats.invalidRoutines += routineDocs.length - routines.length;
+  // Live loose habits with a reminder time in the window: the same test as dueHabits, before any count is known.
+  const inWindow = new Set(windows.flatMap((w) => dueHabits(habits, {}, w.day, w.times, routines)));
   const candidates = habits.filter((h) => inWindow.has(h)).slice(0, MAX_HABITS);
   stats.overLimit += inWindow.size - candidates.length;
-  if (!candidates.length) return null;
+  // Live routines with a reminder time in the window and at least one live habit: the same test as dueRoutines.
+  const timed = new Set(windows.flatMap((w) => dueRoutines(routines, habits, {}, w.day, w.times).map((d) => d.routine)));
+  if (!candidates.length && !timed.size) return null;
 
   const logs = {};
   for (const month of new Set(windows.flatMap((w) => weekKeys(w.day)).map(monthId))) {
@@ -146,10 +168,15 @@ async function readUser(google, user, plan, stats, mayRetry, sleep) {
   }
 
   const due = new Map(); // habit -> the latest local day it is due on
-  for (const w of windows) for (const h of dueHabits(candidates, logs, w.day, w.times)) due.set(h, w.day);
-  stats.skipped += candidates.length - due.size;
-  if (!due.size) return null;
-  stats.due += due.size;
+  const dueTogether = new Map(); // routine -> its habits left on the latest local day it is due on
+  for (const w of windows) {
+    for (const h of dueHabits(candidates, logs, w.day, w.times, routines)) due.set(h, w.day);
+    for (const d of dueRoutines(routines, habits, logs, w.day, w.times)) dueTogether.set(d.routine, d.left);
+  }
+  const reminders = due.size + dueTogether.size; // a routine reminder counts as one, like a habit reminder
+  stats.skipped += candidates.length - due.size + timed.size - dueTogether.size;
+  if (!reminders) return null;
+  stats.due += reminders;
 
   const found = await read(() => google.queryEqual('devices', 'uid', uid));
   const usable = found.filter((d) => typeof d.id === 'string' && DEVICE_ID.test(d.id) && d.data?.uid === uid);
@@ -159,14 +186,18 @@ async function readUser(google, user, plan, stats, mayRetry, sleep) {
   stats.overLimit += usable.length - devices.length;
   stats.devices += devices.length;
   if (!devices.length) {
-    stats.noDevice += due.size;
+    stats.noDevice += reminders;
     return null;
   }
-  const messages = [...due].map(([h, day]) => {
-    const text = reminderText(h, logs, day); // a valid habit stays well inside the caps; they hold whatever comes
-    return { title: cap(text.title, TITLE_MAX), body: cap(text.body, BODY_MAX), tag: h.id, url: '/' };
-  });
-  return { messages, devices };
+  // Valid habits and routines stay well inside the caps; they hold whatever comes.
+  const message = (text, tag) => ({ title: cap(text.title, TITLE_MAX), body: cap(text.body, BODY_MAX), tag, url: '/' });
+  return {
+    messages: [
+      ...[...dueTogether].map(([routine, left]) => message(routineReminderText(routine, left), routine.id)),
+      ...[...due].map(([h, day]) => message(reminderText(h, logs, day), h.id)),
+    ],
+    devices,
+  };
 }
 
 export async function run({
@@ -240,8 +271,8 @@ export async function run({
       try { users = await google.listDocs('users'); } catch (err) { throw stop('listing the users', err); }
     }
     stats = {
-      due: 0, skipped: 0, devices: 0, noDevice: 0, invalidHabits: 0, badDevices: 0, overLimit: 0, atReadLimit: 0,
-      retried: 0,
+      due: 0, skipped: 0, devices: 0, noDevice: 0, invalidHabits: 0, invalidRoutines: 0, badDevices: 0, overLimit: 0,
+      atReadLimit: 0, routinesAtReadLimit: 0, retried: 0,
     };
     jobs = [];
     let unread = 0;
@@ -258,6 +289,7 @@ export async function run({
     const extra = [
       stats.noDevice && `${stats.noDevice} due without a device`,
       stats.invalidHabits && `${plural(stats.invalidHabits, 'invalid habit')} ignored`,
+      stats.invalidRoutines && `${plural(stats.invalidRoutines, 'invalid routine')} ignored`,
       stats.badDevices && `${plural(stats.badDevices, 'unusable device record')} ignored`,
       stats.overLimit && `${stats.overLimit} over the per-user limits ignored`,
       stats.retried && `${plural(stats.retried, 'failed read')} tried again`,
@@ -268,6 +300,10 @@ export async function run({
     if (stats.atReadLimit) {
       log(`Habit records: ${plural(stats.atReadLimit, 'user')} reached the read limit of ${MAX_HABIT_DOCS}; `
         + 'anything beyond it was not looked at.');
+    }
+    if (stats.routinesAtReadLimit) {
+      log(`Routine records: ${plural(stats.routinesAtReadLimit, 'user')} reached the read limit of `
+        + `${MAX_ROUTINE_DOCS}; anything beyond it was not looked at.`);
     }
     if (tooLateToClaim()) {
       logFailures();

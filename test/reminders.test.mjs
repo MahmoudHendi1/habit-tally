@@ -110,10 +110,22 @@ const habit = (over = {}) => ({
   archived: false, deletedAt: null, order: 1, updatedAt: 1, ...over,
 });
 
-/** Adds a user: habits = { id: fields }, logs = { 'YYYY-MM-DD': { habitId: count } }, devices = ids or [id, updatedAt]. */
-function addUser(w, uid, { tz = 'Europe/London', habits = {}, logs = {}, devices = [] } = {}) {
+const routine = (over = {}) => ({ name: 'Morning', times: ['09:00'], order: 1, deletedAt: null, updatedAt: 1, ...over });
+/** A routine id as the store makes them: 20 letters or digits. */
+const rid = (n) => `routine${String(n).padStart(13, '0')}`;
+/** Fields of a habit in routine `id`: no reminder times of its own. */
+const member = (id, over = {}) => ({ target: 1, times: [], routine: id, ...over });
+
+/** Adds a user: habits = { id: fields }, routines = { id: fields }, logs = { 'YYYY-MM-DD': { habitId: count } },
+ *  devices = ids or [id, updatedAt]. */
+function addUser(w, uid, { tz = 'Europe/London', habits = {}, routines = {}, logs = {}, devices = [] } = {}) {
   sensitive.add(uid);
   w.put(`users/${uid}`, { tz, createdAt: 1, updatedAt: 1 });
+  for (const [id, over] of Object.entries(routines)) {
+    w.put(`users/${uid}/routines/${id}`, routine(over));
+    sensitive.add(id);
+    if (typeof routine(over).name === 'string' && routine(over).name.trim()) sensitive.add(routine(over).name);
+  }
   for (const [id, over] of Object.entries(habits)) {
     w.put(`users/${uid}/habits/${id}`, habit(over));
     if (typeof habit(over).name === 'string') sensitive.add(habit(over).name);
@@ -219,8 +231,8 @@ test('3c. everything is read first, then the slot is claimed, then the first pus
   const before = w.docs.get(BOOKMARK).updateTime;
   await go(w, at(9));
   assert.deepEqual(w.calls.map((c) => c.op),
-    ['getDoc', 'listDocs', 'listDocs', 'getDoc', 'queryEqual', 'setDoc', 'sendPush', 'sendPush']);
-  assert.deepEqual(w.calls[5], { op: 'setDoc', arg: BOOKMARK, options: { ifUpdateTime: before } });
+    ['getDoc', 'listDocs', 'listDocs', 'listDocs', 'getDoc', 'queryEqual', 'setDoc', 'sendPush', 'sendPush']);
+  assert.deepEqual(w.calls[6], { op: 'setDoc', arg: BOOKMARK, options: { ifUpdateTime: before } });
 
   const empty = addUser(worldAt(at(8, 30)), 'uid-bob', { habits: { h1: { times: ['20:00'] } }, devices: ['fid-bob-phone'] });
   assert.deepEqual(await go(empty, at(9)), { slot: at(9), sent: 0, skipped: 0, failed: 0, removed: 0 });
@@ -429,17 +441,18 @@ test('6a. an unregistered device is deleted and the run succeeds; no device is d
 
 test('6b. one user\'s read that keeps failing does not stop the others; the result reports it', async () => {
   const w = worldAt(at(8, 30));
-  for (const name of ['alice', 'bob', 'carol', 'dave']) addUser(w, `uid-${name}`, { habits: { h1: {} }, devices: [`fid-${name}`] });
+  for (const name of ['alice', 'bob', 'carol', 'dave', 'erin']) addUser(w, `uid-${name}`, { habits: { h1: {} }, devices: [`fid-${name}`] });
   w.fail = (op, arg) => {
-    if (arg === 'users/uid-bob/habits' || arg === 'users/uid-carol/logs/2026-11') return unavailable();
+    if (arg === 'users/uid-bob/habits' || arg === 'users/uid-carol/logs/2026-11' || arg === 'users/uid-erin/routines') return unavailable();
     return op === 'sendPush' && arg === 'fid-alice' ? new Error('socket closed') : null;
   };
-  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 1, skipped: 0, failed: 3, removed: 0 });
+  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 1, skipped: 0, failed: 4, removed: 0 });
   assert.deepEqual(w.pushes.map((p) => p.fid), ['fid-dave']);
   assert.equal(w.docs.get(BOOKMARK).data.lastSlot, at(9));
   // each failed read was tried exactly twice
   assert.equal(w.ops('listDocs').filter((arg) => arg === 'users/uid-bob/habits').length, 2);
   assert.equal(w.ops('getDoc').filter((arg) => arg === 'users/uid-carol/logs/2026-11').length, 2);
+  assert.equal(w.ops('listDocs').filter((arg) => arg === 'users/uid-erin/routines').length, 2);
 });
 
 test('6b2. a read that fails once is tried again after a second: that user loses nothing; one retry per user', async () => {
@@ -453,21 +466,23 @@ test('6b2. a read that fails once is tried again after a second: that user loses
     const left = new Set(targets);
     w.fail = (op, arg) => (left.delete(op === 'queryEqual' ? `${op} ${w.ops('queryEqual').length}` : arg) ? error() : null);
   };
-  // bob's habit list, carol's logs and dave's devices (the 4th device query) each fail once, in different ways
+  // alice's routine list, bob's habit list, carol's logs and dave's devices (the 4th device query) each fail once,
+  // in different ways
   const w = build();
-  const errors = [unavailable(), new GoogleError('getDoc failed: no answer in time', { code: 'TIMEOUT' }), new Error('socket closed')];
-  failOnce(w, ['users/uid-bob/habits', 'users/uid-carol/logs/2026-11', 'queryEqual 4'], () => errors.shift());
+  const errors = [unavailable(), unavailable(), new GoogleError('getDoc failed: no answer in time', { code: 'TIMEOUT' }), new Error('socket closed')];
+  failOnce(w, ['users/uid-alice/routines', 'users/uid-bob/habits', 'users/uid-carol/logs/2026-11', 'queryEqual 4'], () => errors.shift());
   waits.length = 0;
   const lines = [];
   const result = await go(w, at(9), { log: (line) => { lines.push(line); log(line); } });
   assert.deepEqual(result, { slot: at(9), sent: 4, skipped: 0, failed: 0, removed: 0 });
   assert.deepEqual(w.pushes.map((p) => p.fid), ['fid-alice', 'fid-bob', 'fid-carol', 'fid-dave']);
-  assert.deepEqual(waits, [1000, 1000, 1000]);
-  assert.deepEqual(w.calls.slice(0, 6).map((c) => `${c.op} ${c.arg}`), [`getDoc ${BOOKMARK}`, 'listDocs users',
-    'listDocs users/uid-alice/habits', 'getDoc users/uid-alice/logs/2026-11', 'queryEqual devices uid', 'listDocs users/uid-bob/habits']);
-  assert.equal(w.ops('listDocs').length, 1 + 4 + 1); // only the failed read is repeated
+  assert.deepEqual(waits, [1000, 1000, 1000, 1000]);
+  assert.deepEqual(w.calls.slice(0, 8).map((c) => `${c.op} ${c.arg}`), [`getDoc ${BOOKMARK}`, 'listDocs users',
+    'listDocs users/uid-alice/habits', 'listDocs users/uid-alice/routines', 'listDocs users/uid-alice/routines',
+    'getDoc users/uid-alice/logs/2026-11', 'queryEqual devices uid', 'listDocs users/uid-bob/habits']);
+  assert.equal(w.ops('listDocs').length, 1 + 4 + 4 + 2); // only the failed reads are repeated
   assert.deepEqual(lines, ['Slot 2026-11-13T09:00Z, window 30 min: 4 users, 4 reminders due, 0 skipped (already done), '
-    + '4 devices, 3 failed reads tried again.']);
+    + '4 devices, 4 failed reads tried again.']);
 
   // a second failed read of the same user is not tried again: that user fails, the others are served
   const v = build();
@@ -625,18 +640,25 @@ test('bookmark ahead of the clock: more than one slot ahead fails the run and ch
   assert.deepEqual(await go(one, at(9)), nothing);
 });
 
-test('read limit: at most 300 habit records are read per user, and the log says when a user reaches it', async () => {
+test('read limit: at most 300 habit and 50 routine records are read per user, and the log says when a user reaches it', async () => {
   const w = worldAt(at(8, 30));
   const habits = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`a${String(i).padStart(3, '0')}`, { deletedAt: 5 }]));
   for (let i = 0; i < 5; i += 1) habits[`z${i}`] = {};
   addUser(w, 'uid-alice', { habits, devices: ['fid-alice-phone'] });
-  addUser(w, 'uid-bob', { habits: { h1: {} }, devices: ['fid-bob-phone'] });
+  // bob has 50 deleted routines and, beyond the read limit, a live one that is due
+  const routines = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [rid(i), { name: `Old ${i}`, deletedAt: 5 }]));
+  addUser(w, 'uid-bob', {
+    habits: { h1: {}, h2: member(rid(900), { name: 'Stretch' }) }, routines: { ...routines, [rid(900)]: {} }, devices: ['fid-bob-phone'],
+  });
   const lines = [];
   const result = await run({ google: w.google, now: at(8, 56), log: (line) => { lines.push(line); log(line); } });
   assert.deepEqual(result, { slot: at(9), sent: 1, skipped: 0, failed: 0, removed: 0 });
   assert.deepEqual(w.calls[2], { op: 'listDocs', arg: 'users/uid-alice/habits', options: { limit: 300 } });
-  assert.equal(w.billed, 1 + 2 + 300 + 1 + 1 + 1); // bookmark, users, alice's 300, bob's habit, log and device
+  assert.deepEqual(w.calls[3], { op: 'listDocs', arg: 'users/uid-alice/routines', options: { limit: 50 } });
+  // bookmark, users, alice's 300 habits and empty routine list, bob's 2 habits, 50 routines, log and device
+  assert.equal(w.billed, 1 + 2 + 300 + 1 + 2 + 50 + 1 + 1);
   assert.equal(lines[1], 'Habit records: 1 user reached the read limit of 300; anything beyond it was not looked at.');
+  assert.equal(lines[2], 'Routine records: 1 user reached the read limit of 50; anything beyond it was not looked at.');
 });
 
 test('time limit: past the deadline no new push is started and the rest count as failed; out of time while reading claims nothing', async () => {
@@ -671,7 +693,7 @@ test('time limit: past the deadline no new push is started and the rest count as
     + 'the slot is not claimed, so the next run retries it. Nothing was sent.';
   const slow = build();
   assert.deepEqual(await timed(slow, 'listDocs', 160000), { result: { slot: null, sent: 0, skipped: 0, failed: 1, removed: 0 }, last: tooLate });
-  assert.deepEqual([slow.ops('setDoc'), slow.pushes, slow.ops('listDocs')], [[], [], ['users', 'users/uid-alice/habits']]);
+  assert.deepEqual([slow.ops('setDoc'), slow.pushes, slow.ops('listDocs')], [[], [], ['users', 'users/uid-alice/habits', 'users/uid-alice/routines']]);
   slow.before = async () => {};
   assert.equal((await go(slow, at(9))).sent, 6);
   // the claim needs 30 s of the limit left for sending: reading for 91 s (2 x 45.5) is too long, 90 s is not
@@ -797,27 +819,47 @@ test('7b. the command (main): exit code 0 or 1, the summary line, and only REMIN
 test('8. reads are kept to a minimum, and a 200-user run finishes in under 5 seconds', async () => {
   const ten = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`h${i}`, { name: `Habit ${i}`, times: ['07:00', '20:00'] }]));
   const devices = ['fid-alice-phone', 'fid-alice-laptop'];
-  // nothing due: the bookmark, the user and the 10 habits; no logs, no devices
-  const quiet = addUser(worldAt(at(8, 30)), 'uid-alice', { habits: ten, devices });
+  const two = { [rid(1)]: { times: ['07:00'] }, [rid(2)]: { name: 'Evening', times: ['20:00', '21:30'], order: 2 } };
+  // nothing due, 10 habits (two of them in a routine) and 2 routines: the bookmark, the user, the 10 habits and
+  // the 2 routines = 14 document reads; no logs, no devices
+  const quiet = addUser(worldAt(at(8, 30)), 'uid-alice', {
+    habits: { ...ten, h8: member(rid(1), { name: 'Habit 8' }), h9: member(rid(2), { name: 'Habit 9' }) }, routines: two, devices,
+  });
   await go(quiet, at(9));
-  assert.deepEqual(quiet.calls.map((c) => `${c.op} ${c.arg}`),
-    [`getDoc ${BOOKMARK}`, 'listDocs users', 'listDocs users/uid-alice/habits', `setDoc ${BOOKMARK}`]);
-  assert.equal(quiet.billed, 12);
+  assert.deepEqual(quiet.calls.map((c) => `${c.op} ${c.arg}`), [`getDoc ${BOOKMARK}`, 'listDocs users',
+    'listDocs users/uid-alice/habits', 'listDocs users/uid-alice/routines', `setDoc ${BOOKMARK}`]);
+  assert.equal(quiet.billed, 14);
+  // the same user without routines: 13, because an empty routine list is billed as one read
+  const plain = addUser(worldAt(at(8, 30)), 'uid-alice', { habits: ten, devices });
+  await go(plain, at(9));
+  assert.equal(plain.billed, 13);
+  // one routine due and no habit of its own in the window: one month of logs and one device query on top
+  const together = addUser(worldAt(at(6, 30)), 'uid-alice', {
+    habits: { h8: member(rid(1), { name: 'Habit 8' }), h9: member(rid(1), { name: 'Habit 9' }) }, routines: two, devices,
+  });
+  assert.deepEqual(await go(together, at(7)), { slot: at(7), sent: 2, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual(together.calls.map((c) => `${c.op} ${c.arg}`), [
+    `getDoc ${BOOKMARK}`, 'listDocs users', 'listDocs users/uid-alice/habits', 'listDocs users/uid-alice/routines',
+    'getDoc users/uid-alice/logs/2026-11', 'queryEqual devices uid', `setDoc ${BOOKMARK}`,
+    'sendPush fid-alice-laptop', 'sendPush fid-alice-phone',
+  ]);
+  assert.equal(together.billed, 1 + 1 + 2 + 2 + 1 + 2);
   // one habit due (and one more in the window): one month of logs and one device query on top
   const due = addUser(worldAt(at(8, 30)), 'uid-alice', {
     habits: { ...ten, h3: { times: ['09:00'] }, h4: { name: 'Stretch', times: ['09:00'] } }, logs: { '2026-11-13': { h4: 3 } }, devices,
   });
   assert.deepEqual(await go(due, at(9)), { slot: at(9), sent: 2, skipped: 1, failed: 0, removed: 0 });
   assert.deepEqual(due.calls.map((c) => `${c.op} ${c.arg}`), [
-    `getDoc ${BOOKMARK}`, 'listDocs users', 'listDocs users/uid-alice/habits', 'getDoc users/uid-alice/logs/2026-11',
-    'queryEqual devices uid', `setDoc ${BOOKMARK}`, 'sendPush fid-alice-laptop', 'sendPush fid-alice-phone',
+    `getDoc ${BOOKMARK}`, 'listDocs users', 'listDocs users/uid-alice/habits', 'listDocs users/uid-alice/routines',
+    'getDoc users/uid-alice/logs/2026-11', 'queryEqual devices uid', `setDoc ${BOOKMARK}`,
+    'sendPush fid-alice-laptop', 'sendPush fid-alice-phone',
   ]);
-  assert.equal(due.billed, 15);
+  assert.equal(due.billed, 16);
   // every candidate already done: logs are read, devices are not
   const done = addUser(worldAt(at(8, 30)), 'uid-alice', { habits: { h1: { target: 1 } }, logs: { '2026-11-13': { h1: 1 } }, devices });
   await go(done, at(9));
   assert.deepEqual([done.ops('getDoc').length, done.ops('queryEqual').length], [2, 0]);
-  // no local time in the window (Europe/London, the hour the clocks go back): not even the habits are read
+  // no local time in the window (Europe/London, the hour the clocks go back): not even the habits or routines are read
   const autumn = Date.UTC(2026, 9, 25, 1);
   const back = addUser(worldAt(autumn - SLOT), 'uid-alice', { habits: ten, devices });
   await go(back, autumn);
@@ -834,30 +876,175 @@ test('8. reads are kept to a minimum, and a 200-user run finishes in under 5 sec
   const started = performance.now();
   assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 800, skipped: 0, failed: 0, removed: 0 });
   assert.ok(performance.now() - started < 5000);
-  assert.deepEqual([w.ops('listDocs').length, w.ops('getDoc').length, w.ops('queryEqual').length], [201, 201, 200]);
+  assert.deepEqual([w.ops('listDocs').length, w.ops('getDoc').length, w.ops('queryEqual').length], [401, 201, 200]);
 });
 
-test('9. nothing sensitive in the log: no habit name, uid, device id, email or server text', async () => {
+test('R1. one due routine with two habits left: one push per device with the routine name, "2 left: ..." and the routine id as tag', async () => {
+  const w = worldAt(at(8, 30));
+  addUser(w, 'uid-alice', {
+    routines: { [rid(1)]: { name: 'Morning', times: ['09:00', '21:00'] } },
+    habits: {
+      aTeeth: member(rid(1), { name: 'Brush teeth', order: 2 }), // routine order is `order`, not the id
+      zPills: member(rid(1), { name: 'Take pills', order: 1 }),
+      bed: member(rid(1), { name: 'Make bed', order: 3 }),
+      h1: { unit: 'glasses' },
+    },
+    logs: { '2026-11-13': { bed: 1 } },
+    devices: ['fid-alice-phone', 'fid-alice-laptop'],
+  });
+  addUser(w, 'uid-bob', { habits: { h2: { name: 'Read a book', target: 1 } }, devices: ['fid-bob-phone'] });
+  // alice: the routine and her loose habit, each on two devices; bob: his habit
+  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 5, skipped: 0, failed: 0, removed: 0 });
+  const data = { title: 'Morning', body: '2 left: Take pills, Brush teeth', tag: rid(1), url: '/' };
+  assert.deepEqual(w.pushes.filter((p) => p.data.tag === rid(1)), [{ fid: 'fid-alice-laptop', data }, { fid: 'fid-alice-phone', data }]);
+  assert.deepEqual(tags(w).sort(), ['h1', 'h1', 'h2', rid(1), rid(1)]); // nothing for the habits of the routine
+  assert.deepEqual(tags(w, 'fid-bob-phone'), ['h2']);
+});
+
+test('R2. a routine with every habit done sends nothing and counts as one skipped; a routine without live habits counts as nothing', async () => {
+  const w = worldAt(at(8, 30));
+  addUser(w, 'uid-alice', {
+    routines: {
+      [rid(1)]: { name: 'Morning' }, [rid(2)]: { name: 'Empty', order: 2 }, [rid(3)]: { name: 'Shelved', order: 3 },
+    },
+    habits: {
+      vitamins: member(rid(1), { name: 'Take vitamins' }),
+      run: member(rid(1), { name: 'Go for a run', period: 'week', target: 3 }), // logged today: it has had its turn
+      old: member(rid(3), { name: 'Archived one', archived: true }),
+      gone: member(rid(3), { name: 'Deleted one', deletedAt: 1793000000000 }),
+    },
+    logs: { '2026-11-13': { vitamins: 1, run: 1 } },
+    devices: ['fid-alice-phone'],
+  });
+  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 0, skipped: 1, failed: 0, removed: 0 });
+  assert.deepEqual([w.pushes, w.ops('queryEqual')], [[], []]);
+  assert.deepEqual(w.ops('getDoc'), [BOOKMARK, 'users/uid-alice/logs/2026-11']);
+});
+
+test('R3. a habit in a live routine never gets a push of its own, even when it is stored with reminder times', async () => {
+  const w = worldAt(at(8, 30));
+  addUser(w, 'uid-alice', {
+    routines: { [rid(1)]: { name: 'Morning', times: ['09:30'] } },
+    habits: {
+      pills: member(rid(1), { name: 'Take pills' }),
+      teeth: member(rid(1), { name: 'Brush teeth', times: ['09:00', '09:30'] }), // the rules refuse this record
+    },
+    devices: ['fid-alice-phone'],
+  });
+  const lines = [];
+  const options = { log: (line) => { lines.push(line); log(line); } };
+  // at its own time: nothing, although the routine is not due
+  assert.deepEqual(await go(w, at(9), options), { slot: at(9), sent: 0, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual([w.pushes, w.ops('queryEqual')], [[], []]);
+  // at the routine's time: the routine only. A habit with a routine and times is not a valid habit (validateHabit),
+  // so it is left out altogether, as any other invalid record is
+  assert.deepEqual(await go(w, at(9, 30), options), { slot: at(9, 30), sent: 1, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual(w.pushes.map((p) => p.data), [{ title: 'Morning', body: '1 left: Take pills', tag: rid(1), url: '/' }]);
+  assert.deepEqual(lines, [
+    'Slot 2026-11-13T09:00Z, window 30 min: 1 user, 0 reminders due, 0 skipped (already done), 0 devices, 1 invalid habit ignored.',
+    'Slot 2026-11-13T09:30Z, window 30 min: 1 user, 1 reminder due, 0 skipped (already done), 1 device, 1 invalid habit ignored.',
+  ]);
+});
+
+test('R4. a deleted routine sends nothing: its habits are loose and have no reminder times of their own', async () => {
+  const user = (deletedAt) => ({
+    routines: { [rid(1)]: { name: 'Morning', deletedAt } },
+    habits: { pills: member(rid(1), { name: 'Take pills' }), teeth: member(rid(1), { name: 'Brush teeth' }), h1: { times: ['21:00'] } },
+    devices: ['fid-alice-phone'],
+  });
+  const w = addUser(worldAt(at(8, 30)), 'uid-alice', user(1793000000000));
+  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 0, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual([w.pushes, w.ops('getDoc'), w.ops('queryEqual')], [[], [BOOKMARK], []]); // no logs, no devices
+  // the same routine restored is sent
+  const v = addUser(worldAt(at(8, 30)), 'uid-alice', user(null));
+  assert.equal((await go(v, at(9))).sent, 1);
+  assert.deepEqual(tags(v), [rid(1)]);
+});
+
+test('R5. a routine due in two window entries (catch-up across local midnight) is sent once, with the text of the latest day', async () => {
+  const w = worldAt(at(23)); // Europe/London, window 23:00 to 24:00 UTC on 13 Nov: 23:30 on the 13th, 00:00 on the 14th
+  addUser(w, 'uid-alice', {
+    routines: {
+      [rid(1)]: { name: 'Night', times: ['00:00', '23:30'] },
+      [rid(2)]: { name: 'Late', times: ['23:30'], order: 2 },
+      [rid(3)]: { name: 'Done late', times: ['23:30'], order: 3 },
+      [rid(4)]: { name: 'Done late, open early', times: ['00:00', '23:30'], order: 4 },
+    },
+    habits: {
+      pills: member(rid(1), { name: 'Take pills', order: 1 }), teeth: member(rid(1), { name: 'Brush teeth', order: 2 }),
+      page: member(rid(2), { name: 'Read a page', order: 3 }), floss: member(rid(2), { name: 'Floss', order: 4 }),
+      lights: member(rid(3), { name: 'Lights out', order: 5 }),
+      door: member(rid(4), { name: 'Lock the door', order: 6 }),
+    },
+    logs: { '2026-11-13': { pills: 1, floss: 1, lights: 1, door: 1 } },
+    devices: ['fid-alice-phone'],
+  });
+  assert.deepEqual(await go(w, at(24)), { slot: at(24), sent: 3, skipped: 1, failed: 0, removed: 0 });
+  assert.deepEqual(Object.fromEntries(w.pushes.map((p) => [p.data.tag, p.data.body])), {
+    [rid(1)]: '2 left: Take pills, Brush teeth', // once, with the text of the 14th (on the 13th: "1 left: Brush teeth")
+    [rid(2)]: '1 left: Read a page', // for the 13th
+    [rid(4)]: '1 left: Lock the door', // for the 14th
+  });
+  assert.equal(w.pushes.length, 3);
+});
+
+test('R6. junk routine documents are ignored: nothing crashes, their habits are loose, junk fields of a valid one do no harm', async () => {
+  const w = worldAt(at(8, 30));
+  addUser(w, 'uid-mallory', {
+    routines: {
+      [rid(1)]: { name: 42 }, [rid(2)]: { name: '   ' }, [rid(3)]: { name: 'x'.repeat(41) }, [rid(4)]: { times: 'nope' },
+      [rid(5)]: { times: ['09:15'] }, [rid(6)]: { times: ['09:00', '09:00'] },
+      [rid(8)]: { name: 'Deleted oddly', deletedAt: 'yes' },
+      [rid(9)]: { name: 'Odd but fine', order: 'first', deletedAt: 0, updatedAt: 'now', extra: { toString: 'x' }, constructor: 'y' },
+    },
+    habits: {
+      inJunk: member(rid(1), { name: 'Count sheep' }), // its routine is not valid: loose, and it has no times
+      inDeleted: member(rid(8), { name: 'Feed the cat' }),
+      inGood: member(rid(9), { name: 'Stretch' }),
+      numberRoutine: { name: 'Water plants', routine: 7 }, // not a string: counts as ''
+      mapRoutine: { name: 'Sweep floor', routine: { id: rid(9) } },
+      badRoutine: member('not an id', { name: 'Wash car' }), // not a valid habit
+    },
+    devices: ['fid-mallory'],
+  });
+  w.put(`users/uid-mallory/routines/${rid(7)}`, {});
+  const lines = [];
+  const result = await go(w, at(9), { log: (line) => { lines.push(line); log(line); } });
+  assert.deepEqual(result, { slot: at(9), sent: 3, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual(w.pushes.map((p) => p.data), [
+    { title: 'Odd but fine', body: '1 left: Stretch', tag: rid(9), url: '/' },
+    { title: 'Sweep floor', body: 'Not started today. Target: 3.', tag: 'mapRoutine', url: '/' },
+    { title: 'Water plants', body: 'Not started today. Target: 3.', tag: 'numberRoutine', url: '/' },
+  ]);
+  assert.deepEqual(lines, ['Slot 2026-11-13T09:00Z, window 30 min: 1 user, 3 reminders due, 0 skipped (already done), 1 device, '
+    + '1 invalid habit ignored, 7 invalid routines ignored.']);
+});
+
+test('9. nothing sensitive in the log: no habit name, routine name or id, uid, device id, email or server text', async () => {
   const w = worldAt(at(8));
   const said = `Drink water for uid-alice on fid-alice-phone, ${EMAIL}`; // what a server might quote back
   addUser(w, 'uid-alice', {
-    habits: { h1: {}, h2: { name: 'Stretch', target: 1 } }, logs: { '2026-11-13': { h2: 1 } },
+    habits: { h1: {}, h2: { name: 'Stretch', target: 1 }, h3: member(rid(41), { name: 'Floss' }), h4: member(rid(42), { name: 'Tidy desk' }) },
+    routines: { [rid(41)]: { name: 'Wind down' }, [rid(42)]: { name: 'Before work', order: 2 } },
+    logs: { '2026-11-13': { h2: 1, h4: 1 } },
     devices: ['fid-alice-phone', 'fid-alice-old'],
   });
   addUser(w, 'uid-bob', { habits: { h1: { name: 'Read a book' }, bad: { name: 7 } }, devices: ['fid-bob-phone'] });
-  addUser(w, 'uid-carol', { habits: { h1: { name: 'Call mum' } } });
+  addUser(w, 'uid-carol', { habits: { h1: { name: 'Call mum' } }, routines: { [rid(43)]: { name: 'Weekend chores', times: ['9am'] } } });
   w.put('devices/fid carol!', { uid: 'uid-carol', ua: EMAIL, updatedAt: 1 });
   w.fail = (op, arg) => (arg === 'users/uid-bob/habits' ? unavailable(said) : null);
   w.pushReply = (fid) => (fid === 'fid-alice-old' ? 'unregistered' : new GoogleError(said, { status: 403, code: said, detail: said }));
   const lines = [];
   const result = await run({ google: w.google, now: at(8, 56), log: (line) => { lines.push(line); log(line); }, sleep });
-  assert.deepEqual(result, { slot: at(9), sent: 0, skipped: 1, failed: 2, removed: 1 });
+  // alice: the routine "Wind down" and the habit h1 are due, the routine "Before work" and the habit h2 are done
+  assert.deepEqual(result, { slot: at(9), sent: 0, skipped: 2, failed: 3, removed: 1 });
   assert.deepEqual(lines, [
-    'Slot 2026-11-13T09:00Z, window 60 min: 3 users, 2 reminders due, 1 skipped (already done), 2 devices, '
-      + '1 due without a device, 1 unusable device record ignored, 1 failed read tried again.',
+    'Slot 2026-11-13T09:00Z, window 60 min: 3 users, 3 reminders due, 2 skipped (already done), 2 devices, '
+      + '1 due without a device, 1 invalid routine ignored, 1 unusable device record ignored, 1 failed read tried again.',
     'Failed 1 x: reading a user, HTTP 503 UNAVAILABLE.',
-    'Failed 1 x: a push, HTTP 403 UNKNOWN.',
+    'Failed 2 x: a push, HTTP 403 UNKNOWN.',
   ]);
+  for (const secret of ['Wind down', 'Before work', 'Weekend chores', rid(41), rid(42), rid(43)]) assert.ok(sensitive.has(secret));
   // run-level failures and the quiet paths log too
   w.fail = (op) => (op === 'setDoc' ? new TypeError(said) : null);
   await assert.rejects(go(w, at(9, 30)));
