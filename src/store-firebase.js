@@ -483,6 +483,9 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     if (!record || (record.deletedAt === null) === (deletedAt === null)) return;
     if (deletedAt === null && state[kind].length >= KINDS[kind].max) throw tooMany(kind);
     const patch = { deletedAt, updatedAt: now().getTime() };
+    // A habit stored before routines existed has no `routine` field, and the rules check the whole merged
+    // document: write the normalised value along, so such a habit can still be deleted and restored.
+    if (kind === 'habits') patch.routine = record.routine ?? '';
     change({ kind, id, patch }, () => updateDoc(recordRef(kind, id), patch));
   }
 
@@ -500,7 +503,10 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     const updatedAt = now().getTime();
     change({ all: moved.map(([id, order]) => ({ kind, id, patch: { order, updatedAt } })) }, () => {
       const batch = writeBatch(db);
-      for (const [id, order] of moved) batch.update(recordRef(kind, id), { order, updatedAt });
+      // Habits carry `routine` along for the same reason as in setDeleted().
+      for (const [id, order] of moved) {
+        batch.update(recordRef(kind, id), kind === 'habits' ? { order, updatedAt, routine: live.get(id).routine ?? '' } : { order, updatedAt });
+      }
       return batch.commit();
     });
   }
