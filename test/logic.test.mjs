@@ -220,6 +220,16 @@ test('sortHabits: by order, deleted left out', () => {
   assert.deepEqual(sortHabits(hs).map((h) => h.id), ['z', 'a', 'b']);
 });
 
+test('sortHabits: equal order falls back to the name by code units, then the id, whatever the locale', () => {
+  const ids = (list) => sortHabits(list).map((h) => h.id);
+  // Code units put 'Z' before 'a' and 'z' before 'ä'; a locale comparison would give a, ä, Z, z.
+  const hs = [{ id: '1', name: 'ä' }, { id: '2', name: 'a' }, { id: '3', name: 'z' }, { id: '4', name: 'Z' }];
+  assert.deepEqual(ids(hs), ['4', '2', '3', '1']);
+  assert.deepEqual(ids([{ id: 'b', name: 'Same', order: 1 }, { id: 'a', name: 'Same', order: 1 }]), ['a', 'b']);
+  assert.deepEqual(ids([{ id: 'a', name: 'Aaa', order: 2 }, { id: 'b', name: 'Zzz', order: 1 }]), ['b', 'a']); // order still wins
+  assert.deepEqual(ids([{ id: 'B' }, { id: 'a' }]), ['B', 'a']); // ids by code units too
+});
+
 test('startDay: a back-filled day moves the first day, an undone one does not', () => {
   assert.equal(startDay(water, {}), '2026-11-02');
   const logs = logsOf([['2026-10-30', 'w', 3], ['2026-10-31', 'w', 3], ['2026-11-01', 'w', 3], ['2026-11-02', 'w', 3], ['2026-10-20', 'g', 1]]);
