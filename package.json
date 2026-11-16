@@ -13,7 +13,7 @@
     "test": "node --test test/*.test.mjs",
     "test:emulator": "firebase emulators:exec --only firestore,auth --project demo-habit-tally \"node --test --test-concurrency=1 test/emulator/*.test.mjs\"",
     "test:e2e": "npm run build:demo && playwright test",
-    "test:e2e:emulator": "playwright test -c playwright.emulator.config.js"
+    "test:e2e:emulator": "firebase emulators:exec --only firestore,auth --project demo-habit-tally \"node e2e/emulator.mjs\""
   },
   "dependencies": {
     "firebase": "^13.3.0"
