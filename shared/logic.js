@@ -193,10 +193,12 @@ export function validateHabit(h) {
   return out;
 }
 
-/** Display order: by `order`, then by id so ties are stable. Deleted habits are left out. */
+/** Display order: by `order`, then by name, then by id, so ties fall the same way on every device and in the
+ *  reminder job (code-unit comparison, never the locale's). Deleted habits are left out. */
 export function sortHabits(habits) {
   return habits.filter((h) => !h.deletedAt)
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(a.id).localeCompare(String(b.id)));
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || byText(String(a.name ?? ''), String(b.name ?? ''))
+      || byText(String(a.id), String(b.id)));
 }
 
 // ---------- routines ----------

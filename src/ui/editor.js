@@ -486,6 +486,8 @@ function save(s) {
   const { input, problem } = checkForm(s.form, s.id);
   if (problem) return fail(s, problem);
   let { routine } = input;
+  /** The routine this Save made, and the name typed for it: taken back if the habit is then refused. */
+  let created = null;
   if (s.form.routine === NEW_ROUTINE) {
     const named = checkRoutineName(s.form.routineName);
     if (named.problem) return fail(s, named.problem);
@@ -495,7 +497,7 @@ function save(s) {
       if (!(err instanceof StoreError)) throw err;
       return fail(s, { field: 'routineName', message: err.message });
     }
-    // The routine exists from here on: should the habit be refused, Save must not make a second one.
+    created = { id: routine, name: s.form.routineName };
     s.form = { ...s.form, routine, routineName: '' };
     draw(s);
     choose(s, routine);
@@ -504,6 +506,13 @@ function save(s) {
     s.ctx.store.saveHabit({ ...input, routine });
   } catch (err) {
     if (!(err instanceof StoreError)) throw err;
+    if (created) {
+      // The habit was refused (for example the habit limit): leave no empty routine behind, and put the form
+      // back to "New routine..." with the typed name, so the next Save starts over cleanly.
+      s.ctx.store.deleteRoutine(created.id);
+      s.form = { ...s.form, routine: NEW_ROUTINE, routineName: created.name };
+      draw(s);
+    }
     return fail(s, { field: err.code === 'invalid' ? fieldOf(err.message) : 'form', message: err.message });
   }
   s.end();

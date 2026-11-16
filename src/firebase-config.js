@@ -12,7 +12,7 @@ export const firebaseConfig = {
 
 // Web Push public key (Firebase console > Project settings > Cloud Messaging > Web Push certificates).
 // Public by design. While it is empty, push registration leaves the option out.
-export const vapidKey = '';
+export const vapidKey = 'BHgGci2Twas2QrTxoPln1g1DWtQe2hOL8vsMaXcTeT3wkJ8Slay0SEg5h9rVl39yUCL9ZafXiF5FHsMamoP2EAg';
 
 // Used when BACKEND is 'emulator' (npm run dev:emulator, emulator tests). The "demo-" project id
 // guarantees that nothing can reach a real Firebase project.

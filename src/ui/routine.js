@@ -90,7 +90,7 @@ function view(s) {
   })}
     ${id && !s.gone ? `<div class="editor-danger" id="editor-danger">
       <button type="button" class="btn btn-danger" data-action="delete">Delete routine</button>
-      <p class="field-hint">Its habits stay, under “Other habits”. You can undo this straight afterwards.</p></div>` : ''}
+      <p class="field-hint">Its habits stay, under “Other habits”, and get no reminders until you give them times of their own. You can undo this straight afterwards.</p></div>` : ''}
     ${footView(s, { save: 'Save routine', goneText: 'This routine has been deleted, perhaps on another device, so changes to it cannot be saved.' })}
   </form>`;
 }
