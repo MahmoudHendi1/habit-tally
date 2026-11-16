@@ -6,7 +6,11 @@
 .progress-habit { display: grid; gap: 16px; min-width: 0; padding: 16px 16px 14px; }
 .progress-habit dl, .progress-habit dd { margin: 0; }
 .progress-head { display: grid; gap: 2px; min-width: 0; }
-.progress-head h2 { font-size: 19px; overflow-wrap: anywhere; }
+.progress-name { margin: 0; font-size: 19px; line-height: 1.3; font-weight: 650; overflow-wrap: anywhere; }
+/* With routines: the sections of Today, each under the routine's name. */
+.progress-groups { display: grid; gap: 24px; }
+.progress-group { display: grid; gap: 10px; min-width: 0; }
+.progress-group > h2 { padding-left: 2px; font-size: 19px; overflow-wrap: anywhere; }
 
 /* ---------- the current streak, with the best one beside it ---------- */
 .progress-hero { display: grid; gap: 10px; padding: 14px 16px; border-radius: var(--r-sm); background: var(--sunk); }

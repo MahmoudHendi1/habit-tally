@@ -4,12 +4,13 @@ import { keyOf } from '../shared/logic.js';
 import { createStore, BACKEND } from './store.js';
 import { createPush } from './push.js';
 import { initPwa } from './pwa.js';
-import { esc, patch, toast, clearToasts, closeSheet, initTheme, getTheme, setTheme } from './ui/common.js';
+import { esc, patch, toast, clearToasts, announce, closeSheet, initTheme, getTheme, setTheme } from './ui/common.js';
 import * as today from './ui/today.js';
 import * as progress from './ui/progress.js';
 import * as settings from './ui/settings.js';
 import * as signin from './ui/signin.js';
 import { openEditor } from './ui/editor.js';
+import { openRoutine } from './ui/routine.js';
 
 /** @typedef {import('./ui/common.js').State} State */
 /** @typedef {import('./ui/common.js').Ctx} Ctx */
@@ -47,6 +48,7 @@ const ctx = {
     location.hash = `#/${tab}`;
   },
   openEditor: (habitId = null) => openEditor(habitId, ctx),
+  openRoutine: (routineId = null) => openRoutine(routineId, ctx),
   toast, signOut, getTheme, setTheme,
   refresh: update,
 };
@@ -82,6 +84,7 @@ function draw() {
   if (ready && lastStatus !== 'ready') push.resume().catch(() => { /* reminders stay as they were; Settings shows the status */ });
   if (lastStatus === 'ready' && !ready) {
     clearToasts(); // "Deleted <habit name>." must not stay on the sign-in screen
+    announce(''); // nor the last count read out to a screen reader ("Read: 3 of 1 today")
     // Signing out from Settings must not bring the next person back to Settings.
     if (location.hash) history.replaceState(null, '', '#/today');
   }

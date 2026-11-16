@@ -8,12 +8,12 @@ import { initializeTestEnvironment } from '@firebase/rules-unit-testing';
 import { deleteApp, getApp } from 'firebase/app';
 import { FetchProvider } from '@firebase/auth/internal';
 import {
-  collection, disableNetwork, doc, enableNetwork, getDoc, getDocs, getFirestore, setLogLevel, updateDoc, waitForPendingWrites,
+  collection, disableNetwork, doc, enableNetwork, getDoc, getDocs, getFirestore, setDoc, setLogLevel, updateDoc, waitForPendingWrites,
 } from 'firebase/firestore';
 import { createFirebaseStore } from '../../src/store-firebase.js';
 import { emulatorConfig } from '../../src/firebase-config.js';
 import { StoreError } from '../../src/store.js';
-import { countOn } from '../../shared/logic.js';
+import { countOn, groupHabits, routineOf } from '../../shared/logic.js';
 import { runStoreContract } from '../store-contract.mjs';
 
 setLogLevel('error'); // refused writes are expected here; do not print a warning for each one
@@ -27,7 +27,8 @@ assert.ok(PROJECT.startsWith('demo-') && FIRESTORE.includes('//127.0.0.1:') && A
 const TODAY = '2026-11-03';
 const NOON = new Date(`${TODAY}T12:00:00`).getTime();
 const WATER = { name: 'Water', period: 'day', target: 3, unit: 'glasses', times: ['09:00'] };
-const HABIT_FIELDS = ['archived', 'created', 'deletedAt', 'name', 'order', 'period', 'target', 'times', 'unit', 'updatedAt'];
+const HABIT_FIELDS = ['archived', 'created', 'deletedAt', 'name', 'order', 'period', 'routine', 'target', 'times', 'unit', 'updatedAt'];
+const ROUTINE_FIELDS = ['deletedAt', 'name', 'order', 'times', 'updatedAt'];
 const SENTENCE = /^[A-Z][^/]*\.$/; // a plain sentence, not an error code like auth/wrong-password
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -145,7 +146,7 @@ async function stored(path) {
 async function storedUnder(uid) {
   const out = { [`users/${uid}`]: await stored(`users/${uid}`) };
   await env.withSecurityRulesDisabled(async (ctx) => {
-    for (const name of ['habits', 'logs']) {
+    for (const name of ['habits', 'routines', 'logs']) {
       for (const d of (await getDocs(collection(ctx.firestore(), `users/${uid}/${name}`))).docs) out[d.ref.path] = d.data();
     }
   });
@@ -190,10 +191,10 @@ test('firebase store: loading until Auth has reported, then signedOut; nothing c
   const { store } = open();
   const seen = [];
   store.subscribe((state) => seen.push(state.status));
-  assert.deepEqual(store.getState(), { status: 'loading', mode: 'emulator', user: null, habits: [], logs: {}, lastError: null });
+  assert.deepEqual(store.getState(), { status: 'loading', mode: 'emulator', user: null, habits: [], routines: [], logs: {}, lastError: null });
   const before = await until(store, (state) => state.status === 'signedOut', 'Auth reports that nobody is signed in');
   assert.deepEqual(seen, ['loading', 'signedOut']);
-  assert.deepEqual(before, { status: 'signedOut', mode: 'emulator', user: null, habits: [], logs: {}, lastError: null });
+  assert.deepEqual(before, { status: 'signedOut', mode: 'emulator', user: null, habits: [], routines: [], logs: {}, lastError: null });
 
   assert.throws(() => store.saveHabit(WATER), fails('not-ready'));
   store.addCount(TODAY, 'habit000000000000001', 1);
@@ -210,7 +211,7 @@ test('check 4: a new account is waiting, not an error; once invited, retry() cre
   store.subscribe((state) => seen.push(state.status));
   await store.signUp(' New.Person@Example.com ', 'secret1');
   const { user, ...rest } = store.getState();
-  assert.deepEqual(rest, { status: 'waiting', mode: 'emulator', habits: [], logs: {}, lastError: null });
+  assert.deepEqual(rest, { status: 'waiting', mode: 'emulator', habits: [], routines: [], logs: {}, lastError: null });
   assert.deepEqual(user, { uid: user.uid, email: 'new.person@example.com', tz: 'Asia/Tokyo' });
   assert.match(user.uid, /^\w{20,}$/);
   assert.equal(await stored(`users/${user.uid}`), null, 'the rules let a stranger create nothing');
@@ -224,7 +225,7 @@ test('check 4: a new account is waiting, not an error; once invited, retry() cre
   store.retry();
   store.retry(); // a second tap on "check again" is harmless
   const ready = await until(store, (state) => state.status === 'ready', 'ready after retry()');
-  assert.deepEqual(ready, { status: 'ready', mode: 'emulator', user, habits: [], logs: {}, lastError: null });
+  assert.deepEqual(ready, { status: 'ready', mode: 'emulator', user, habits: [], routines: [], logs: {}, lastError: null });
   assert.deepEqual(seen, ['loading', 'signedOut', 'loading', 'waiting', 'ready']);
   assert.deepEqual(await storedUnder(user.uid), { [`users/${user.uid}`]: { tz: 'Asia/Tokyo', createdAt: NOON, updatedAt: NOON } });
 });
@@ -258,7 +259,7 @@ test('a user record the rules refuse is tried once, shows as lastError, and is t
   try {
     await rejects(store.signIn(account.email, account.password), 'unknown');
     const { lastError, ...rest } = store.getState();
-    assert.deepEqual(rest, { status: 'loading', mode: 'emulator', user: null, habits: [], logs: {} });
+    assert.deepEqual(rest, { status: 'loading', mode: 'emulator', user: null, habits: [], routines: [], logs: {} });
     assert.equal(lastError.code, 'not-saved');
     assert.match(lastError.message, SENTENCE);
   } finally {
@@ -333,6 +334,61 @@ test('check 2: two stores signed in as one user see each other\'s changes within
   assert.deepEqual(Object.keys(docs[`users/${a.uid}/habits/${id}`]).sort(), HABIT_FIELDS);
   assert.deepEqual(docs[`users/${a.uid}/habits/${id}`], Object.fromEntries(Object.entries(a.store.getState().habits[0]).filter(([key]) => key !== 'id')));
   assert.deepEqual(docs[`users/${a.uid}/logs/2026-11`], { days: { [TODAY]: { [id]: 2 } } });
+});
+
+test('R1 check 3: a routine saved, edited, reordered, deleted or restored in one store reaches the other within 2 seconds', async () => {
+  const a = await readyStore();
+  const b = open();
+  await b.store.signIn(a.email, a.password);
+  assert.deepEqual(b.store.getState().routines, []);
+
+  const morning = a.store.saveRoutine({ name: 'Morning', times: ['07:00'] });
+  await until(b.store, (state) => state.routines.length === 1, 'a new routine reaches the other store');
+  assert.deepEqual(b.store.getState().routines, a.store.getState().routines);
+  const evening = b.store.saveRoutine({ name: 'Evening' });
+  const pills = b.store.saveHabit({ ...WATER, name: 'Take pills', routine: morning });
+  const teeth = b.store.saveHabit({ ...WATER, name: 'Brush teeth', routine: morning });
+  await until(a.store, (state) => state.routines.length === 2 && state.habits.length === 2, 'a second routine and two members reach the first store');
+  assert.deepEqual(a.store.getState().habits.map((h) => [h.id, h.routine, h.times]), [[pills, morning, []], [teeth, morning, []]]);
+
+  a.store.saveRoutine({ id: evening, name: 'Night', times: ['21:30'] });
+  await until(b.store, (state) => state.routines[1]?.name === 'Night', 'an edit reaches the other store');
+  b.store.reorderRoutines([evening, morning]);
+  await until(a.store, (state) => state.routines[0]?.id === evening, 'a new order of routines reaches the other store');
+  assert.deepEqual(a.store.getState().routines.map((r) => [r.id, r.order]), [[evening, 1], [morning, 2]], 'both records of the reorder arrive together');
+  a.store.reorderHabits([teeth, pills]);
+  await until(b.store, (state) => state.habits[0]?.id === teeth, 'a new order of habits reaches the other store');
+
+  a.store.deleteRoutine(morning);
+  const without = await until(b.store, (state) => state.routines.length === 1, 'a delete reaches the other store');
+  assert.deepEqual(without.habits.map((h) => routineOf(h, without.routines)), [null, null], 'its habits are loose meanwhile');
+  b.store.restoreRoutine(morning);
+  const back = await until(a.store, (state) => state.routines.length === 2, 'a restore reaches the other store');
+  assert.deepEqual(groupHabits(back.habits, back.routines).map((entry) => [entry.routine?.id, entry.habits.map((h) => h.id)]),
+    [[evening, []], [morning, [teeth, pills]]]);
+
+  await a.settle();
+  await b.settle();
+  assert.deepEqual(a.store.getState(), b.store.getState());
+  assert.equal(a.store.getState().lastError, null);
+  // What is stored has the shapes of contracts section 4: five fields in a routine, eleven in a habit, no id.
+  const docs = await storedUnder(a.uid);
+  const routine = a.store.getState().routines[1];
+  assert.deepEqual(Object.keys(docs[`users/${a.uid}/routines/${morning}`]).sort(), ROUTINE_FIELDS);
+  assert.deepEqual(docs[`users/${a.uid}/routines/${morning}`], Object.fromEntries(Object.entries(routine).filter(([key]) => key !== 'id')));
+  assert.deepEqual(Object.keys(docs[`users/${a.uid}/habits/${pills}`]).sort(), HABIT_FIELDS);
+  assert.deepEqual([docs[`users/${a.uid}/habits/${pills}`].routine, docs[`users/${a.uid}/habits/${pills}`].times], [morning, []]);
+});
+
+test('a habit stored without the routine field (from before routines) is read as loose', async () => {
+  const { store, uid } = await readyStore();
+  const routine = store.saveRoutine({ name: 'Morning' });
+  const old = { name: 'Old', period: 'day', target: 1, unit: '', times: ['09:00'], created: TODAY, archived: false, deletedAt: null, order: 1, updatedAt: NOON };
+  await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), `users/${uid}/habits/habit000000000000001`), old));
+  const state = await until(store, (s) => s.habits.length === 1, 'the stored habit arrives');
+  assert.deepEqual(state.habits[0], { id: 'habit000000000000001', ...old, routine: '' });
+  assert.equal(routineOf(state.habits[0], state.routines), null);
+  assert.equal(state.routines[0].id, routine);
 });
 
 test('check 3: both stores add +1 at the same moment: both end at 2', async () => {
@@ -511,7 +567,7 @@ test('nothing cached and Firestore out of reach: sign-in rejects "offline", last
   const cut = openUnreachable();
   await rejects(soon(cut.store.signIn(account.email, account.password), 'signIn', 15_000), 'offline');
   const { lastError, ...rest } = cut.store.getState();
-  assert.deepEqual(rest, { status: 'loading', mode: 'emulator', user: null, habits: [], logs: {} });
+  assert.deepEqual(rest, { status: 'loading', mode: 'emulator', user: null, habits: [], routines: [], logs: {} });
   assert.equal(lastError.code, 'offline');
   assert.match(lastError.message, SENTENCE);
 
@@ -638,7 +694,7 @@ test('signOut clears the state and stops the listeners; signing in again brings 
   a.store.subscribe((state) => seen.push(state));
   await a.store.signOut();
   const signedOut = a.store.getState();
-  assert.deepEqual(signedOut, { status: 'signedOut', mode: 'emulator', user: null, habits: [], logs: {}, lastError: null });
+  assert.deepEqual(signedOut, { status: 'signedOut', mode: 'emulator', user: null, habits: [], routines: [], logs: {}, lastError: null });
   assert.deepEqual(seen.map((state) => state.status), ['ready', 'signedOut']);
   assert.throws(() => a.store.saveHabit(WATER), fails('not-ready'));
 

@@ -20,8 +20,8 @@ service cloud.firestore {
     // The document has exactly these fields: none missing, none extra.
     function hasExactly(data, fields) { return data.keys().hasAll(fields) && data.keys().hasOnly(fields); }
 
-    // A habit id: 20 letters or digits.
-    function isHabitId(id) { return id.matches('^[A-Za-z0-9]{20}$'); }
+    // A habit id or a routine id: 20 letters or digits.
+    function isId(id) { return id.matches('^[A-Za-z0-9]{20}$'); }
 
     // A day 'YYYY-MM-DD' and a month 'YYYY-MM', as the app writes them.
     function isDay(s) { return s is string && s.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
@@ -37,9 +37,10 @@ service cloud.firestore {
     }
 
     // A whole habit. Required on every write, so a partial write can never create or damage one.
+    // (Reading is not checked: a habit stored before routines existed, without `routine`, can still be read.)
     function validHabit(h) {
       return hasExactly(h, ['name', 'period', 'target', 'unit', 'times', 'created', 'archived', 'deletedAt',
-                            'order', 'updatedAt'])
+                            'order', 'updatedAt', 'routine'])
         && h.name is string && h.name.trim().size() >= 1 && h.name.size() <= 60 // not blank
         && h.period in ['day', 'week']
         && h.target is int && h.target >= 1 && h.target <= 50
@@ -49,7 +50,21 @@ service cloud.firestore {
         && h.archived is bool
         && (h.deletedAt == null || h.deletedAt is int)
         && h.order is number
-        && h.updatedAt is number;
+        && h.updatedAt is number
+        // '' (loose) or the id of a routine; a habit in a routine has no reminder times of its own.
+        // (Rules cannot check that the routine exists: shared/logic.js routineOf decides membership.)
+        && h.routine is string && (h.routine == '' || isId(h.routine))
+        && (h.routine == '' || h.times.size() == 0);
+    }
+
+    // A whole routine: a named, ordered group of habits with its own reminder times. Required on every write.
+    function validRoutine(r) {
+      return hasExactly(r, ['name', 'times', 'order', 'deletedAt', 'updatedAt'])
+        && r.name is string && r.name.trim().size() >= 1 && r.name.size() <= 40 // not blank
+        && validTimes(r.times)
+        && r.order is number
+        && (r.deletedAt == null || r.deletedAt is number)
+        && r.updatedAt is number;
     }
 
     // The account record: reminder time zone and two times in ms.
@@ -84,7 +99,12 @@ service cloud.firestore {
 
       match /habits/{habitId} {
         allow read, delete: if owner(uid);
-        allow create, update: if owner(uid) && isHabitId(habitId) && validHabit(request.resource.data);
+        allow create, update: if owner(uid) && isId(habitId) && validHabit(request.resource.data);
+      }
+
+      match /routines/{routineId} {
+        allow read, delete: if owner(uid);
+        allow create, update: if owner(uid) && isId(routineId) && validRoutine(request.resource.data);
       }
 
       match /logs/{month} {

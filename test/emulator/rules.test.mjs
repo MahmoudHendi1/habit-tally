@@ -20,14 +20,16 @@ const rules = file('firestore.rules')
   .replace(INVITE_LINE, "function invited() { return ['alice', 'bob']; } // @invite-list");
 
 const HABIT = 'habit000000000000001'; // 20 letters or digits, like the ids the store makes
+const ROUTINE = 'routine0000000000001';
 const MONTH = '2026-11';
 const NOW = 1794000000000;
 const ALL_TIMES = Array.from({ length: 48 }, (_, i) => `${String(i >> 1).padStart(2, '0')}:${i % 2 ? '30' : '00'}`);
 
 const habit = (over = {}) => ({
   name: 'Drink water', period: 'day', target: 8, unit: 'glasses', times: ['09:00', '13:30'],
-  created: '2026-11-02', archived: false, deletedAt: null, order: 1, updatedAt: NOW, ...over,
+  created: '2026-11-02', archived: false, deletedAt: null, order: 1, updatedAt: NOW, routine: '', ...over,
 });
+const routine = (over = {}) => ({ name: 'Morning', times: ['07:00', '07:30'], order: 1, deletedAt: null, updatedAt: NOW, ...over });
 const without = (obj, key) => Object.fromEntries(Object.entries(obj).filter(([k]) => k !== key));
 const account = (over = {}) => ({ tz: 'Europe/London', createdAt: NOW, updatedAt: NOW, ...over });
 const device = (uid, over = {}) => ({ uid, ua: 'Chrome on Android', updatedAt: NOW, ...over });
@@ -63,13 +65,14 @@ async function stored(path) {
 const seedUser = (uid) => seed({
   [`users/${uid}`]: account(),
   [`users/${uid}/habits/${HABIT}`]: habit(),
+  [`users/${uid}/routines/${ROUTINE}`]: routine(),
   [`users/${uid}/logs/${MONTH}`]: { days: { '2026-11-12': { [HABIT]: 3 } } },
   [`devices/fid-${uid}`]: device(uid),
 });
 
 /** Every kind of request on one user's data, in an order that works when all are allowed. */
 function userOps(db, uid) {
-  const u = `users/${uid}`, h = `${u}/habits/${HABIT}`, l = `${u}/logs/${MONTH}`;
+  const u = `users/${uid}`, h = `${u}/habits/${HABIT}`, r = `${u}/routines/${ROUTINE}`, l = `${u}/logs/${MONTH}`;
   return [
     ['get account', () => getDoc(doc(db, u))],
     ['set account', () => setDoc(doc(db, u), account())],
@@ -78,10 +81,15 @@ function userOps(db, uid) {
     ['set habit', () => setDoc(doc(db, h), habit())],
     ['update habit', () => updateDoc(doc(db, h), { target: 9, updatedAt: NOW + 1 })],
     ['list habits', () => getDocs(collection(db, `${u}/habits`))],
+    ['get routine', () => getDoc(doc(db, r))],
+    ['set routine', () => setDoc(doc(db, r), routine())],
+    ['update routine', () => updateDoc(doc(db, r), { name: 'Evening', updatedAt: NOW + 1 })],
+    ['list routines', () => getDocs(collection(db, `${u}/routines`))],
     ['get log', () => getDoc(doc(db, l))],
     ['count', () => tap(db, uid, '2026-11-13')],
     ['list logs', () => getDocs(collection(db, `${u}/logs`))],
     ['delete habit', () => deleteDoc(doc(db, h))],
+    ['delete routine', () => deleteDoc(doc(db, r))],
     ['delete log', () => deleteDoc(doc(db, l))],
     ['delete account', () => deleteDoc(doc(db, u))],
   ];
@@ -99,7 +107,7 @@ async function allRefused(ops) { for (const [label, run] of ops) await named(lab
 async function allAllowed(ops) { for (const [label, run] of ops) await named(label, assertSucceeds(run())); }
 
 describe('1. own data only', () => {
-  test('an invited user reads and writes their own account record, habits and logs', async () => {
+  test('an invited user reads and writes their own account record, habits, routines and logs', async () => {
     await allAllowed(userOps(alice, 'alice'));
   });
 
@@ -107,6 +115,7 @@ describe('1. own data only', () => {
     await seedUser('bob');
     await allRefused(userOps(alice, 'bob'));
     assert.deepEqual(await stored(`users/bob/habits/${HABIT}`), habit());
+    assert.deepEqual(await stored(`users/bob/routines/${ROUTINE}`), routine());
     await allRefused(userOps(alice, 'nobody-yet')); // also where nothing is stored
   });
 
@@ -131,12 +140,13 @@ describe('1. own data only', () => {
 });
 
 describe('2. queries across users', () => {
-  test('a collection-group query over all habits or logs is refused, also for an invited user', async () => {
+  test('a collection-group query over all habits, routines or logs is refused, also for an invited user', async () => {
     await seedUser('alice');
     for (const db of [alice, carol, visitor]) {
       await assertFails(getDocs(collectionGroup(db, 'habits')));
       await assertFails(getDocs(query(collectionGroup(db, 'habits'), where('archived', '==', false))));
       await assertFails(getDocs(collectionGroup(db, 'logs')));
+      await assertFails(getDocs(collectionGroup(db, 'routines')));
     }
   });
 });
@@ -154,6 +164,25 @@ describe('3. habits', () => {
   test('the limits themselves are allowed: target 1 and 50, name 60, unit 20, all 48 times', async () => {
     await assertSucceeds(setDoc(ref(), habit({ target: 1, name: 'x'.repeat(60), unit: 'u'.repeat(20) })));
     await assertSucceeds(setDoc(ref(), habit({ target: 50, times: ALL_TIMES })));
+  });
+
+  test('a habit in a routine has the routine id and no times; moving it in and out is allowed', async () => {
+    await assertSucceeds(setDoc(ref(), habit({ routine: ROUTINE, times: [] })));
+    await assertSucceeds(updateDoc(ref(), { routine: '', times: ['09:00'], updatedAt: NOW + 1 }));
+    await assertSucceeds(updateDoc(ref(), { routine: ROUTINE, times: [], updatedAt: NOW + 2 }));
+    assert.deepEqual(await stored(`users/alice/habits/${HABIT}`), habit({ routine: ROUTINE, times: [], updatedAt: NOW + 2 }));
+    // The rules cannot see whether the routine exists: that is decided by routineOf in shared/logic.js.
+    assert.equal(await stored(`users/alice/routines/${ROUTINE}`), null);
+  });
+
+  test('a habit stored before routines existed (no routine field) can be read; a write must add the field', async () => {
+    const old = without(habit(), 'routine');
+    await seed({ [`users/alice/habits/${HABIT}`]: old });
+    assert.deepEqual((await assertSucceeds(getDoc(ref()))).data(), old);
+    assert.deepEqual((await assertSucceeds(getDocs(collection(alice, 'users/alice/habits')))).docs.map((d) => d.data()), [old]);
+    await assertFails(updateDoc(ref(), { target: 9, updatedAt: NOW + 1 }));
+    await assertSucceeds(updateDoc(ref(), { target: 9, updatedAt: NOW + 1, routine: '' }));
+    await assertSucceeds(deleteDoc(ref()));
   });
 
   test('a soft delete (deletedAt a number) and a restore (deletedAt null) are allowed', async () => {
@@ -199,6 +228,13 @@ describe('3. habits', () => {
     'an updatedAt that is a Firestore Timestamp': { updatedAt: Timestamp.fromMillis(NOW) },
     'an unknown extra field': { colour: 'red' },
     'the id stored as a field': { id: HABIT },
+    'a routine that is not text': { routine: 7, times: [] },
+    'a routine that is null': { routine: null },
+    'a routine that is a list': { routine: [ROUTINE], times: [] },
+    'a routine id of 19 characters': { routine: ROUTINE.slice(1), times: [] },
+    'a routine id of 21 characters': { routine: `${ROUTINE}2`, times: [] },
+    'a routine id with a character that is not a letter or digit': { routine: 'routine-000000000001', times: [] },
+    'both a routine and reminder times': { routine: ROUTINE },
   };
   for (const [label, over] of Object.entries(INVALID)) {
     test(`refused: ${label}`, async () => {
@@ -211,9 +247,10 @@ describe('3. habits', () => {
     });
   }
 
-  test('refused: a habit with any one of the ten fields missing', async () => {
+  test('refused: a habit with any one of the eleven fields missing, routine included', async () => {
     const fields = Object.keys(habit());
-    assert.equal(fields.length, 10);
+    assert.equal(fields.length, 11);
+    assert.ok(fields.includes('routine'));
     for (const field of fields) await named(field, assertFails(setDoc(ref(), without(habit(), field))));
   });
 
@@ -227,6 +264,83 @@ describe('3. habits', () => {
   test('refused: a habit id that is not 20 letters or digits', async () => {
     for (const id of ['short', 'habit-00000000000001', 'habit0000000000000012']) {
       await named(id, assertFails(setDoc(ref(id), habit())));
+    }
+  });
+});
+
+describe('3b. routines (R1 check 1)', () => {
+  const path = `users/alice/routines/${ROUTINE}`;
+  const ref = (id = ROUTINE) => doc(alice, `users/alice/routines/${id}`);
+
+  test('a valid create and a valid full update are allowed', async () => {
+    await assertSucceeds(setDoc(ref(), routine()));
+    const edited = routine({ name: 'Bedtime', times: [], order: 2.5, updatedAt: NOW + 5 });
+    await assertSucceeds(setDoc(ref(), edited));
+    assert.deepEqual(await stored(path), edited);
+  });
+
+  test('the limits themselves are allowed: a name of 1 and of 40 characters, all 48 times, no times', async () => {
+    await assertSucceeds(setDoc(ref(), routine({ name: 'x' })));
+    await assertSucceeds(setDoc(ref(), routine({ name: 'x'.repeat(40), times: ALL_TIMES })));
+    await assertSucceeds(setDoc(ref(), routine({ times: [] })));
+  });
+
+  test('a soft delete, a restore and a new order are allowed as partial updates', async () => {
+    await assertSucceeds(setDoc(ref(), routine()));
+    await assertSucceeds(updateDoc(ref(), { deletedAt: NOW + 1, updatedAt: NOW + 1 }));
+    assert.equal((await stored(path)).deletedAt, NOW + 1);
+    await assertSucceeds(updateDoc(ref(), { deletedAt: null, updatedAt: NOW + 2 }));
+    await assertSucceeds(updateDoc(ref(), { order: 3, updatedAt: NOW + 3 }));
+    assert.deepEqual(await stored(path), routine({ order: 3, updatedAt: NOW + 3 }));
+  });
+
+  const INVALID = {
+    'an empty name': { name: '' },
+    'a name of only spaces': { name: '   ' },
+    'a name of 41 characters': { name: 'x'.repeat(41) },
+    'a name that is not text': { name: 8 },
+    'a name that is a list': { name: ['Morning'] },
+    '49 times': { times: [...ALL_TIMES, '09:00'] },
+    'times that are not a list': { times: '07:00' },
+    'a time off the half hour': { times: ['07:15'] },
+    'a time that is not HH:MM': { times: ['7:00'] },
+    'a time after 23:30': { times: ['24:00'] },
+    'a time listed twice': { times: ['07:00', '07:00'] },
+    'two times hidden in one item': { times: ['07:00,07:30'] },
+    'an order that is not a number': { order: 'first' },
+    'a deletedAt that is text': { deletedAt: 'yesterday' },
+    'an updatedAt that is not a number': { updatedAt: '2026-11-13' },
+    'an updatedAt that is a Firestore Timestamp': { updatedAt: Timestamp.fromMillis(NOW) },
+    'an unknown extra field': { colour: 'red' },
+    'the id stored as a field': { id: ROUTINE },
+    'a habit field': { period: 'day' },
+  };
+  for (const [label, over] of Object.entries(INVALID)) {
+    test(`refused: ${label}`, async () => {
+      await assertFails(setDoc(ref(), routine(over))); // as a create
+      assert.equal(await stored(path), null);
+      await seed({ [path]: routine() });
+      await assertFails(setDoc(ref(), routine(over))); // as a full update
+      await assertFails(setDoc(ref(), over, { merge: true })); // as a partial update
+      assert.deepEqual(await stored(path), routine());
+    });
+  }
+
+  test('refused: a routine with any one of the five fields missing', async () => {
+    const fields = Object.keys(routine());
+    assert.deepEqual(fields.sort(), ['deletedAt', 'name', 'order', 'times', 'updatedAt']);
+    for (const field of fields) await named(field, assertFails(setDoc(ref(), without(routine(), field))));
+  });
+
+  test('refused: a partial merge write to a routine that does not exist; no document is created', async () => {
+    await assertFails(setDoc(ref(), { deletedAt: NOW, updatedAt: NOW }, { merge: true }));
+    await assertFails(updateDoc(ref(), { order: 2 }));
+    assert.equal(await stored(path), null);
+  });
+
+  test('refused: a routine id that is not 20 letters or digits', async () => {
+    for (const id of ['short', 'routine-000000000001', 'routine00000000000012']) {
+      await named(id, assertFails(setDoc(ref(id), routine())));
     }
   });
 });
