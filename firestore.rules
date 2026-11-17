@@ -7,7 +7,7 @@ service cloud.firestore {
     // ---------- who may use the app ----------
 
     // The invite list: Firebase Auth user ids. Keep it on this one line; the emulator tests replace it.
-    function invited() { return ['REPLACE_AT_GO_LIVE']; } // @invite-list
+    function invited() { return ['T5hIjjsborYIR9hjhbGWcBhXJG72']; } // @invite-list
 
     // Signed in and on the invite list.
     function allowed() { return request.auth != null && request.auth.uid in invited(); }
