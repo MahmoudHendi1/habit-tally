@@ -47,8 +47,8 @@ export function routineChanged(form, opened) {
 
 /** Who is in the routine, in one sentence. @param {string[]} names habit names, in order @returns {string} plain text */
 export function membersText(names) {
-  if (names.length === 0) return 'No habits in this routine yet. To put one in, open the habit and choose this routine in it.';
-  return `${names.length === 1 ? '1 habit' : `${names.length} habits`}: ${names.join(', ')}. To add or take out a habit, open it and change its routine.`;
+  if (names.length === 0) return 'No habits in this routine yet. To put one in, open the habit and check this routine in it.';
+  return `${names.length === 1 ? '1 habit' : `${names.length} habits`}: ${names.join(', ')}. To add or take out a habit, open it and change its routines.`;
 }
 
 // ================================ the sheet ================================
@@ -81,7 +81,7 @@ function view(s) {
         autocomplete="off" autocapitalize="sentences" enterkeyhint="done"${id ? '' : ' autofocus'}${describe(s, 'name', ['editor-name-hint', ...(limit.text ? ['editor-name-count'] : [])])}>
       ${errorOf(s, 'name')}${countView('name', limit)}
       <p class="field-hint" id="editor-name-hint">${esc(id ? membersText(members.map((/** @type {{ name: string }} */ h) => h.name))
-    : 'A routine is a list of habits you do together. After saving, open a habit and choose this routine in it.')}</p>
+    : 'A routine is a list of habits you do together. After saving, open a habit and check this routine in it.')}</p>
     </div>
     ${remindersView({
     times: form.times, picks: s.picks, problem: s.problem, note: s.note, status: s.ctx.push.getStatus(),

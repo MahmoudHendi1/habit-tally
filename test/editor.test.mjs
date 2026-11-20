@@ -11,6 +11,7 @@ import {
 } from '../src/ui/editor.js';
 import { openRoutine, blankRoutine, routineFormOf, checkRoutine, routineChanged, membersText } from '../src/ui/routine.js';
 import { movedRoutines, canReorder, shareText, render as renderToday } from '../src/ui/today.js';
+import { render as renderProgress } from '../src/ui/progress.js';
 import { groupHabits, moveHabitIds } from '../shared/logic.js';
 
 const form = (changes = {}) => ({ ...blankForm(), name: 'Drink water', ...changes });
@@ -451,6 +452,15 @@ test('Today renders a shared habit in each of its sections, with the same button
   // Each section is a region named by its routine (or "Other habits").
   for (const name of ['Morning', 'Evening']) assert.match(html, new RegExp(`aria-labelledby="(routine-name-[A-Za-z0-9]+)"[\\s\\S]*?id="\\1">${name}<`));
   assert.match(html, /aria-labelledby="routine-title-loose"[\s\S]*?id="routine-title-loose">Other habits</);
+});
+
+test('Progress shows a shared habit once, under its first routine', () => {
+  const { store } = teethStore();
+  const html = renderProgress(store.getState(), ctxFor(store));
+  assert.equal(html.match(/>Brush teeth</g)?.length, 1);
+  const morning = html.indexOf('>Morning<'), evening = html.indexOf('>Evening<'), teeth = html.indexOf('>Brush teeth<');
+  assert.ok(morning >= 0 && evening > morning && teeth > morning && teeth < evening, 'under Morning, before Evening');
+  assert.ok(html.indexOf('>Floss<') > evening);
 });
 
 // ---------- the routine editor (v1.3) ----------
