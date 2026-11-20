@@ -442,6 +442,10 @@ test('Today renders a shared habit in each of its sections, with the same button
   assert.equal(html.match(/aria-label="Add one: Take vitamins"/g)?.length, 1);
   assert.match(html, /1 of 2 today<span class="habit-share">.*?done for Morning/);
   assert.match(html, /1 of 2 today<span class="habit-share">.*?still to do for Evening/);
+  // The check mark agrees with that line: done in Morning, not yet in Evening.
+  const teethCards = [...html.matchAll(/<li class="card habit([^"]*)" data-key="([^"]+)"/g)]
+    .filter((m) => m[2].endsWith(`:${ids.teeth}`)).map((m) => m[1].includes('is-done'));
+  assert.deepEqual(teethCards, [true, false]);
   // The headings use routineProgress; the top line counts Brush teeth once (1 of 4: only Take vitamins is hit).
   assert.match(html, /2 of 2 done<\/p>/);
   assert.match(html, /0 of 2 done<\/p>/);

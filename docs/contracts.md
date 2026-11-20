@@ -260,11 +260,14 @@ State { status: 'loading' | 'signedOut' | 'waiting' | 'ready',
 - **Rewriting old data (v1.4).** When a store loads a stored habit that has no `routines` array (the v1.3 field
   `routine`, or neither), it reads it as `routines: routineIdsOf(stored)` and writes it back once in the new
   shape: the same values, `routines` in place of `routine`, ids kept even when their routine is deleted, and a
-  new `updatedAt`. The Firebase store does this with a full `setDoc` overwrite (no `merge`), which the v1.4
-  rules accept because the written document has exactly the eleven new fields; several such habits may go in
-  one batch. The demo store rewrites its storage key in one save. The rewrite is not a call: it does not wait
-  for the network, sends no extra listener call beyond the load itself, and if it is refused it sets `lastError`
-  `not-saved` like any write and is tried again on the next load, while state already shows the new shape.
+  new `updatedAt`. The Firebase store does this only from a server snapshot, one transaction per habit that
+  reads the habit again and, only if it is still in an old shape there, overwrites it in full (no `merge`); the
+  v1.4 rules accept it because the written document has exactly the eleven new fields. So it needs the
+  connection, and an edit made meanwhile elsewhere is never overwritten. The demo store rewrites its storage
+  key in one save. The rewrite is not a call: it sends no extra listener call beyond the load itself; if the
+  rules refuse it, it sets `lastError` `not-saved` like any write and is tried again on the next load; if it
+  fails for any other reason (no connection) it sets nothing and is tried again on the next server snapshot.
+  State already shows the new shape either way.
   Any store write of a habit after loading is in the new shape anyway. (v1.4)
 - `lastError` is `{ code: 'not-saved', message }` when a write could not be saved (the backend refused it, or
   browser storage failed). The optimistic state stays as it is; the next write that succeeds clears `lastError`.
@@ -495,7 +498,8 @@ The screens are packages of their own (R3); this fixes only what tests and the o
   it did in v1.2. The line at the top still counts every habit, each once. (v1.4)
 - **A habit in several routines (v1.4)** shows in each of its sections with the same + and − buttons and the
   same count (one count per habit). In a routine section its line also says whether it is done there by
-  `doneIn`, for example "1 of 2 today, done for Morning" in Morning and "1 of 2 today" in Evening. Element ids
+  `doneIn`, for example "1 of 2 today, done for Morning" in Morning and "1 of 2 today, still to do for Evening"
+  in Evening; the card's check mark follows the same rule in that section. Element ids
   built from a habit id must also include the section, so they stay unique on the page. (v1.4)
 - **Reorder mode.** A "Reorder" button on Today (shown when there is anything to reorder) switches the mode on;
   "Done reordering" switches it off. In the mode every habit has Move up and Move down, which move it one

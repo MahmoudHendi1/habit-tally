@@ -454,7 +454,8 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   }
 
   /** Rewrite habits stored in an old shape to the v1.4 shape (contracts section 5), each at most once per
-   *  session; a refusal sets lastError and the next load tries again. The state shows the new shape already
+   *  session; a refusal by the rules sets lastError and the next load tries again, and any other failure (no
+   *  connection) is silent and tried again on the next server snapshot. The state shows the new shape already
    *  (readHabit); the new `updatedAt` is laid over it as an op, so this adds no listener call of its own.
    *  It is a full overwrite (tx.set, no merge) inside a transaction that reads each habit again on the server
    *  first: only a habit that is still in an old shape there is written, built from what the server holds,
@@ -481,8 +482,14 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
       }, (err) => {
         if (session !== s) return;
         s.ops = s.ops.filter((o) => o !== op);
-        lastError = notSaved(err);
-        sentAtError = sent;
+        if (err && err.code === 'permission-denied') {
+          lastError = notSaved(err);
+          sentAtError = sent;
+        } else {
+          // The connection went away (or the transaction gave up): the person wrote nothing, so no "not saved".
+          // The habit stays readable in the old shape and the next server snapshot tries again.
+          s.rewritten.delete(id);
+        }
         refresh();
       });
     }

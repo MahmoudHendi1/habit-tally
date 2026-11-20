@@ -111,12 +111,14 @@ export function shareText(habit, routine, routines, logs, day) {
 }
 
 /** @param {Habit} habit @param {State['logs']} logs @param {string} day @param {string} today
- *  @param {{ tag: 'h2' | 'h3', move: { first: boolean, last: boolean } | null, section: string, share: string }} how
+ *  @param {{ tag: 'h2' | 'h3', move: { first: boolean, last: boolean } | null, section: string, share: string, doneHere: boolean | null }} how
  *    the heading level of the name (h3 under a section heading), where the card is in its section while
- *    reordering, the section's routine id ('' for the loose one, escaped) and `shareText` */
-function habitCard(habit, logs, day, today, { tag, move, section, share }) {
+ *    reordering, the section's routine id ('' for the loose one, escaped), `shareText`, and for a habit in
+ *    several routines whether it is done in this section (`doneIn`; null otherwise, when the day's target decides) */
+function habitCard(habit, logs, day, today, { tag, move, section, share, doneHere }) {
   const id = esc(habit.id), name = esc(habit.name);
-  const done = isHit(habit, logs, day);
+  // The check mark agrees with the line: in a shared habit's section it follows "done for <routine>".
+  const done = doneHere ?? isHit(habit, logs, day);
   const { main, extra } = progressText(habit, logs, day, today);
   // A habit can be in several sections: its key names the section too, so it is unique on the page.
   return `<li class="card habit${done ? ' is-done' : ''}" data-key="${section || 'loose'}:${id}">
@@ -141,6 +143,7 @@ function habitCard(habit, logs, day, today, { tag, move, section, share }) {
 const cards = (list, logs, day, today, tag, routine = null, routines = []) => list.map((h, i) => habitCard(h, logs, day, today, {
   tag, move: reordering ? { first: i === 0, last: i === list.length - 1 } : null,
   section: routine ? esc(routine.id) : '', share: shareText(h, routine, routines, logs, day),
+  doneHere: routine && routinesOf(h, routines).length > 1 ? doneIn(h, routine, routines, logs, day) : null,
 })).join('');
 
 /** One section of Today: a routine with its habits, or the loose habits under "Other habits". Each is a
