@@ -263,7 +263,7 @@ async function main() {
 
       await page.getByRole('button', { name: 'Add a habit', exact: true }).click();
       await page.getByLabel('Name', { exact: true }).fill('Brush teeth');
-      await page.getByLabel('Routine', { exact: true }).selectOption({ label: 'Morning' });
+      await page.getByRole('group', { name: 'Routines', exact: true }).getByRole('checkbox', { name: 'Morning', exact: true }).check();
       await page.getByRole('button', { name: 'Save habit', exact: true }).click();
       await expect(routineSection(page, 'Morning').getByRole('button', { name: 'Add one: Brush teeth', exact: true })).toBeVisible();
       await expect(routineSection(page, 'Morning').getByRole('button', { name: 'Add one: Read', exact: true })).toHaveCount(0);
