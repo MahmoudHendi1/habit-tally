@@ -313,8 +313,8 @@ async function main() {
       const read = habits.find((h) => h.data.name === 'Read'), brush = habits.find((h) => h.data.name === 'Brush teeth');
       assert.deepEqual({ name: routine.data.name, times: routine.data.times, deletedAt: routine.data.deletedAt }, { name: 'Morning', times, deletedAt: null });
       assert.deepEqual(Object.keys(routine.data).sort(), ['deletedAt', 'name', 'order', 'times', 'updatedAt']);
-      assert.deepEqual([read?.data.times, read?.data.routine, read?.data.target], [times, '', 1]);
-      assert.deepEqual([brush?.data.times, brush?.data.routine], [[], routine.id]);
+      assert.deepEqual([read?.data.times, read?.data.routines, read?.data.target, 'routine' in (read?.data ?? {})], [times, [], 1, false]);
+      assert.deepEqual([brush?.data.times, brush?.data.routines, 'routine' in (brush?.data ?? {})], [[], [routine.id], false]);
       for (const h of habits) assert.equal(Object.keys(h.data).length, 11, 'a habit document has eleven fields');
 
       // The device record, which push registration would have written.
