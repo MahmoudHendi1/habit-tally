@@ -65,7 +65,7 @@ import { pathToFileURL } from 'node:url';
 import { readServiceAccount, createGoogle, ConfigError, GoogleError, PreconditionError } from './lib/google.mjs';
 import {
   planRun, dueWindows, dueHabits, dueRoutines, reminderText, routineReminderText, validateHabit, validateRoutine,
-  weekKeys, monthId, SLOT_MS,
+  routineIdsOf, weekKeys, monthId, SLOT_MS,
 } from '../shared/logic.js';
 
 const BOOKMARK = 'system/reminders';
@@ -104,12 +104,13 @@ function describe(err) {
 const order = (v) => (Number.isFinite(v) ? v : 0);
 
 /** A stored habit as shared/logic.js wants it, or null when it is not a valid habit (hostile or broken data).
- *  `routine` is the stored string; whether it names a live routine is for routineOf in the shared logic. */
+ *  `routines` is routineIdsOf(stored data), so a habit still stored in the v1.3 shape (`routine: '' | <id>`) is
+ *  read the same way; the job never rewrites it. Whether an id names a live routine is for routinesOf. */
 function toHabit(doc) {
   const d = isMap(doc.data) ? doc.data : {};
   const habit = {
     id: doc.id, name: d.name, period: d.period, target: d.target, unit: d.unit, times: d.times,
-    routine: typeof d.routine === 'string' ? d.routine : '', order: order(d.order),
+    routines: routineIdsOf(d), order: order(d.order),
     archived: Boolean(d.archived), deletedAt: d.deletedAt || null,
   };
   return typeof doc.id === 'string' && doc.id && validateHabit(habit).length === 0 ? habit : null;

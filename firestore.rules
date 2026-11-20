@@ -36,11 +36,21 @@ service cloud.firestore {
             && t.join(',').matches('^([01][0-9]|2[0-3]):[03]0(,([01][0-9]|2[0-3]):[03]0)*$')));
     }
 
+    // Routine ids of a habit (contract v1.4): a list of at most 5, none twice, each 20 letters or digits.
+    // Rules cannot loop, so each of the five possible positions is checked on its own behind a size guard.
+    function routineIdAt(r, i) { return r.size() <= i || (r[i] is string && isId(r[i])); }
+    function validRoutineIds(r) {
+      return r is list && r.size() <= 5 && r.toSet().size() == r.size()
+        && routineIdAt(r, 0) && routineIdAt(r, 1) && routineIdAt(r, 2) && routineIdAt(r, 3) && routineIdAt(r, 4);
+    }
+
     // A whole habit. Required on every write, so a partial write can never create or damage one.
-    // (Reading is not checked: a habit stored before routines existed, without `routine`, can still be read.)
+    // Exactly the eleven fields of v1.4: a write with the v1.3 field `routine` (alone or beside `routines`) or
+    // without `routines` is refused, so an app still on v1.3 can no longer save habits until it reloads.
+    // (Reading is not checked: a habit stored in an older shape can still be read and is rewritten by the app.)
     function validHabit(h) {
       return hasExactly(h, ['name', 'period', 'target', 'unit', 'times', 'created', 'archived', 'deletedAt',
-                            'order', 'updatedAt', 'routine'])
+                            'order', 'updatedAt', 'routines'])
         && h.name is string && h.name.trim().size() >= 1 && h.name.size() <= 60 // not blank
         && h.period in ['day', 'week']
         && h.target is int && h.target >= 1 && h.target <= 50
@@ -51,10 +61,11 @@ service cloud.firestore {
         && (h.deletedAt == null || h.deletedAt is int)
         && h.order is number
         && h.updatedAt is number
-        // '' (loose) or the id of a routine; a habit in a routine has no reminder times of its own.
-        // (Rules cannot check that the routine exists: shared/logic.js routineOf decides membership.)
-        && h.routine is string && (h.routine == '' || isId(h.routine))
-        && (h.routine == '' || h.times.size() == 0);
+        // [] (loose) or the ids of its routines; a habit in a routine has no reminder times of its own.
+        // (Rules cannot check that the ids name existing or live routines, nor the 20-routine limit:
+        // shared/logic.js routinesOf decides membership.)
+        && validRoutineIds(h.routines)
+        && (h.routines.size() == 0 || h.times.size() == 0);
     }
 
     // A whole routine: a named, ordered group of habits with its own reminder times. Required on every write.

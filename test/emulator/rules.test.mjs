@@ -21,13 +21,14 @@ const rules = file('firestore.rules')
 
 const HABIT = 'habit000000000000001'; // 20 letters or digits, like the ids the store makes
 const ROUTINE = 'routine0000000000001';
+const ROUTINES5 = [1, 2, 3, 4, 5].map((n) => `routine000000000000${n}`); // five distinct ids
 const MONTH = '2026-11';
 const NOW = 1794000000000;
 const ALL_TIMES = Array.from({ length: 48 }, (_, i) => `${String(i >> 1).padStart(2, '0')}:${i % 2 ? '30' : '00'}`);
 
 const habit = (over = {}) => ({
   name: 'Drink water', period: 'day', target: 8, unit: 'glasses', times: ['09:00', '13:30'],
-  created: '2026-11-02', archived: false, deletedAt: null, order: 1, updatedAt: NOW, routine: '', ...over,
+  created: '2026-11-02', archived: false, deletedAt: null, order: 1, updatedAt: NOW, routines: [], ...over,
 });
 const routine = (over = {}) => ({ name: 'Morning', times: ['07:00', '07:30'], order: 1, deletedAt: null, updatedAt: NOW, ...over });
 const without = (obj, key) => Object.fromEntries(Object.entries(obj).filter(([k]) => k !== key));
@@ -166,23 +167,54 @@ describe('3. habits', () => {
     await assertSucceeds(setDoc(ref(), habit({ target: 50, times: ALL_TIMES })));
   });
 
-  test('a habit in a routine has the routine id and no times; moving it in and out is allowed', async () => {
-    await assertSucceeds(setDoc(ref(), habit({ routine: ROUTINE, times: [] })));
-    await assertSucceeds(updateDoc(ref(), { routine: '', times: ['09:00'], updatedAt: NOW + 1 }));
-    await assertSucceeds(updateDoc(ref(), { routine: ROUTINE, times: [], updatedAt: NOW + 2 }));
-    assert.deepEqual(await stored(`users/alice/habits/${HABIT}`), habit({ routine: ROUTINE, times: [], updatedAt: NOW + 2 }));
-    // The rules cannot see whether the routine exists: that is decided by routineOf in shared/logic.js.
+  test('a habit in 0, 1 or 5 routines has their ids and no times; moving it in and out is allowed (R5 check 1)', async () => {
+    await assertSucceeds(setDoc(ref(), habit({ routines: [ROUTINE], times: [] })));
+    await assertSucceeds(updateDoc(ref(), { routines: [], times: ['09:00'], updatedAt: NOW + 1 }));
+    await assertSucceeds(updateDoc(ref(), { routines: ROUTINES5, times: [], updatedAt: NOW + 2 }));
+    assert.deepEqual(await stored(`users/alice/habits/${HABIT}`), habit({ routines: ROUTINES5, times: [], updatedAt: NOW + 2 }));
+    await assertSucceeds(setDoc(ref(), habit({ routines: [ROUTINE], times: [], updatedAt: NOW + 3 })));
+    // The rules cannot see whether the routines exist: that is decided by routinesOf in shared/logic.js.
     assert.equal(await stored(`users/alice/routines/${ROUTINE}`), null);
   });
 
-  test('a habit stored before routines existed (no routine field) can be read; a write must add the field', async () => {
-    const old = without(habit(), 'routine');
+  test('a habit stored before routines existed (no routine field) can be read; a write must give it routines', async () => {
+    const old = without(habit(), 'routines');
     await seed({ [`users/alice/habits/${HABIT}`]: old });
     assert.deepEqual((await assertSucceeds(getDoc(ref()))).data(), old);
     assert.deepEqual((await assertSucceeds(getDocs(collection(alice, 'users/alice/habits')))).docs.map((d) => d.data()), [old]);
     await assertFails(updateDoc(ref(), { target: 9, updatedAt: NOW + 1 }));
-    await assertSucceeds(updateDoc(ref(), { target: 9, updatedAt: NOW + 1, routine: '' }));
+    await assertFails(updateDoc(ref(), { target: 9, updatedAt: NOW + 1, routine: '' }));
+    await assertSucceeds(updateDoc(ref(), { target: 9, updatedAt: NOW + 1, routines: [] }));
     await assertSucceeds(deleteDoc(ref()));
+  });
+
+  test('a v1.3 habit (routine: <id>) can be read, and the full-overwrite rewrite to the v1.4 shape is allowed (R5)', async () => {
+    const old = { ...without(habit({ times: [] }), 'routines'), routine: ROUTINE };
+    await seed({ [`users/alice/habits/${HABIT}`]: old });
+    assert.deepEqual((await assertSucceeds(getDoc(ref()))).data(), old);
+    const rewritten = habit({ times: [], routines: [ROUTINE], updatedAt: NOW + 1 });
+    await assertSucceeds(setDoc(ref(), rewritten));
+    assert.deepEqual(await stored(`users/alice/habits/${HABIT}`), rewritten);
+  });
+
+  test('an app still on v1.3 is refused cleanly when it saves a habit, and nothing is changed (R5)', async () => {
+    // v1.3 saveHabit: a full overwrite with `routine` and no `routines`, as a create and over a stored habit.
+    const v13 = { ...without(habit(), 'routines'), routine: '' };
+    await assertFails(setDoc(ref(), v13));
+    await assertFails(setDoc(ref(), { ...v13, routine: ROUTINE, times: [] }));
+    assert.equal(await stored(`users/alice/habits/${HABIT}`), null);
+    await seed({ [`users/alice/habits/${HABIT}`]: habit() });
+    await assertFails(setDoc(ref(), v13));
+    await assertFails(setDoc(ref(), { routine: ROUTINE, times: [], updatedAt: NOW + 1 }, { merge: true }));
+    assert.deepEqual(await stored(`users/alice/habits/${HABIT}`), habit());
+    // A v1.3 merge write (delete, restore, reorder) on a habit still stored in the v1.3 shape is refused too.
+    const old = { ...without(habit(), 'routines'), routine: '' };
+    await seed({ [`users/alice/habits/${HABIT}`]: old });
+    await assertFails(setDoc(ref(), { deletedAt: NOW + 1, updatedAt: NOW + 1 }, { merge: true }));
+    await assertFails(setDoc(ref(), { order: 4, updatedAt: NOW + 1 }, { merge: true }));
+    assert.deepEqual(await stored(`users/alice/habits/${HABIT}`), old);
+    // Counts still go in.
+    await assertSucceeds(tap(alice, 'alice', '2026-11-12'));
   });
 
   test('a soft delete (deletedAt a number) and a restore (deletedAt null) are allowed', async () => {
@@ -228,13 +260,21 @@ describe('3. habits', () => {
     'an updatedAt that is a Firestore Timestamp': { updatedAt: Timestamp.fromMillis(NOW) },
     'an unknown extra field': { colour: 'red' },
     'the id stored as a field': { id: HABIT },
-    'a routine that is not text': { routine: 7, times: [] },
-    'a routine that is null': { routine: null },
-    'a routine that is a list': { routine: [ROUTINE], times: [] },
-    'a routine id of 19 characters': { routine: ROUTINE.slice(1), times: [] },
-    'a routine id of 21 characters': { routine: `${ROUTINE}2`, times: [] },
-    'a routine id with a character that is not a letter or digit': { routine: 'routine-000000000001', times: [] },
-    'both a routine and reminder times': { routine: ROUTINE },
+    '6 routine ids': { routines: [...ROUTINES5, 'routine0000000000006'], times: [] },
+    'a routine id listed twice': { routines: [ROUTINE, ROUTINE], times: [] },
+    'a routine id of 19 characters': { routines: [ROUTINE.slice(1)], times: [] },
+    'a routine id of 21 characters': { routines: [`${ROUTINE}2`], times: [] },
+    'a routine id with a character that is not a letter or digit': { routines: ['routine-000000000001'], times: [] },
+    'a bad routine id in the fifth place': { routines: [...ROUTINES5.slice(0, 4), 'routine-000000000005'], times: [] },
+    'a routine id that is not a string': { routines: [7], times: [] },
+    'a routine id that is null': { routines: [null], times: [] },
+    'a routine id that is a map': { routines: [{ id: ROUTINE }], times: [] },
+    'routines that are not a list (text)': { routines: ROUTINE, times: [] },
+    'routines that are not a list (map)': { routines: { 0: ROUTINE }, times: [] },
+    'routines that are null': { routines: null },
+    'routines together with reminder times': { routines: [ROUTINE] },
+    'the v1.3 field routine beside routines': { routine: '' },
+    'the v1.3 field routine (an id) beside routines': { routine: ROUTINE, routines: [ROUTINE], times: [] },
   };
   for (const [label, over] of Object.entries(INVALID)) {
     test(`refused: ${label}`, async () => {
@@ -247,11 +287,18 @@ describe('3. habits', () => {
     });
   }
 
-  test('refused: a habit with any one of the eleven fields missing, routine included', async () => {
+  test('refused: a habit with any one of the eleven fields missing, routines included', async () => {
     const fields = Object.keys(habit());
     assert.equal(fields.length, 11);
-    assert.ok(fields.includes('routine'));
+    assert.ok(fields.includes('routines'));
     for (const field of fields) await named(field, assertFails(setDoc(ref(), without(habit(), field))));
+  });
+
+  test('refused: a habit with the v1.3 field routine in place of routines (R5 check 1)', async () => {
+    for (const routine of ['', ROUTINE]) {
+      const v13 = { ...without(habit({ times: [] }), 'routines'), routine };
+      await named(`routine '${routine}'`, assertFails(setDoc(ref(), v13)));
+    }
   });
 
   test('refused: a partial merge write to a habit that does not exist; no document is created', async () => {

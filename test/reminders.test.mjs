@@ -113,8 +113,10 @@ const habit = (over = {}) => ({
 const routine = (over = {}) => ({ name: 'Morning', times: ['09:00'], order: 1, deletedAt: null, updatedAt: 1, ...over });
 /** A routine id as the store makes them: 20 letters or digits. */
 const rid = (n) => `routine${String(n).padStart(13, '0')}`;
-/** Fields of a habit in routine `id`: no reminder times of its own. */
-const member = (id, over = {}) => ({ target: 1, times: [], routine: id, ...over });
+/** Fields of a habit in routine `id` (or in each of a list of ids): no reminder times of its own. */
+const member = (id, over = {}) => ({ target: 1, times: [], routines: [].concat(id), ...over });
+/** The same habit as v1.3 of the app stored it: `routine: <id>` (or '' for none) and no `routines`. */
+const memberV13 = (id, over = {}) => ({ target: 1, times: [], routine: id, ...over });
 
 /** Adds a user: habits = { id: fields }, routines = { id: fields }, logs = { 'YYYY-MM-DD': { habitId: count } },
  *  devices = ids or [id, updatedAt]. */
@@ -1018,6 +1020,109 @@ test('R6. junk routine documents are ignored: nothing crashes, their habits are 
   ]);
   assert.deepEqual(lines, ['Slot 2026-11-13T09:00Z, window 30 min: 1 user, 3 reminders due, 0 skipped (already done), 1 device, '
     + '1 invalid habit ignored, 7 invalid routines ignored.']);
+});
+
+test('R5 (v1.4). "Brush teeth" (target 2) in Morning (07:00) and Evening (21:00): the k-th rule decides each reminder', async () => {
+  const MORNING = rid(51), EVENING = rid(52);
+  const user = (count) => ({
+    routines: { [MORNING]: { name: 'Morning', times: ['07:00'] }, [EVENING]: { name: 'Evening', times: ['21:00'], order: 2 } },
+    habits: { teeth: member([EVENING, MORNING], { name: 'Brush teeth', target: 2 }) }, // stored order of ids does not matter
+    logs: count ? { '2026-11-13': { teeth: count } } : {},
+    devices: ['fid-alice-phone'],
+  });
+  const reminder = async (count, h) => {
+    const w = addUser(worldAt(at(h - 1, 30)), 'uid-alice', user(count));
+    const lines = [];
+    const result = await go(w, at(h), { log: (line) => { lines.push(line); log(line); } });
+    for (const line of lines) {
+      for (const secret of ['Morning', 'Evening', 'Brush teeth', MORNING, EVENING, 'teeth']) assert.ok(!line.includes(secret), line);
+    }
+    return { result, bodies: w.pushes.map((p) => [p.data.tag, p.data.body]) };
+  };
+  const one = (sent, skipped) => ({ sent, skipped, failed: 0, removed: 0 });
+  const counts = ({ result: { sent, skipped, failed, removed } }) => ({ sent, skipped, failed, removed });
+  // no count yet: both list it
+  let r = await reminder(0, 7);
+  assert.deepEqual([counts(r), r.bodies], [one(1, 0), [[MORNING, '1 left: Brush teeth']]]);
+  r = await reminder(0, 21);
+  assert.deepEqual([counts(r), r.bodies], [one(1, 0), [[EVENING, '1 left: Brush teeth']]]);
+  // after one tap: done in Morning (the 1st of its 2 routines), so no Morning message (counted as skipped); Evening still lists it
+  r = await reminder(1, 7);
+  assert.deepEqual([counts(r), r.bodies], [one(0, 1), []]);
+  r = await reminder(1, 21);
+  assert.deepEqual([counts(r), r.bodies], [one(1, 0), [[EVENING, '1 left: Brush teeth']]]);
+  // after two taps: neither lists it
+  r = await reminder(2, 7);
+  assert.deepEqual([counts(r), r.bodies], [one(0, 1), []]);
+  r = await reminder(2, 21);
+  assert.deepEqual([counts(r), r.bodies], [one(0, 1), []]);
+});
+
+test('R5 (v1.4). a shared habit is listed in each routine still waiting for it, beside the routine\'s other habits', async () => {
+  const MORNING = rid(53), EVENING = rid(54);
+  const w = addUser(worldAt(at(8, 30)), 'uid-alice', {
+    routines: { [MORNING]: { name: 'Morning', times: ['09:00'] }, [EVENING]: { name: 'Evening', times: ['09:00'], order: 2 } },
+    habits: {
+      teeth: member([MORNING, EVENING], { name: 'Brush teeth', target: 2, order: 2 }),
+      pills: member(MORNING, { name: 'Take pills', order: 1 }),
+      floss: member(EVENING, { name: 'Floss', order: 3 }),
+    },
+    logs: { '2026-11-13': { teeth: 1 } },
+    devices: ['fid-alice-phone'],
+  });
+  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 2, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual(w.pushes.map((p) => [p.data.title, p.data.body]), [['Morning', '1 left: Take pills'], ['Evening', '2 left: Brush teeth, Floss']]);
+});
+
+test('R5 (v1.4). habits still stored in the v1.3 shape get exactly the reminders of v1.3; the job never writes a habit', async () => {
+  const user = (as) => ({
+    routines: { [rid(1)]: { name: 'Morning', times: ['09:00', '21:00'] }, [rid(2)]: { name: 'Shelved', deletedAt: 5, order: 2 } },
+    habits: {
+      aTeeth: as(rid(1), { name: 'Brush teeth', order: 2 }),
+      zPills: as(rid(1), { name: 'Take pills', order: 1 }),
+      bed: as(rid(1), { name: 'Make bed', order: 3 }),
+      shelved: as(rid(2), { name: 'Old habit' }), // its only routine is deleted: loose, and it has no times
+      h1: { unit: 'glasses', ...(as === memberV13 ? { routine: '' } : { routines: [] }) },
+    },
+    logs: { '2026-11-13': { bed: 1 } },
+    devices: ['fid-alice-phone'],
+  });
+  const old = addUser(worldAt(at(8, 30)), 'uid-alice', user(memberV13));
+  const now = addUser(worldAt(at(8, 30)), 'uid-alice', user(member));
+  assert.ok(old.docs.get('users/uid-alice/habits/aTeeth').data.routine === rid(1) && !('routines' in old.docs.get('users/uid-alice/habits/aTeeth').data));
+  const result = await go(old, at(9));
+  assert.deepEqual(result, { slot: at(9), sent: 2, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual(await go(now, at(9)), result);
+  assert.deepEqual(old.pushes, now.pushes);
+  assert.deepEqual(old.pushes.map((p) => p.data), [
+    { title: 'Morning', body: '2 left: Take pills, Brush teeth', tag: rid(1), url: '/' },
+    { title: 'Drink water', body: 'Not started today. Target: 3 glasses.', tag: 'h1', url: '/' },
+  ]);
+  assert.deepEqual(old.ops('setDoc'), [BOOKMARK], 'only the bookmark is written');
+});
+
+test('R5 (v1.4). a habit whose every routine is deleted sends nothing; one in any live routine never gets a push of its own', async () => {
+  const w = addUser(worldAt(at(8, 30)), 'uid-alice', {
+    routines: {
+      [rid(61)]: { name: 'Gone one', deletedAt: 5 }, [rid(62)]: { name: 'Gone two', deletedAt: 6, order: 2 },
+      [rid(63)]: { name: 'Evening', times: ['21:00'], order: 3 },
+    },
+    habits: {
+      orphan: member([rid(61), rid(62)], { name: 'Orphan' }), // no live routine and no times: nothing at all
+      half: member([rid(61), rid(63)], { name: 'Half' }), // in Evening only, which is not due at 09:00
+      unknown: member([rid(99), rid(63)], { name: 'Unknown too' }), // an id of a routine that does not exist is ignored
+    },
+    devices: ['fid-alice-phone'],
+  });
+  assert.deepEqual(await go(w, at(9)), { slot: at(9), sent: 0, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual([w.pushes, w.ops('getDoc'), w.ops('queryEqual')], [[], [BOOKMARK], []]);
+  const v = addUser(worldAt(at(20, 30)), 'uid-alice', {
+    routines: { [rid(61)]: { name: 'Gone one', deletedAt: 5 }, [rid(63)]: { name: 'Evening', times: ['21:00'], order: 3 } },
+    habits: { orphan: member([rid(61)], { name: 'Orphan' }), half: member([rid(61), rid(63)], { name: 'Half' }) },
+    devices: ['fid-alice-phone'],
+  });
+  assert.deepEqual(await go(v, at(21)), { slot: at(21), sent: 1, skipped: 0, failed: 0, removed: 0 });
+  assert.deepEqual(v.pushes.map((p) => [p.data.tag, p.data.body]), [[rid(63), '1 left: Half']]);
 });
 
 test('9. nothing sensitive in the log: no habit name, routine name or id, uid, device id, email or server text', async () => {
