@@ -10,8 +10,8 @@ import {
   addTimes, overLimitMessage, quickFill, quickFillSummary, pushNote, openEditor, formChanged, NEW_ROUTINE, checkRoutineName,
 } from '../src/ui/editor.js';
 import { openRoutine, blankRoutine, routineFormOf, checkRoutine, routineChanged, membersText } from '../src/ui/routine.js';
-import { movedHabits, movedRoutines, canReorder } from '../src/ui/today.js';
-import { groupHabits } from '../shared/logic.js';
+import { movedRoutines, canReorder, shareText, render as renderToday } from '../src/ui/today.js';
+import { groupHabits, moveHabitIds } from '../shared/logic.js';
 
 const form = (changes = {}) => ({ ...blankForm(), name: 'Drink water', ...changes });
 const hours = (from, to, step = 1) => {
@@ -378,20 +378,13 @@ test('the editor input creates a routine and puts the habit in it and in the che
   assert.deepEqual(store.getState().habits.find((h) => h.id === id).routines, [evening]);
 });
 
-// ---------- Reorder mode on Today (v1.3) ----------
+// ---------- Today: Reorder mode (v1.3) and habits in several routines (v1.4) ----------
 
-test('Move up and Move down: every live id in the new order, moves stay inside a section', () => {
+test('Move up and Move down of routines, and when Reorder has anything to do', () => {
   const A = 'A'.repeat(20), B = 'B'.repeat(20);
   const routines = [{ id: A, name: 'Morning', order: 1, deletedAt: null }, { id: B, name: 'Evening', order: 2, deletedAt: null }];
-  const habit = (id, order, routine = '') => ({ id, name: id, order, routine, archived: false, deletedAt: null });
-  const habits = [habit('loose1', 1), habit('a1', 2, A), habit('loose2', 3), habit('a2', 4, A), habit('b1', 5, B)];
-  // Display order: Morning (a1, a2), Evening (b1), Other habits (loose1, loose2).
-  assert.deepEqual(movedHabits(habits, routines, 'a2', -1), ['a2', 'a1', 'b1', 'loose1', 'loose2']);
-  assert.deepEqual(movedHabits(habits, routines, 'loose1', 1), ['a1', 'a2', 'b1', 'loose2', 'loose1']);
-  assert.equal(movedHabits(habits, routines, 'a1', -1), null, 'the first of its section');
-  assert.equal(movedHabits(habits, routines, 'a2', 1), null, 'the last of its section, not into the next one');
-  assert.equal(movedHabits(habits, routines, 'b1', 1), null);
-  assert.equal(movedHabits(habits, routines, 'nobody', 1), null);
+  const habit = (id, order, ids = []) => ({ id, name: id, order, routines: ids, archived: false, deletedAt: null });
+  const habits = [habit('loose1', 1), habit('a1', 2, [A]), habit('b1', 3, [B])];
   assert.deepEqual(movedRoutines(routines, B, -1), [B, A]);
   assert.equal(movedRoutines(routines, A, -1), null);
   assert.equal(movedRoutines(routines, B, 1), null);
@@ -400,14 +393,64 @@ test('Move up and Move down: every live id in the new order, moves stay inside a
   assert.equal(canReorder(groupHabits([habit('x', 1), habit('y', 2)], []), []), true);
 });
 
-test('a move through the store keeps the order after the swap', () => {
+/** A store with Morning (Take vitamins, Brush teeth) and Evening (Brush teeth, Floss), and one loose habit. */
+function teethStore() {
   const store = openStore();
-  const r = store.saveRoutine({ name: 'Morning', times: [] });
-  const ids = ['Pills', 'Teeth', 'Water'].map((name, i) => store.saveHabit({ name, period: 'day', target: 1, unit: '', times: [], routine: i < 2 ? r : '' }));
-  const { habits, routines } = store.getState();
-  store.reorderHabits(movedHabits(habits, routines, ids[1], -1));
-  const after = store.getState();
-  assert.deepEqual(groupHabits(after.habits, after.routines).map((g) => g.habits.map((h) => h.name)), [['Teeth', 'Pills'], ['Water']]);
+  const morning = store.saveRoutine({ name: 'Morning', times: [] });
+  const evening = store.saveRoutine({ name: 'Evening', times: [] });
+  const add = (name, routines, target = 1) => store.saveHabit({ name, period: 'day', target, unit: '', times: [], routines });
+  const ids = { vitamins: add('Take vitamins', [morning]), teeth: add('Brush teeth', [morning, evening], 2), floss: add('Floss', [evening]), water: add('Water', []) };
+  return { store, morning, evening, ids };
+}
+const ctxFor = (store) => ({ store, today: () => '2026-11-03' });
+const namesBySection = (state) => groupHabits(state.habits, state.routines).map((g) => g.habits.map((h) => h.name));
+
+test('a move inside one section goes through moveHabitIds and the store, and stays inside that section', () => {
+  const { store, evening, ids } = teethStore();
+  // Brush teeth is second in Morning and first in Evening; moving it down in Evening puts it after Floss there.
+  let { habits, routines } = store.getState();
+  store.reorderHabits(moveHabitIds(habits, routines, evening, ids.teeth, 1));
+  assert.deepEqual(namesBySection(store.getState()), [['Take vitamins', 'Brush teeth'], ['Floss', 'Brush teeth'], ['Water']]);
+  ({ habits, routines } = store.getState());
+  assert.equal(moveHabitIds(habits, routines, evening, ids.teeth, 1), null, 'already last in Evening');
+  assert.equal(moveHabitIds(habits, routines, null, ids.water, -1), null, 'Water is alone in Other habits');
+});
+
+test('shareText: a habit in two routines says where it is done, by the k-th rule; others say nothing more', () => {
+  const { store, ids } = teethStore();
+  const sectionText = () => {
+    const { habits, routines, logs } = store.getState();
+    const teeth = habits.find((h) => h.id === ids.teeth), vitamins = habits.find((h) => h.id === ids.vitamins);
+    return [...routines.map((r) => shareText(teeth, r, routines, logs, '2026-11-03')), shareText(vitamins, routines[0], routines, logs, '2026-11-03'),
+      shareText(teeth, null, routines, logs, '2026-11-03')];
+  };
+  assert.deepEqual(sectionText(), ['still to do for Morning', 'still to do for Evening', '', '']);
+  store.addCount('2026-11-03', ids.teeth, 1);
+  assert.deepEqual(sectionText(), ['done for Morning', 'still to do for Evening', '', '']);
+  store.addCount('2026-11-03', ids.teeth, 1);
+  assert.deepEqual(sectionText(), ['done for Morning', 'done for Evening', '', '']);
+});
+
+test('Today renders a shared habit in each of its sections, with the same buttons and unique keys', () => {
+  const { store, ids } = teethStore();
+  store.addCount('2026-11-03', ids.teeth, 1);
+  store.addCount('2026-11-03', ids.vitamins, 1);
+  const html = renderToday(store.getState(), ctxFor(store));
+  assert.equal(html.match(/aria-label="Add one: Brush teeth"/g)?.length, 2);
+  assert.equal(html.match(/aria-label="Undo one: Brush teeth"/g)?.length, 2);
+  assert.equal(html.match(/aria-label="Add one: Take vitamins"/g)?.length, 1);
+  assert.match(html, /1 of 2 today<span class="habit-share">.*?done for Morning/);
+  assert.match(html, /1 of 2 today<span class="habit-share">.*?still to do for Evening/);
+  // The headings use routineProgress; the top line counts Brush teeth once (1 of 4: only Take vitamins is hit).
+  assert.match(html, /2 of 2 done<\/p>/);
+  assert.match(html, /0 of 2 done<\/p>/);
+  assert.match(html, /<strong class="num">1 of 4<\/strong> habits done/);
+  const keys = [...html.matchAll(/<li class="card habit[^"]*" data-key="([^"]+)"/g)].map((m) => m[1]);
+  assert.equal(keys.length, 5);
+  assert.equal(new Set(keys).size, 5, 'keys name the section, so they are unique on the page');
+  // Each section is a region named by its routine (or "Other habits").
+  for (const name of ['Morning', 'Evening']) assert.match(html, new RegExp(`aria-labelledby="(routine-name-[A-Za-z0-9]+)"[\\s\\S]*?id="\\1">${name}<`));
+  assert.match(html, /aria-labelledby="routine-title-loose"[\s\S]*?id="routine-title-loose">Other habits</);
 });
 
 // ---------- the routine editor (v1.3) ----------
