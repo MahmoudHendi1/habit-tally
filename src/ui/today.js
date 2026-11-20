@@ -101,7 +101,7 @@ function moveButtons(kind, id, name, at, section = '') {
 }
 
 /** For a habit in several routines, shown in one of them: whether it is done there by the k-th rule
- *  (`doneIn`), as " · done for Morning" or " · still to do for Evening". '' for a habit in one routine or none,
+ *  (`doneIn`), as "done for Morning" or "still to do for Evening", shown after the count with a comma. '' for a habit in one routine or none,
  *  where the count already says it. Plain text.
  *  @param {Habit} habit @param {State['routines'][number] | null} routine the section's routine
  *  @param {State['routines']} routines @param {State['logs']} logs @param {string} day */
@@ -124,7 +124,7 @@ function habitCard(habit, logs, day, today, { tag, move, section, share }) {
       <${tag} class="habit-name"><button type="button" class="habit-edit" data-action="edit" data-id="${id}">
         <span>${name}<span class="sr-only">, edit habit</span></span>${icon('edit', 16)}</button></${tag}>
       ${tallyMarks(periodCount(habit, logs, day), habit.target)}
-      <p class="habit-progress num">${done ? icon('check', 18) : ''}<span>${esc(main)}${share ? `<span class="habit-share"><span aria-hidden="true"> · </span><span class="sr-only">, </span>${esc(share)}</span>` : ''}</span>${done ? '<span class="sr-only">, done</span>' : ''}</p>
+      <p class="habit-progress num">${done ? icon('check', 18) : ''}<span>${esc(main)}${share ? `<span class="habit-share">, ${esc(share)}</span>` : ''}</span>${done ? '<span class="sr-only">, done</span>' : ''}</p>
       ${extra ? `<p class="muted small num">${esc(extra)}</p>` : ''}
     </div>
     ${move ? moveButtons('habit', id, name, move, section) : `<div class="habit-controls">
