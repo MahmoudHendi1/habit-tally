@@ -2,10 +2,13 @@
 //
 // Data shapes
 //   habit: { id, name, period: 'day' | 'week', target, unit, times: ['09:00'], created: 'YYYY-MM-DD',
-//            archived, deletedAt, order, updatedAt, routine: '' | routineId }   (full contract: docs/contracts.md)
+//            archived, deletedAt, order, updatedAt, routines: [routineId, ...] }   (full contract: docs/contracts.md)
+//            Data stored before contract v1.4 has `routine: '' | routineId` instead of `routines`; every function
+//            here reads both (routineIdsOf).
 //   routine: { id, name, times: ['07:00'], order, deletedAt, updatedAt }   a named, ordered list of habits done
-//            together. A habit is "in" a routine only while that routine exists and is not deleted; otherwise
-//            it is loose, like a habit with routine ''.
+//            together. A habit can be in up to five routines. It is "in" a routine only while that routine
+//            exists and is not deleted; a habit in no live routine is loose, like a habit with routines [].
+//            One count per habit per day, whichever section it is tapped in.
 //   logs:  { 'YYYY-MM': { 'YYYY-MM-DD': { [habitId]: count } } }
 
 export const SLOT_MINUTES = 30;
@@ -14,7 +17,7 @@ export const SLOT_MS = SLOT_MINUTES * 60 * 1000;
 /** Limits shared by the editor, both stores and (where expressible) the security rules. */
 export const LIMITS = Object.freeze({
   nameMax: 60, unitMax: 20, targetMin: 1, targetMax: 50, timesMax: 48, habitsMax: 50, backDays: 7,
-  routineNameMax: 40, routinesMax: 20,
+  routineNameMax: 40, routinesMax: 20, routinesPerHabitMax: 5,
 });
 
 export const pad = (n) => String(n).padStart(2, '0');
@@ -158,23 +161,41 @@ function timesProblems(times) {
   return [];
 }
 
+/** The routine ids a habit (or editor input) names, whether or not those routines exist: `routines` when it
+ *  is an array (strings trimmed, blanks and repeats dropped, first occurrence kept), otherwise the old field
+ *  `routine` (a non-blank string gives one id), otherwise []. This is how data stored before contract v1.4 is
+ *  read: `{ routine: 'abc' }` is `['abc']`, `{ routine: '' }` is []. Membership is still decided by routinesOf. */
+export function routineIdsOf(habit) {
+  const list = Array.isArray(habit?.routines) ? habit.routines : [habit?.routine];
+  return [...new Set(list.filter((id) => typeof id === 'string').map((id) => id.trim()).filter(Boolean))];
+}
+
 /** Tidy what the editor collected: trims text, whole-number target, snapped unique sorted times.
- *  `routine` is '' or a routine id; a habit in a routine has no reminder times of its own, so they are emptied.
+ *  `routines` is routineIdsOf(input); a habit in a routine has no reminder times of its own, so they are emptied.
  *  Returns only the fields a person edits; ids, dates and order are set by the store. */
 export function cleanHabit(input) {
-  const routine = typeof input?.routine === 'string' ? input.routine.trim() : '';
+  const routines = routineIdsOf(input);
   return {
     name: cleanName(input?.name),
     period: input?.period === 'week' ? 'week' : 'day',
     target: Math.round(Number(input?.target)),
     unit: String(input?.unit ?? '').trim(),
-    times: routine ? [] : cleanTimes(input?.times),
-    routine,
+    times: routines.length ? [] : cleanTimes(input?.times),
+    routines,
   };
 }
 
+/** The routine ids validateHabit checks: `routines` when present; otherwise the old `routine` field ('' or
+ *  missing is none). null when the value cannot be a list of ids. */
+function routineField(h) {
+  if (h.routines !== undefined && h.routines !== null) return Array.isArray(h.routines) ? h.routines : null;
+  if (h.routine === undefined || h.routine === null || h.routine === '') return [];
+  return [h.routine];
+}
+
 /** Problems with a habit, as short sentences for the editor. Empty list = valid. Run on cleanHabit output.
- *  A missing `routine` counts as ''. */
+ *  `routines`: at most LIMITS.routinesPerHabitMax ids of 20 letters or digits, none twice. A habit stored before
+ *  v1.4 (old `routine` field, no `routines`) is checked as v1.3 did; missing both counts as []. */
 export function validateHabit(h) {
   const out = [];
   if (!h || typeof h !== 'object') return ['Habit is missing.'];
@@ -186,9 +207,11 @@ export function validateHabit(h) {
   }
   if (typeof h.unit !== 'string' || h.unit.length > LIMITS.unitMax) out.push(`Keep the unit to ${LIMITS.unitMax} characters.`);
   out.push(...timesProblems(h.times));
-  const routine = h.routine ?? ''; // a habit stored before routines existed has no such field
-  if (routine !== '' && !(typeof routine === 'string' && ID_RE.test(routine))) out.push('Choose a routine from the list.');
-  else if (routine !== '' && Array.isArray(h.times) && h.times.length > 0) out.push('A habit in a routine takes its reminder times from the routine.');
+  const ids = routineField(h);
+  if (!ids || ids.some((id) => !(typeof id === 'string' && ID_RE.test(id)))) out.push('Choose a routine from the list.');
+  else if (ids.length > LIMITS.routinesPerHabitMax) out.push(`A habit can be in at most ${LIMITS.routinesPerHabitMax} routines.`);
+  else if (new Set(ids).size !== ids.length) out.push('A routine is chosen twice.');
+  else if (ids.length > 0 && Array.isArray(h.times) && h.times.length > 0) out.push('A habit in a routine takes its reminder times from the routine.');
   if ('created' in h && !DAY_RE.test(h.created || '')) out.push('Start date is not a valid day.');
   return out;
 }
@@ -225,24 +248,52 @@ export function sortRoutines(routines) {
       || byText(String(a.id), String(b.id)));
 }
 
-/** The live routine a habit belongs to, or null when the habit is loose: `routine` is '' or missing, or it
- *  names a routine that does not exist or is deleted. The one test of membership for the app and the job. */
-export function routineOf(habit, routines) {
-  const id = habit?.routine;
-  if (typeof id !== 'string' || id === '') return null;
-  return objects(routines).find((r) => r.id === id && !r.deletedAt) ?? null;
+/** The live routines a habit is in, in sortRoutines (display) order: the routines of `routines` that exist, are
+ *  not deleted and are named by routineIdsOf(habit). Ids naming a missing or deleted routine are ignored; []
+ *  means the habit is loose. The one test of membership for the app and the job. */
+export function routinesOf(habit, routines) {
+  const ids = routineIdsOf(habit);
+  if (!ids.length) return [];
+  const seen = new Set();
+  return sortRoutines(routines).filter((r) => ids.includes(r.id) && !seen.has(r.id) && seen.add(r.id));
 }
 
-/** The sections of Today and Progress: one { routine, habits } per live routine in sortRoutines order (also
- *  when it has no habits), then { routine: null, habits } with the loose habits. The last entry is present
+/** Deprecated (v1.4): the first of routinesOf(habit, routines), or null. Kept only until the v1.3 callers
+ *  (src/ui/editor.js, test/store-contract.mjs, the emulator store test) use routinesOf; then removed. */
+export function routineOf(habit, routines) {
+  return routinesOf(habit, routines)[0] ?? null;
+}
+
+/** The sections of Today: one { routine, habits } per live routine in sortRoutines order (also when it has no
+ *  habits), then { routine: null, habits } with the loose habits. A habit in several live routines is in the
+ *  entry of each; a habit is in the loose entry only when it is in no live routine. The last entry is present
  *  when there are loose habits or no live routine at all. Habits inside an entry are in sortHabits order. */
 export function groupHabits(habits, routines) {
   const live = sortRoutines(routines);
   const sorted = sortHabits(objects(habits));
-  const out = live.map((routine) => ({ routine, habits: sorted.filter((h) => routineOf(h, live) === routine) }));
-  const loose = sorted.filter((h) => !routineOf(h, live));
+  const member = new Map(sorted.map((h) => [h, new Set(routinesOf(h, live))]));
+  const out = live.map((routine) => ({ routine, habits: sorted.filter((h) => member.get(h).has(routine)) }));
+  const loose = sorted.filter((h) => member.get(h).size === 0);
   if (loose.length || !live.length) out.push({ routine: null, habits: loose });
   return out;
+}
+
+/** The argument of `store.reorderHabits()` for moving one habit one place (`delta` -1 up, +1 down) inside one
+ *  section of groupHabits: `routineId` is the section's routine id, or null for the loose section. Returns every
+ *  live habit id in sortHabits order with the habit taken out and put back just before (up) or just after (down)
+ *  its neighbour in that section, so no other habit changes place relative to any other. A habit in several
+ *  routines has one `order`, so the move can also change its place in its other sections (accepted, contract
+ *  v1.4). null when the habit is not in that section, is first (up) or last (down) there, or delta is not ±1. */
+export function moveHabitIds(habits, routines, routineId, habitId, delta) {
+  if (delta !== 1 && delta !== -1) return null;
+  const entry = groupHabits(habits, routines).find((g) => (g.routine?.id ?? null) === (routineId || null));
+  const list = entry ? entry.habits : [];
+  const at = list.findIndex((h) => h.id === habitId);
+  const next = at < 0 ? undefined : list[at + delta];
+  if (!next) return null;
+  const ids = sortHabits(objects(habits)).map((h) => h.id).filter((id) => id !== habitId);
+  ids.splice(ids.indexOf(next.id) + (delta > 0 ? 1 : 0), 0, habitId);
+  return ids;
 }
 
 // ---------- reminder times ----------
@@ -338,10 +389,11 @@ export function dueWindows(from, slot, tz) {
   return out;
 }
 
-/** Whether a live habit still has something to do on `day`: the one test behind habit and routine reminders. */
-function stillToDo(h, logs, day) {
+/** Whether a live habit still has something to do on `day`: the one test behind habit and routine reminders.
+ *  `done` is the test of done (isHit for a habit's own reminder, doneIn for a routine's). */
+function stillToDo(h, logs, day, done = isHit(h, logs, day)) {
   if (h.archived || h.deletedAt) return false;
-  if (isHit(h, logs, day)) return false;
+  if (done) return false;
   // A weekly habit already logged today has had its turn for the day.
   if (isWeekly(h) && countOn(logs, h.id, day) > 0) return false;
   return true;
@@ -354,23 +406,55 @@ const hasTime = (x, want) => Array.isArray(x.times) && x.times.some((t) => want.
 export function dueHabits(habits, logs, day, times, routines) {
   const want = new Set([].concat(times || []));
   const live = sortRoutines(routines);
-  return habits.filter((h) => !routineOf(h, live) && hasTime(h, want) && stillToDo(h, logs, day));
+  return habits.filter((h) => !routinesOf(h, live).length && hasTime(h, want) && stillToDo(h, logs, day));
+}
+
+/** Whether `habit` counts as done in `routine` on `day` (the k-th occurrence rule). List the habit's n live
+ *  routines in display order (routinesOf); if `routine` is the k-th of them (1-based), a daily habit is done
+ *  there once the day's count is at least min(k, target), and in the last one (k = n) once the target is hit.
+ *  So "Brush teeth", target 2, in Morning and Evening is done in Morning after the first tap and in Evening after
+ *  the second; with target 1, one tap does both; a habit in one routine needs its whole target there (as in
+ *  v1.3). A weekly habit is done in every routine once its week's total reaches the target (isHit). false when
+ *  the habit is not in `routine`, or `routine` is deleted or not among `routines` (pass the whole list). */
+export function doneIn(habit, routine, routines, logs, day) {
+  if (!habit || typeof habit !== 'object' || !routine || typeof routine !== 'object' || routine.deletedAt) return false;
+  const mine = routinesOf(habit, routines);
+  const k = mine.findIndex((r) => r.id === routine.id) + 1;
+  if (k === 0) return false;
+  if (isWeekly(habit) || k === mine.length) return isHit(habit, logs, day);
+  return countOn(logs, habit.id, day) >= Math.min(k, habit.target);
+}
+
+/** The live, unarchived habits of a live routine, in sortHabits order. */
+function membersOf(routine, habits, routines) {
+  if (!routine || typeof routine !== 'object' || routine.deletedAt) return [];
+  const live = sortRoutines(routines);
+  return sortHabits(objects(habits)).filter((h) => !h.archived && routinesOf(h, live).some((r) => r.id === routine.id));
 }
 
 /** The habits of a live routine that still have something to do on `day`, in routine (sortHabits) order:
- *  not archived or deleted, target not hit in the habit's own period (the day, or the Monday-to-Sunday week),
- *  and for a weekly habit nothing logged on `day` yet. [] for a deleted or missing routine. */
-export function routineLeft(routine, habits, logs, day) {
-  if (!routine || typeof routine !== 'object' || routine.deletedAt) return [];
-  return sortHabits(objects(habits).filter((h) => routineOf(h, [routine]))).filter((h) => stillToDo(h, logs, day));
+ *  not archived or deleted, not doneIn this routine, and for a weekly habit nothing logged on `day` yet.
+ *  `routines` is the whole list (state.routines), which must hold `routine`: it decides membership and k.
+ *  [] for a deleted or missing routine. */
+export function routineLeft(routine, habits, routines, logs, day) {
+  return membersOf(routine, habits, routines)
+    .filter((h) => stillToDo(h, logs, day, doneIn(h, routine, routines, logs, day)));
+}
+
+/** "x of y done" for a routine's section heading on `day`: total = the routine's live, unarchived habits,
+ *  done = those doneIn the routine. { done: 0, total: 0 } for a deleted or missing routine. */
+export function routineProgress(routine, habits, routines, logs, day) {
+  const members = membersOf(routine, habits, routines);
+  return { done: members.filter((h) => doneIn(h, routine, routines, logs, day)).length, total: members.length };
 }
 
 /** Routines that should send a reminder for local day `day`: live, with one of `times` ('HH:MM' or a list)
- *  among their reminder times and at least one habit left. Returns [{ routine, left }] in sortRoutines order. */
+ *  among their reminder times and at least one habit left (routineLeft, so the k-th occurrence rule of doneIn).
+ *  Returns [{ routine, left }] in sortRoutines order. */
 export function dueRoutines(routines, habits, logs, day, times) {
   const want = new Set([].concat(times || []));
   return sortRoutines(routines).filter((r) => hasTime(r, want))
-    .map((routine) => ({ routine, left: routineLeft(routine, habits, logs, day) }))
+    .map((routine) => ({ routine, left: routineLeft(routine, habits, routines, logs, day) }))
     .filter((d) => d.left.length > 0);
 }
 
