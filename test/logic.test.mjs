@@ -6,7 +6,7 @@ import {
   startDay,
   LIMITS, summary, recentDays, calendarWeeks, cleanHabit, validateHabit, sortHabits,
   cleanRoutine, validateRoutine, sortRoutines, routineOf, groupHabits, routineLeft, dueRoutines, routineReminderText,
-  REMINDER_BODY_MAX,
+  REMINDER_BODY_MAX, routineIdsOf, routinesOf, doneIn, routineProgress, moveHabitIds,
 } from '../shared/logic.js';
 
 const logsOf = (entries) => {
@@ -200,7 +200,7 @@ test('calendarWeeks: 15 Monday-first columns ending this week', () => {
 
 test('cleanHabit and validateHabit', () => {
   const clean = cleanHabit({ name: '  Drink   water ', period: 'day', target: '8', unit: ' glasses ', times: ['09:10', '09:00', '15:00'], junk: 1 });
-  assert.deepEqual(clean, { name: 'Drink water', period: 'day', target: 8, unit: 'glasses', times: ['09:00', '15:00'], routine: '' });
+  assert.deepEqual(clean, { name: 'Drink water', period: 'day', target: 8, unit: 'glasses', times: ['09:00', '15:00'], routines: [] });
   assert.deepEqual(validateHabit(clean), []);
   assert.deepEqual(validateHabit({ ...clean, created: '2026-11-13' }), []);
   assert.equal(validateHabit(cleanHabit({ name: '', target: 3 })).length, 1);
@@ -277,30 +277,71 @@ test('input hardening: snapTime, cleanTimes, planRun', () => {
 const RID = 'morningRoutine000001'; // 20 letters or digits, like every id
 const morning = { id: RID, name: 'Morning', times: ['07:00', '07:30'], order: 1, deletedAt: null, updatedAt: 1 };
 const evening = { id: 'eveningRoutine000001', name: 'Evening', times: ['21:00'], order: 2, deletedAt: null, updatedAt: 1 };
-const pills = { id: 'p', name: 'Take pills', period: 'day', target: 1, unit: '', times: [], routine: RID, order: 1, created: '2026-11-02' };
-const teeth = { id: 't', name: 'Brush teeth', period: 'day', target: 2, unit: '', times: [], routine: RID, order: 2, created: '2026-11-02' };
-const run = { id: 'r', name: 'Run', period: 'week', target: 3, unit: '', times: [], routine: RID, order: 3, created: '2026-11-02' };
+const pills = { id: 'p', name: 'Take pills', period: 'day', target: 1, unit: '', times: [], routines: [RID], order: 1, created: '2026-11-02' };
+const teeth = { id: 't', name: 'Brush teeth', period: 'day', target: 2, unit: '', times: [], routines: [RID], order: 2, created: '2026-11-02' };
+const run = { id: 'r', name: 'Run', period: 'week', target: 3, unit: '', times: [], routines: [RID], order: 3, created: '2026-11-02' };
 const ids = (list) => list.map((x) => x.id);
 
 test('LIMITS: routine limits', () => {
   assert.equal(LIMITS.routineNameMax, 40);
   assert.equal(LIMITS.routinesMax, 20);
+  assert.equal(LIMITS.routinesPerHabitMax, 5);
   assert.equal(LIMITS.habitsMax, 50);
 });
 
 test('cleanHabit and validateHabit: a habit in a routine has no reminder times of its own', () => {
-  const clean = cleanHabit({ name: 'Take pills', target: 1, times: ['07:00'], routine: ` ${RID} ` });
-  assert.deepEqual(clean, { name: 'Take pills', period: 'day', target: 1, unit: '', times: [], routine: RID });
+  const clean = cleanHabit({ name: 'Take pills', target: 1, times: ['07:00'], routines: [` ${RID} `] });
+  assert.deepEqual(clean, { name: 'Take pills', period: 'day', target: 1, unit: '', times: [], routines: [RID] });
+  assert.equal('routine' in clean, false);
   assert.deepEqual(validateHabit(clean), []);
-  assert.deepEqual(cleanHabit({ name: 'A', target: 1, times: ['07:00'], routine: '' }).times, ['07:00']);
-  for (const junk of [undefined, null, 5, {}, ['x']]) assert.equal(cleanHabit({ name: 'A', target: 1, routine: junk }).routine, '');
-  // both a routine and times, or a routine that is not an id, is refused; a missing field counts as ''
+  assert.deepEqual(cleanHabit({ name: 'A', target: 1, times: ['07:00'], routines: [] }).times, ['07:00']);
+  for (const junk of [undefined, null, 5, {}, 'x', [5, null, '', '  ']]) {
+    assert.deepEqual(cleanHabit({ name: 'A', target: 1, routines: junk }).routines, [], String(junk));
+  }
+  // both a routine and times, or a routine that is not an id, is refused; a missing field counts as []
   assert.deepEqual(validateHabit({ ...clean, times: ['07:00'] }), ['A habit in a routine takes its reminder times from the routine.']);
-  for (const bad of ['morning', `${RID}x`, 'morning-routine-0001', 7, {}]) assert.equal(validateHabit({ ...clean, routine: bad }).length, 1, String(bad));
-  const { routine, ...old } = cleanHabit({ name: 'A', target: 1, times: ['07:00'] });
-  assert.equal(routine, '');
-  assert.deepEqual(validateHabit(old), []);
-  assert.deepEqual(validateHabit({ ...old, routine: null }), []);
+  for (const bad of ['morning', `${RID}x`, 'morning-routine-0001', 7, {}, null]) {
+    assert.deepEqual(validateHabit({ ...clean, routines: [RID, bad] }), ['Choose a routine from the list.'], String(bad));
+  }
+  for (const bad of [RID, 7, {}]) assert.deepEqual(validateHabit({ ...clean, routines: bad }), ['Choose a routine from the list.'], String(bad));
+  const { routines, ...none } = cleanHabit({ name: 'A', target: 1, times: ['07:00'] });
+  assert.deepEqual(routines, []);
+  assert.deepEqual(validateHabit(none), []);
+  assert.deepEqual(validateHabit({ ...none, routines: null }), []);
+});
+
+test('cleanHabit and validateHabit: several routines, at most five, none twice (v1.4)', () => {
+  const five = ['a', 'b', 'c', 'd', 'e'].map((c) => c.repeat(20));
+  const clean = cleanHabit({ name: 'Brush teeth', target: 2, times: ['07:00'], routines: [five[1], five[0], ` ${five[1]}`] });
+  assert.deepEqual(clean.routines, [five[1], five[0]]); // repeats dropped, first place kept, no sorting
+  assert.deepEqual(clean.times, []);
+  assert.deepEqual(validateHabit({ ...clean, routines: five }), []);
+  assert.deepEqual(validateHabit({ ...clean, routines: [...five, 'f'.repeat(20)] }), ['A habit can be in at most 5 routines.']);
+  assert.deepEqual(validateHabit({ ...clean, routines: [five[0], five[0]] }), ['A routine is chosen twice.']);
+  // cleaning never drops ids to meet the limit: six stay six, and validateHabit refuses them
+  assert.equal(cleanHabit({ name: 'A', target: 1, routines: [...five, 'f'.repeat(20)] }).routines.length, 6);
+});
+
+test('old data: a habit with the v1.3 field `routine` is read as routines (v1.4)', () => {
+  assert.deepEqual(routineIdsOf({ routine: RID }), [RID]);
+  assert.deepEqual(routineIdsOf({ routine: ` ${RID} ` }), [RID]);
+  for (const none of [{ routine: '' }, { routine: '  ' }, {}, { routine: 5 }, { routine: null }, null, undefined, 'x']) {
+    assert.deepEqual(routineIdsOf(none), [], JSON.stringify(none));
+  }
+  // `routines`, when it is an array, wins over `routine`
+  assert.deepEqual(routineIdsOf({ routines: [], routine: RID }), []);
+  assert.deepEqual(routineIdsOf({ routines: ['x', 'x', 7, ''], routine: RID }), ['x']);
+  assert.deepEqual(routineIdsOf({ routines: 'nope', routine: RID }), [RID]);
+  // the editor input and the stored habit of v1.3 still clean, validate and group
+  const old = { ...pills, routines: undefined, routine: RID };
+  assert.deepEqual(cleanHabit(old).routines, [RID]);
+  assert.deepEqual(validateHabit({ name: 'A', period: 'day', target: 1, unit: '', times: [], routine: RID }), []);
+  assert.deepEqual(validateHabit({ name: 'A', period: 'day', target: 1, unit: '', times: ['07:00'], routine: RID }),
+    ['A habit in a routine takes its reminder times from the routine.']);
+  assert.deepEqual(validateHabit({ name: 'A', period: 'day', target: 1, unit: '', times: [], routine: 'morning' }), ['Choose a routine from the list.']);
+  assert.deepEqual(validateHabit({ name: 'A', period: 'day', target: 1, unit: '', times: ['07:00'], routine: '' }), []);
+  assert.deepEqual(routinesOf(old, [morning]), [morning]);
+  assert.deepEqual(groupHabits([old], [morning]).map((g) => [g.routine?.id ?? null, ids(g.habits)]), [[RID, ['p']]]);
 });
 
 test('cleanRoutine and validateRoutine', () => {
@@ -334,20 +375,29 @@ test('sortRoutines: by order, then name, deleted left out', () => {
   for (const junk of [undefined, null, 'x', {}, [null, 5, 'x']]) assert.deepEqual(sortRoutines(junk), []);
 });
 
-test('routineOf: a habit is in a routine only while that routine is live', () => {
-  assert.equal(routineOf(pills, [evening, morning]), morning);
-  assert.equal(routineOf(pills, [evening]), null); // routine missing
-  assert.equal(routineOf(pills, [{ ...morning, deletedAt: 5 }]), null); // routine deleted
-  assert.equal(routineOf(water, [morning]), null); // no `routine` field at all
-  assert.equal(routineOf({ ...pills, routine: '' }, [{ ...morning, id: '' }]), null);
-  assert.equal(routineOf({ ...pills, routine: undefined }, [{ name: 'No id' }]), null);
+test('routinesOf: the live routines a habit is in, in routine order (v1.4)', () => {
+  const both = { ...teeth, routines: [evening.id, RID] };
+  assert.deepEqual(routinesOf(both, [evening, morning]), [morning, evening]); // display order, not stored order
+  assert.deepEqual(routinesOf(both, [{ ...evening, order: 0 }, morning]).map((r) => r.name), ['Evening', 'Morning']);
+  assert.deepEqual(routinesOf(both, [evening]), [evening]); // Morning missing: ignored
+  assert.deepEqual(routinesOf(both, [{ ...morning, deletedAt: 5 }, evening]), [evening]); // Morning deleted: ignored
+  assert.deepEqual(routinesOf(both, [{ ...morning, deletedAt: 5 }]), []); // no live routine: loose
+  assert.deepEqual(routinesOf(water, [morning]), []); // no routine field at all
+  assert.deepEqual(routinesOf({ ...pills, routines: [] }, [{ ...morning, id: '' }]), []);
+  assert.deepEqual(routinesOf(pills, [morning, { ...morning }]).length, 1); // a repeated routine record counts once
+  for (const junk of [undefined, null, 'x', {}, [null, 4]]) assert.deepEqual(routinesOf(pills, junk), []);
+  for (const junk of [undefined, null, 'x', {}]) assert.deepEqual(routinesOf(junk, [morning]), []);
+  // routineOf (deprecated) is the first of them
+  assert.equal(routineOf(both, [evening, morning]), morning);
+  assert.equal(routineOf(both, [evening]), evening);
+  assert.equal(routineOf(water, [morning]), null);
   for (const junk of [undefined, null, 'x', {}]) assert.equal(routineOf(pills, junk), null);
   assert.equal(routineOf(null, [morning]), null);
 });
 
 test('groupHabits: one section per live routine in order, then the loose habits', () => {
   const loose = { ...water, order: 1 };
-  const late = { ...gym, order: 9, routine: evening.id };
+  const late = { ...gym, order: 9, routines: [evening.id] };
   const groups = groupHabits([teeth, loose, late, pills, { ...run, deletedAt: 4 }], [evening, morning]);
   assert.deepEqual(groups.map((g) => [g.routine?.id ?? null, ids(g.habits)]), [[RID, ['p', 't']], [evening.id, ['g']], [null, ['w']]]);
   // an empty routine keeps its section; no loose section when every habit is in a routine
@@ -362,32 +412,47 @@ test('groupHabits: one section per live routine in order, then the loose habits'
   for (const junk of [undefined, null, 'x', {}, [null, 3]]) assert.deepEqual(groupHabits(junk, junk), [{ routine: null, habits: [] }]);
 });
 
+test('groupHabits: a habit in several routines is in the section of each, and never loose (v1.4)', () => {
+  const both = { ...teeth, routines: [evening.id, RID] };
+  const floss = { ...pills, id: 'f', name: 'Floss', order: 0, routines: [evening.id] };
+  const groups = groupHabits([water, both, pills, floss], [evening, morning]);
+  assert.deepEqual(groups.map((g) => [g.routine?.id ?? null, ids(g.habits)]), [[RID, ['p', 't']], [evening.id, ['f', 't']], [null, ['w']]]);
+  assert.equal(groups[0].habits[1], groups[1].habits[1]); // the same habit object, one count
+  // one of its routines deleted: still in the other, not loose
+  const gone = groupHabits([water, both, pills], [{ ...evening, deletedAt: 1 }, morning]);
+  assert.deepEqual(gone.map((g) => [g.routine?.id ?? null, ids(g.habits)]), [[RID, ['p', 't']], [null, ['w']]]);
+  // both deleted: loose
+  assert.deepEqual(groupHabits([both], [{ ...morning, deletedAt: 1 }]), [{ routine: null, habits: [both] }]);
+});
+
 test('routineLeft: member habits not yet done, in routine order', () => {
   const habits = [run, teeth, pills, water, { ...pills, id: 'd', deletedAt: 3 }, { ...pills, id: 'a', archived: true }];
   const day = '2026-11-13'; // a Friday
-  assert.deepEqual(ids(routineLeft(morning, habits, {}, day)), ['p', 't', 'r']);
+  assert.deepEqual(ids(routineLeft(morning, habits, [morning], {}, day)), ['p', 't', 'r']);
   let logs = logsOf([[day, 'p', 1], [day, 't', 1]]);
-  assert.deepEqual(ids(routineLeft(morning, habits, logs, day)), ['t', 'r']); // teeth: 1 of 2
+  assert.deepEqual(ids(routineLeft(morning, habits, [morning], logs, day)), ['t', 'r']); // teeth: 1 of 2 (its only routine is its last: the full target)
   // a weekly habit inside a routine: left until its week's target is hit, but not again on a day it was logged
   logs = logsOf([['2026-11-10', 'r', 1], ['2026-11-11', 'r', 1]]);
-  assert.deepEqual(ids(routineLeft(morning, [run], logs, day)), ['r']); // 2 of 3 this week, nothing today
+  assert.deepEqual(ids(routineLeft(morning, [run], [morning], logs, day)), ['r']); // 2 of 3 this week, nothing today
   logs = logsOf([['2026-11-10', 'r', 1], [day, 'r', 1]]);
-  assert.deepEqual(routineLeft(morning, [run], logs, day), []); // had its turn today
-  assert.deepEqual(ids(routineLeft(morning, [run], logs, '2026-11-14')), ['r']); // due again the next day
+  assert.deepEqual(routineLeft(morning, [run], [morning], logs, day), []); // had its turn today
+  assert.deepEqual(ids(routineLeft(morning, [run], [morning], logs, '2026-11-14')), ['r']); // due again the next day
   logs = logsOf([['2026-11-09', 'r', 2], ['2026-11-10', 'r', 1]]);
-  assert.deepEqual(routineLeft(morning, [run], logs, '2026-11-15'), []); // week's target hit (Sunday, same week)
-  assert.deepEqual(ids(routineLeft(morning, [run], logs, '2026-11-16')), ['r']); // a new week
+  assert.deepEqual(routineLeft(morning, [run], [morning], logs, '2026-11-15'), []); // week's target hit (Sunday, same week)
+  assert.deepEqual(ids(routineLeft(morning, [run], [morning], logs, '2026-11-16')), ['r']); // a new week
   // a deleted routine, another routine, and junk
-  assert.deepEqual(routineLeft({ ...morning, deletedAt: 8 }, habits, {}, day), []);
-  assert.deepEqual(routineLeft(evening, habits, {}, day), []);
+  assert.deepEqual(routineLeft({ ...morning, deletedAt: 8 }, habits, [morning], {}, day), []);
+  assert.deepEqual(routineLeft(evening, habits, [morning, evening], {}, day), []);
+  assert.deepEqual(routineLeft(morning, habits, [evening], {}, day), []); // `routines` must hold the routine
   for (const junk of [undefined, null, 'x', {}]) {
-    assert.deepEqual(routineLeft(junk, habits, {}, day), []);
-    assert.deepEqual(routineLeft(morning, junk, junk, day), []);
+    assert.deepEqual(routineLeft(junk, habits, [morning], {}, day), []);
+    assert.deepEqual(routineLeft(morning, junk, [morning], junk, day), []);
+    assert.deepEqual(routineLeft(morning, habits, junk, {}, day), []);
   }
 });
 
 test('dueRoutines: live routines with a matching time and something left', () => {
-  const habits = [pills, teeth, { ...gym, routine: evening.id, times: [] }];
+  const habits = [pills, teeth, { ...gym, routines: [evening.id], times: [] }];
   const day = '2026-11-13';
   let due = dueRoutines([evening, morning], habits, {}, day, '07:00');
   assert.deepEqual(due.map((d) => [d.routine.id, ids(d.left)]), [[RID, ['p', 't']]]);
@@ -411,7 +476,7 @@ test('dueRoutines: live routines with a matching time and something left', () =>
 
 test('dueHabits with routines: a habit in a live routine sends no reminder of its own', () => {
   const day = '2026-11-13';
-  const both = { ...water, id: 'b', routine: RID }; // a stored habit with a routine and times (the rules refuse it)
+  const both = { ...water, id: 'b', routines: [RID] }; // a stored habit with a routine and times (the rules refuse it)
   const habits = [water, both];
   assert.deepEqual(ids(dueHabits(habits, {}, day, '09:00', [morning])), ['w']);
   // a deleted or missing routine, or no routines passed: the habit is loose
@@ -427,6 +492,131 @@ test('dueHabits with routines: a habit in a live routine sends no reminder of it
   const all = [water, pills, teeth];
   const viaRoutine = dueRoutines([morning], all, {}, day, ['07:00', '09:00']).flatMap((d) => ids(d.left));
   assert.deepEqual([...ids(dueHabits(all, {}, day, ['07:00', '09:00'], [morning])), ...viaRoutine].sort(), ['p', 't', 'w']);
+});
+
+// ---------- habits in several routines (contract v1.4) ----------
+
+const night = { id: 'nightRoutine00000001', name: 'Night', times: ['23:00'], order: 3, deletedAt: null, updatedAt: 1 };
+const shared = { ...teeth, id: 's', routines: [evening.id, RID] }; // Brush teeth, target 2, in Morning and Evening
+const all3 = [morning, evening, night];
+
+test('doneIn: the k-th routine of a daily habit needs min(k, target) taps, the last one the whole target', () => {
+  const day = '2026-11-13';
+  const at = (n) => logsOf([[day, 's', n]]);
+  const done = (habit, r, n, rs = all3) => doneIn(habit, r, rs, at(n), day);
+  // target 2 in Morning and Evening: Morning after the first tap, Evening after the second
+  assert.deepEqual([0, 1, 2, 3].map((n) => [done(shared, morning, n), done(shared, evening, n)]),
+    [[false, false], [true, false], [true, true], [true, true]]);
+  // target 1: one tap does both
+  const once = { ...shared, target: 1 };
+  assert.deepEqual([0, 1].map((n) => [done(once, morning, n), done(once, evening, n)]), [[false, false], [true, true]]);
+  // in one routine only: the whole target, as in v1.3
+  assert.deepEqual([1, 2].map((n) => done({ ...teeth, id: 's' }, morning, n)), [false, true]);
+  // three routines, target 2: 1, 2, 2; target 5: 1, 2, 5 (the last routine carries the rest)
+  const three = { ...shared, routines: [night.id, evening.id, RID] };
+  assert.deepEqual([1, 2].map((n) => [morning, evening, night].map((r) => done(three, r, n))), [[true, false, false], [true, true, true]]);
+  const five = { ...three, target: 5 };
+  assert.deepEqual([2, 4, 5].map((n) => [morning, evening, night].map((r) => done(five, r, n))),
+    [[true, true, false], [true, true, false], [true, true, true]]);
+  // the order is the routines' display order, not the stored order: Evening first when it is shown first
+  const flipped = [{ ...evening, order: 0 }, morning];
+  assert.deepEqual([done(shared, flipped[0], 1, flipped), done(shared, morning, 1, flipped)], [true, false]);
+  // a deleted routine is not counted: Evening becomes the first (and last) routine
+  const noMorning = [{ ...morning, deletedAt: 1 }, evening];
+  assert.deepEqual([done(shared, evening, 1, noMorning), done(shared, evening, 2, noMorning)], [false, true]);
+  assert.equal(done(shared, { ...morning, deletedAt: 1 }, 2, noMorning), false);
+  // a weekly habit is done in every routine once the week's target is hit
+  const weekly = { ...run, id: 's', routines: [RID, evening.id] };
+  const week = logsOf([['2026-11-10', 's', 2], [day, 's', 1]]);
+  assert.deepEqual([doneIn(weekly, morning, all3, week, day), doneIn(weekly, evening, all3, week, day)], [true, true]);
+  assert.deepEqual([doneIn(weekly, morning, all3, at(1), day), doneIn(weekly, evening, all3, at(1), day)], [false, false]);
+  // not a member, not in `routines`, junk
+  assert.equal(done(shared, night, 2), false);
+  assert.equal(done(shared, morning, 2, [evening]), false);
+  for (const junk of [undefined, null, 'x', {}]) {
+    assert.equal(doneIn(junk, morning, all3, at(2), day), false);
+    assert.equal(doneIn(shared, junk, all3, at(2), day), false);
+    assert.equal(doneIn(shared, morning, junk, at(2), day), false);
+    assert.equal(doneIn(shared, morning, all3, junk, day), false);
+  }
+});
+
+test('routineLeft and routineProgress: a shared habit is left, and done, in each routine on its own (v1.4)', () => {
+  const day = '2026-11-13';
+  const habits = [pills, shared, { ...pills, id: 'f', name: 'Floss', order: 5, routines: [evening.id] }, water];
+  const rs = [evening, morning];
+  const both = (logs) => [morning, evening].map((r) => [ids(routineLeft(r, habits, rs, logs, day)), routineProgress(r, habits, rs, logs, day)]);
+  assert.deepEqual(both({}), [[['p', 's'], { done: 0, total: 2 }], [['s', 'f'], { done: 0, total: 2 }]]);
+  // one tap of Brush teeth (in either section: one count) is its Morning share
+  assert.deepEqual(both(logsOf([[day, 'p', 1], [day, 's', 1]])), [[[], { done: 2, total: 2 }], [['s', 'f'], { done: 0, total: 2 }]]);
+  assert.deepEqual(both(logsOf([[day, 's', 2], [day, 'f', 1]])), [[['p'], { done: 1, total: 2 }], [[], { done: 2, total: 2 }]]);
+  // a weekly habit in two routines: left in both until its turn today, done in both at the week's target
+  const weekly = { ...run, id: 'k', routines: [RID, evening.id] };
+  const w = (logs) => [morning, evening].map((r) => [ids(routineLeft(r, [weekly], rs, logs, day)), routineProgress(r, [weekly], rs, logs, day).done]);
+  assert.deepEqual(w({}), [[['k'], 0], [['k'], 0]]);
+  assert.deepEqual(w(logsOf([[day, 'k', 1]])), [[[], 0], [[], 0]]); // had its turn today, not done yet
+  assert.deepEqual(w(logsOf([['2026-11-10', 'k', 2], [day, 'k', 1]])), [[[], 1], [[], 1]]);
+  // archived and deleted habits are not counted; deleted, missing and junk routines give nothing
+  const extra = [...habits, { ...pills, id: 'a', archived: true }, { ...pills, id: 'd', deletedAt: 2 }];
+  assert.deepEqual(routineProgress(morning, extra, rs, {}, day), { done: 0, total: 2 });
+  assert.deepEqual(routineProgress({ ...morning, deletedAt: 1 }, habits, rs, {}, day), { done: 0, total: 0 });
+  assert.deepEqual(routineProgress(night, habits, all3, {}, day), { done: 0, total: 0 });
+  assert.deepEqual(routineProgress(morning, habits, [evening], {}, day), { done: 0, total: 0 });
+  for (const junk of [undefined, null, 'x', {}]) {
+    assert.deepEqual(routineProgress(junk, habits, rs, {}, day), { done: 0, total: 0 });
+    assert.deepEqual(routineProgress(morning, junk, junk, junk, day), { done: 0, total: 0 });
+  }
+  // the top line still counts each habit once
+  assert.deepEqual(summary(habits, logsOf([[day, 's', 1]]), day), { done: 0, total: 4 });
+  assert.deepEqual(summary(habits, logsOf([[day, 's', 2]]), day), { done: 1, total: 4 });
+});
+
+test('dueRoutines and dueHabits with a shared habit: each routine reminds for its own share (v1.4)', () => {
+  const day = '2026-11-13';
+  const habits = [pills, shared, { ...water, order: 9, routines: [evening.id], times: [] }];
+  const due = (logs, times) => dueRoutines([evening, morning], habits, logs, day, times).map((d) => [d.routine.name, ids(d.left)]);
+  assert.deepEqual(due({}, ['07:00', '21:00']), [['Morning', ['p', 's']], ['Evening', ['s', 'w']]]);
+  // brushed once in the morning: the Evening reminder still asks for it, Morning has only the pills left
+  const once = logsOf([[day, 's', 1]]);
+  assert.deepEqual(due(once, ['07:00', '21:00']), [['Morning', ['p']], ['Evening', ['s', 'w']]]);
+  assert.deepEqual(routineReminderText(evening, dueRoutines([evening], habits, once, day, '21:00')[0].left),
+    { title: 'Evening', body: '2 left: Brush teeth, Water' });
+  assert.deepEqual(due(logsOf([[day, 's', 2], [day, 'p', 1], [day, 'w', 3]]), ['07:00', '21:00']), []);
+  // a habit in any live routine sends no reminder of its own; with all of its routines deleted it is loose
+  const timed = { ...water, id: 'x', routines: [evening.id, RID] }; // times and routines (the rules refuse it)
+  assert.deepEqual(dueHabits([timed], {}, day, '09:00', [{ ...morning, deletedAt: 1 }, evening]), []);
+  assert.deepEqual(ids(dueHabits([timed], {}, day, '09:00', [{ ...morning, deletedAt: 1 }])), ['x']);
+  // the same routine reminder for old data (field `routine`)
+  const old = { ...pills, routines: undefined, routine: RID };
+  assert.deepEqual(ids(dueRoutines([morning], [old], {}, day, '07:00')[0].left), ['p']);
+});
+
+test('moveHabitIds: a move inside one section, with every live id for reorderHabits (v1.4)', () => {
+  // orders: Water 1 (loose), Pills 2 (Morning), Teeth 3 (Morning and Evening), Floss 4 (Evening), Gym 5 (loose)
+  const hs = [{ ...water, order: 1 }, { ...pills, order: 2 }, { ...shared, order: 3 }, { ...pills, id: 'f', name: 'Floss', order: 4, routines: [evening.id] },
+    { ...gym, order: 5 }, { ...pills, id: 'd', order: 6, deletedAt: 1 }];
+  const rs = [morning, evening];
+  const view = (list) => groupHabits(list.map((id) => ({ ...hs.find((h) => h.id === id), order: list.indexOf(id) })), rs)
+    .map((g) => [g.routine?.name ?? null, ids(g.habits)]);
+  assert.deepEqual(view(['w', 'p', 's', 'f', 'g']), [['Morning', ['p', 's']], ['Evening', ['s', 'f']], [null, ['w', 'g']]]);
+  // Floss up in Evening: Teeth and Floss swap there; Morning is unchanged
+  let moved = moveHabitIds(hs, rs, evening.id, 'f', -1);
+  assert.deepEqual(moved, ['w', 'p', 'f', 's', 'g']);
+  assert.deepEqual(view(moved), [['Morning', ['p', 's']], ['Evening', ['f', 's']], [null, ['w', 'g']]]);
+  // Teeth up in Morning: only Teeth moves, so it also goes before Floss in Evening (one order per habit, accepted)
+  moved = moveHabitIds(hs, rs, RID, 's', -1);
+  assert.deepEqual(view(moved), [['Morning', ['s', 'p']], ['Evening', ['s', 'f']], [null, ['w', 'g']]]);
+  // a loose habit jumps over the routine habits between it and its neighbour; nothing else changes place
+  moved = moveHabitIds(hs, rs, null, 'w', 1);
+  assert.deepEqual(moved, ['p', 's', 'f', 'g', 'w']);
+  assert.deepEqual(moveHabitIds(hs, rs, '', 'g', -1), ['g', 'w', 'p', 's', 'f']);
+  // first, last, not in that section, bad delta, junk: null
+  assert.equal(moveHabitIds(hs, rs, RID, 'p', -1), null);
+  assert.equal(moveHabitIds(hs, rs, evening.id, 'f', 1), null);
+  assert.equal(moveHabitIds(hs, rs, evening.id, 'p', 1), null);
+  assert.equal(moveHabitIds(hs, rs, RID, 'd', 1), null);
+  for (const delta of [0, 2, '1', undefined]) assert.equal(moveHabitIds(hs, rs, RID, 'p', delta), null);
+  for (const junk of [undefined, null, 'x', {}]) assert.equal(moveHabitIds(junk, junk, RID, 'p', 1), null);
 });
 
 test('routineReminderText: how many are left and which, never longer than 120 characters', () => {

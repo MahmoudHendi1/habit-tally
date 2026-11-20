@@ -5,8 +5,8 @@ import { readFileSync } from 'node:fs';
 import { createLocalStore, STORAGE_KEY } from '../src/store-local.js';
 import { sampleData, SAMPLE_WEEKS } from '../src/sample-data.js';
 import { StoreError } from '../src/store.js';
-import { addDays, countOn, groupHabits, keyOf, routineLeft, routineReminderText, startDay, stats, streak, summary,
-  validateHabit, validateRoutine, weekStart } from '../shared/logic.js';
+import { addDays, countOn, dueRoutines, groupHabits, keyOf, routineLeft, routineProgress, routineReminderText, startDay,
+  stats, streak, summary, validateHabit, validateRoutine, weekStart } from '../shared/logic.js';
 import { runStoreContract } from './store-contract.mjs';
 
 // A Tuesday early in the month, so "7 days back" crosses a week and a month boundary.
@@ -52,7 +52,7 @@ test('demo store: a new store on the same storage sees the earlier data', () => 
   const morning = first.saveRoutine(MORNING);
   const evening = first.saveRoutine({ name: 'Evening', times: [] });
   const goneRoutine = first.saveRoutine({ name: 'Gone', times: ['12:00'] });
-  const member = first.saveHabit({ ...WATER, name: 'Pills', routine: goneRoutine });
+  const member = first.saveHabit({ ...WATER, name: 'Pills', routines: [goneRoutine, evening] });
   first.deleteRoutine(goneRoutine);
   first.reorderRoutines([evening, morning]);
   assert.deepEqual([...storage.map.keys()], [STORAGE_KEY]);
@@ -71,13 +71,13 @@ test('demo store: a new store on the same storage sees the earlier data', () => 
     .map((entry) => [entry.routine?.name ?? null, entry.habits.map((h) => h.id)]);
   assert.deepEqual(second.getState().routines.map((r) => [r.id, r.name, r.times, r.order]),
     [[evening, 'Evening', [], 1], [morning, 'Morning', ['07:00'], 2]], 'the routines and their new order were saved');
-  assert.deepEqual(sections(second), [['Evening', []], ['Morning', []], [null, [kept, deleted, member]]]);
+  assert.deepEqual(sections(second), [['Evening', [member]], ['Morning', []], [null, [kept, deleted]]]);
   second.restoreRoutine(goneRoutine); // deleted routines are kept too, and their habits still name them
-  assert.deepEqual(sections(second), [['Evening', []], ['Morning', []], ['Gone', [member]], [null, [kept, deleted]]]);
+  assert.deepEqual(sections(second), [['Evening', [member]], ['Morning', []], ['Gone', [member]], [null, [kept, deleted]]]);
   assert.deepEqual(sections(open(storage)), sections(second));
 });
 
-test('demo store: data saved before routines existed loads as no routines and loose habits', () => {
+test('demo store: data saved before routines existed loads as no routines and loose habits, and is rewritten once', () => {
   // Exactly what the demo store wrote before contract v1.3: no `routines`, and habits without `routine`.
   const habits = [
     { id: 'oldWaterHabit0000001', name: 'Water', period: 'day', target: 3, unit: 'glasses', times: ['09:00', '13:00'],
@@ -89,23 +89,83 @@ test('demo store: data saved before routines existed loads as no routines and lo
     logs: { '2026-11': { [TODAY]: { oldWaterHabit0000001: 2 } } } };
   const storage = fakeStorage({ [STORAGE_KEY]: JSON.stringify(old) });
   const store = open(storage);
-  assert.deepEqual(store.getState(), { status: 'ready', mode: 'demo', user: old.user, habits: [{ ...habits[0], routine: '' }],
+  const updatedAt = noonOn(TODAY)().getTime();
+  const rewritten = habits.map((h) => ({ ...h, routines: [], updatedAt }));
+  assert.deepEqual(store.getState(), { status: 'ready', mode: 'demo', user: old.user, habits: [rewritten[0]],
     routines: [], logs: old.logs, lastError: null });
   assert.deepEqual(groupHabits(store.getState().habits, store.getState().routines).map((entry) => entry.routine), [null]);
-  assert.equal(storage.map.get(STORAGE_KEY), JSON.stringify(old), 'loading does not write');
+  assert.deepEqual(JSON.parse(storage.map.get(STORAGE_KEY)), { ...old, habits: rewritten, routines: [] }, 'rewritten in the v1.4 shape');
 
   // and everything works from there, old habits included
   const morning = store.saveRoutine(MORNING);
-  store.saveHabit({ ...habits[0], routine: morning });
+  store.saveHabit({ ...habits[0], routines: [morning] });
   store.restoreHabit(habits[1].id);
   store.reorderHabits([habits[1].id, habits[0].id]);
   store.addCount(TODAY, habits[0].id, 1);
   assert.equal(store.getState().lastError, null);
   const again = open(storage);
   assert.deepEqual(again.getState(), store.getState());
-  assert.deepEqual(again.getState().habits.map((h) => [h.id, h.routine, h.times, h.order, h.created]),
-    [[habits[1].id, '', [], 1, '2026-10-01'], [habits[0].id, morning, [], 2, '2026-10-01']]);
+  assert.deepEqual(again.getState().habits.map((h) => [h.id, h.routines, h.times, h.order, h.created]),
+    [[habits[1].id, [], [], 1, '2026-10-01'], [habits[0].id, [morning], [], 2, '2026-10-01']]);
   assert.equal(countOn(again.getState().logs, habits[0].id, TODAY), 3);
+});
+
+test('demo store: data of v1.3 (habits with `routine`) loads with `routines` and is rewritten once in the new shape', () => {
+  // Exactly what the demo store wrote in contract v1.3: one `routine` per habit, '' for a loose one.
+  const rest = { period: 'day', target: 1, unit: '', created: '2026-10-01', archived: false, deletedAt: null };
+  const habits = [
+    { id: 'oldWaterHabit0000001', name: 'Water', ...rest, target: 3, unit: 'glasses', times: ['09:00'], order: 1, updatedAt: 1790000000000, routine: '' },
+    { id: 'oldPillsHabit0000001', name: 'Pills', ...rest, times: [], order: 2, updatedAt: 1790000100000, routine: 'oldMorningRoutine001' },
+    { id: 'oldTeaHabit000000001', name: 'Tea', ...rest, times: [], order: 3, updatedAt: 1790000200000, routine: 'oldGoneRoutine000001' },
+    { id: 'oldGoneHabit00000001', name: 'Gone', ...rest, period: 'week', times: [], order: 4, updatedAt: 1790000300000,
+      deletedAt: 1790000300000, routine: 'oldMorningRoutine001' },
+  ];
+  const routines = [
+    { id: 'oldMorningRoutine001', name: 'Morning', times: ['07:00'], order: 1, deletedAt: null, updatedAt: 1790000000000 },
+    { id: 'oldGoneRoutine000001', name: 'Gone', times: [], order: 2, deletedAt: 1790000400000, updatedAt: 1790000400000 },
+  ];
+  const old = { v: 1, signedIn: true, user: { uid: 'demo', email: 'me@example.com', tz: 'Africa/Cairo' }, habits, routines,
+    logs: { '2026-10': { '2026-10-30': { oldPillsHabit0000001: 1 } }, '2026-11': { [TODAY]: { oldWaterHabit0000001: 2, oldTeaHabit000000001: 1 } } } };
+  const storage = fakeStorage({ [STORAGE_KEY]: JSON.stringify(old) });
+  const writes = [];
+  const store = open({ ...storage, setItem: (k, v) => { writes.push(k); storage.setItem(k, v); } });
+  let calls = 0;
+  store.subscribe(() => calls++);
+
+  const updatedAt = noonOn(TODAY)().getTime();
+  const rewritten = habits.map(({ routine, ...h }) => ({ ...h, routines: routine ? [routine] : [], updatedAt }));
+  const state = store.getState();
+  assert.deepEqual(state.habits, rewritten.filter((h) => !h.deletedAt), 'every other field kept, the deleted routine\'s id too');
+  assert.ok(state.habits.every((h) => Array.isArray(h.routines) && !('routine' in h)));
+  assert.deepEqual([state.routines, state.logs, state.user, state.lastError], [[routines[0]], old.logs, old.user, null]);
+  assert.deepEqual(groupHabits(state.habits, state.routines).map((entry) => [entry.routine?.id ?? null, entry.habits.map((h) => h.id)]),
+    [['oldMorningRoutine001', ['oldPillsHabit0000001']], [null, ['oldWaterHabit0000001', 'oldTeaHabit000000001']]]);
+  assert.deepEqual([writes, calls], [[STORAGE_KEY], 1], 'one save of the key, no listener call beyond the first');
+  const stored = JSON.parse(storage.map.get(STORAGE_KEY));
+  assert.deepEqual(stored, { ...old, habits: rewritten });
+  assert.ok(stored.habits.every((h) => !('routine' in h)), 'no `routine` left in storage');
+
+  const text = storage.map.get(STORAGE_KEY);
+  const later = open({ ...storage, setItem: () => assert.fail('opening it again writes nothing') }, { now: noonOn(addDays(TODAY, 1)) });
+  assert.deepEqual(later.getState().habits, state.habits);
+  assert.equal(storage.map.get(STORAGE_KEY), text);
+  later.restoreRoutine('oldGoneRoutine000001'); // ids of deleted routines were kept
+  assert.deepEqual(later.getState().habits.map((h) => [h.id, h.routines]), habits.filter((h) => !h.deletedAt)
+    .map((h) => [h.id, h.routine ? [h.routine] : []]));
+});
+
+test('demo store: a rewrite that storage refuses sets lastError, shows the new shape, and is tried again on the next load', () => {
+  const habit = { id: 'oldPillsHabit0000001', name: 'Pills', period: 'day', target: 1, unit: '', times: [], created: '2026-10-01',
+    archived: false, deletedAt: null, order: 1, updatedAt: 1, routine: '' };
+  const text = JSON.stringify({ v: 1, signedIn: true, user: { uid: 'demo', email: 'a@b.co', tz: 'UTC' }, habits: [habit], logs: {} });
+  const storage = fakeStorage({ [STORAGE_KEY]: text });
+  const refused = open({ ...storage, setItem: () => { throw new Error('quota'); } });
+  assert.equal(refused.getState().lastError.code, 'not-saved');
+  assert.deepEqual(refused.getState().habits.map((h) => [h.routines, 'routine' in h]), [[[], false]]);
+  assert.equal(storage.map.get(STORAGE_KEY), text);
+  const next = open(storage);
+  assert.equal(next.getState().lastError, null);
+  assert.deepEqual(JSON.parse(storage.map.get(STORAGE_KEY)).habits.map((h) => [h.routines, 'routine' in h]), [[[], false]]);
 });
 
 test('demo store: missing or damaged storage starts clean without an error', () => {
@@ -125,15 +185,21 @@ test('demo store: missing or damaged storage starts clean without an error', () 
     JSON.stringify({ ...good, routines: [{ ...routine, times: ['07:10'] }] }), JSON.stringify({ ...good, routines: [{ ...routine, order: '1' }] }),
     JSON.stringify({ ...good, routines: [{ ...routine, deletedAt: undefined }] }), JSON.stringify({ ...good, routines: [{ ...routine, updatedAt: null }] }),
     JSON.stringify({ ...good, habits: [{ ...habit, routine: 'not an id' }] }), JSON.stringify({ ...good, habits: [{ ...habit, routine: 7 }] }),
-    JSON.stringify({ ...good, habits: [{ ...habit, routine: 'sampleMorningRoutine', times: ['09:00'] }] })];
+    JSON.stringify({ ...good, habits: [{ ...habit, routine: 'sampleMorningRoutine', times: ['09:00'] }] }),
+    JSON.stringify({ ...good, habits: [{ ...habit, routines: 'sampleMorningRoutine' }] }),
+    JSON.stringify({ ...good, habits: [{ ...habit, routines: ['not an id'] }] }),
+    JSON.stringify({ ...good, habits: [{ ...habit, routines: [7] }] }),
+    JSON.stringify({ ...good, habits: [{ ...habit, routines: ['sampleMorningRoutine', 'sampleMorningRoutine'] }] }),
+    JSON.stringify({ ...good, habits: [{ ...habit, routines: Array.from({ length: 6 }, (_, i) => `sampleRoutine0000000${i}`) }] }),
+    JSON.stringify({ ...good, habits: [{ ...habit, routines: ['sampleMorningRoutine'], times: ['09:00'] }] })];
   const storages = [...damaged.map((text) => fakeStorage({ [STORAGE_KEY]: text })),
     { ...fakeStorage(), getItem: () => { throw new Error('blocked'); } }];
   for (const storage of storages) {
     const store = open(storage);
     assert.deepEqual(store.getState(), open().getState(), storage.map.get(STORAGE_KEY));
     const routineId = store.saveRoutine(MORNING); // and it works from there
-    const id = store.saveHabit({ ...WATER, routine: routineId });
-    assert.deepEqual(store.getState().habits.map((h) => [h.id, h.routine]), [[id, routineId]]);
+    const id = store.saveHabit({ ...WATER, routines: [routineId] });
+    assert.deepEqual(store.getState().habits.map((h) => [h.id, h.routines]), [[id, [routineId]]]);
     assert.equal(store.getState().lastError, null);
   }
 });
@@ -283,7 +349,7 @@ test('demo store: one failing listener does not stop the change or the other lis
 
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/sample-16-weeks.json', import.meta.url), 'utf8'));
 
-test('sample data: 16 weeks for one daily and one weekly habit and the Morning routine, with the totals and streaks of the fixture', () => {
+test('sample data: 16 weeks for one daily and one weekly habit and the Morning and Evening routines, with the totals and streaks of the fixture', () => {
   const { habits, routines, logs } = sampleData(fixture.today);
   assert.deepEqual(sampleData(fixture.today), { habits, routines, logs }, 'the same day gives the same data');
   assert.deepEqual(habits.map((h) => [h.id, h.name, h.period, h.target]), fixture.habits.map((h) => [h.id, h.name, h.period, h.target]));
@@ -306,7 +372,7 @@ test('sample data: 16 weeks for one daily and one weekly habit and the Morning r
 test('sample data: the two older habits are exactly as they were before the Morning routine was added', () => {
   // Written out here, not read from the fixture, so a change to either of them cannot pass unnoticed.
   const { habits, logs } = sampleData('2026-11-13');
-  const rest = { created: '2026-07-27', archived: false, deletedAt: null, updatedAt: Date.parse('2026-07-27T00:00:00Z'), routine: '' };
+  const rest = { created: '2026-07-27', archived: false, deletedAt: null, updatedAt: Date.parse('2026-07-27T00:00:00Z'), routines: [] };
   assert.deepEqual(habits.slice(0, 2), [
     { id: 'sampleWaterHabit0001', name: 'Drink water', period: 'day', target: 6, unit: 'glasses', times: ['09:00', '13:00', '17:00'], order: 1, ...rest },
     { id: 'sampleRunHabit000001', name: 'Go for a run', period: 'week', target: 3, unit: 'runs', times: ['18:00'], order: 2, ...rest },
@@ -315,36 +381,56 @@ test('sample data: the two older habits are exactly as they were before the Morn
   assert.deepEqual(stats(habits[1], logs, '2026-11-13'), { total: 40, periods: 16, hitPeriods: 10, best: 3, streak: 3 });
 });
 
-test('sample data: the Morning routine holds "Take vitamins" and "Brush teeth", and today is "1 of 2 done"', () => {
+test('sample data: Morning holds "Take vitamins" and "Brush teeth", Evening "Brush teeth" (target 2); today Morning is "2 of 2 done" and Evening "0 of 1 done"', () => {
   const { habits, routines, logs } = sampleData(fixture.today);
   const rest = { deletedAt: null, updatedAt: Date.parse(`${fixture.firstDay}T00:00:00Z`) };
-  assert.deepEqual(routines, [{ id: 'sampleMorningRoutine', name: 'Morning', times: ['07:00'], order: 1, ...rest }]);
-  assert.deepEqual(routines.map((r) => validateRoutine(r)), [[]]);
-  const members = { period: 'day', target: 1, unit: '', times: [], routine: 'sampleMorningRoutine', created: fixture.firstDay, archived: false, ...rest };
+  assert.deepEqual(routines, [
+    { id: 'sampleMorningRoutine', name: 'Morning', times: ['07:00'], order: 1, ...rest },
+    { id: 'sampleEveningRoutine', name: 'Evening', times: ['21:00'], order: 2, ...rest },
+  ]);
+  assert.deepEqual(routines.map((r) => validateRoutine(r)), [[], []]);
+  const members = { period: 'day', unit: '', times: [], created: fixture.firstDay, archived: false, ...rest };
   assert.deepEqual(habits.slice(2), [
-    { id: 'sampleVitaminsHabit1', name: 'Take vitamins', order: 3, ...members },
-    { id: 'sampleTeethHabit0001', name: 'Brush teeth', order: 4, ...members },
+    { id: 'sampleVitaminsHabit1', name: 'Take vitamins', order: 3, target: 1, routines: ['sampleMorningRoutine'], ...members },
+    { id: 'sampleTeethHabit0001', name: 'Brush teeth', order: 4, target: 2, routines: ['sampleMorningRoutine', 'sampleEveningRoutine'], ...members },
   ]);
 
-  const sections = groupHabits(habits, routines);
-  const [expected] = fixture.routines;
-  assert.equal(fixture.routines.length, 1);
-  assert.deepEqual(sections.map((entry) => [entry.routine?.id ?? null, entry.habits.map((h) => h.id)]),
-    [[expected.id, expected.habits], [null, fixture.loose]]);
-  const { id, name, times, order } = sections[0].routine;
-  assert.deepEqual({ id, name, times, order }, { id: expected.id, name: expected.name, times: expected.times, order: expected.order });
-  assert.deepEqual(summary(sections[0].habits, logs, fixture.today), { done: expected.today.done, total: expected.today.total });
-  assert.deepEqual([expected.today.done, expected.today.total], [1, 2]);
-  const left = routineLeft(routines[0], habits, logs, fixture.today);
-  assert.deepEqual(left.map((h) => h.id), expected.today.left);
-  assert.deepEqual(routineReminderText(routines[0], left), { title: 'Morning', body: expected.today.reminder });
-  assert.equal(expected.today.reminder, '1 left: Brush teeth');
+  // Brush teeth: 2 on most days, 1 on some, 0 on a few, before today
+  const teeth = habits[3];
+  const tally = [0, 0, 0];
+  for (let day = fixture.firstDay; day < fixture.today; day = addDays(day, 1)) tally[countOn(logs, teeth.id, day)]++;
+  assert.ok(tally[2] > tally[1] + tally[0] && tally[1] > tally[0] && tally[0] > 0, `days with 0, 1, 2: ${tally}`);
 
-  // the same on any other day: the vitamins are taken, the teeth are not brushed yet
+  const sections = groupHabits(habits, routines);
+  assert.deepEqual(sections.map((entry) => [entry.routine?.id ?? null, entry.habits.map((h) => h.id)]),
+    [...fixture.routines.map((r) => [r.id, r.habits]), [null, fixture.loose]]);
+  assert.equal(sections[0].habits[1], sections[1].habits[0], 'one Brush teeth in both sections');
+  assert.deepEqual(summary(habits, logs, fixture.today), fixture.summary, 'the top line counts Brush teeth once');
+  assert.deepEqual(fixture.summary, { done: 1, total: 4 });
+  for (const [i, expected] of fixture.routines.entries()) {
+    const routine = routines[i];
+    const { id, name, times, order } = routine;
+    assert.deepEqual({ id, name, times, order }, { id: expected.id, name: expected.name, times: expected.times, order: expected.order });
+    assert.deepEqual(routineProgress(routine, habits, routines, logs, fixture.today), { done: expected.today.done, total: expected.today.total }, name);
+    const left = routineLeft(routine, habits, routines, logs, fixture.today);
+    assert.deepEqual(left.map((h) => h.id), expected.today.left, name);
+    assert.equal(left.length ? routineReminderText(routine, left).body : null, expected.today.reminder, name);
+  }
+  assert.deepEqual(fixture.routines.map((r) => [r.name, r.today.done, r.today.total, r.today.reminder]),
+    [['Morning', 2, 2, null], ['Evening', 0, 1, '1 left: Brush teeth']]);
+  assert.deepEqual(dueRoutines(routines, habits, logs, fixture.today, '07:00'), [], 'no Morning reminder is due');
+  assert.deepEqual(dueRoutines(routines, habits, logs, fixture.today, '21:00').map(({ routine, left }) => routineReminderText(routine, left)),
+    [{ title: 'Evening', body: '1 left: Brush teeth' }]);
+
+  // the same on any other day: the vitamins are taken, the teeth brushed once
   for (const day of ['2026-11-09', '2026-11-15', '2027-01-01', '2028-02-29']) {
     const other = sampleData(day);
-    assert.deepEqual(summary(groupHabits(other.habits, other.routines)[0].habits, other.logs, day), { done: 1, total: 2 }, day);
-    assert.deepEqual(routineLeft(other.routines[0], other.habits, other.logs, day).map((h) => h.name), ['Brush teeth'], day);
+    const [morning, evening] = other.routines;
+    assert.deepEqual(routineProgress(morning, other.habits, other.routines, other.logs, day), { done: 2, total: 2 }, day);
+    assert.deepEqual(routineProgress(evening, other.habits, other.routines, other.logs, day), { done: 0, total: 1 }, day);
+    assert.deepEqual(routineLeft(morning, other.habits, other.routines, other.logs, day), [], day);
+    const left = routineLeft(evening, other.habits, other.routines, other.logs, day);
+    assert.deepEqual(routineReminderText(evening, left), { title: 'Evening', body: '1 left: Brush teeth' }, day);
   }
 });
 
@@ -358,14 +444,14 @@ test('demo store: sample data loads only when asked for and only into empty stor
   const { habits, routines, logs } = store.getState();
   assert.deepEqual({ habits, routines, logs }, sampleData(fixture.today));
   assert.deepEqual(groupHabits(habits, routines).map((entry) => [entry.routine?.name ?? null, entry.habits.map((h) => h.name)]),
-    [['Morning', ['Take vitamins', 'Brush teeth']], [null, ['Drink water', 'Go for a run']]]);
+    [['Morning', ['Take vitamins', 'Brush teeth']], ['Evening', ['Brush teeth']], [null, ['Drink water', 'Go for a run']]]);
   for (const [i, habit] of habits.entries()) assert.deepEqual(stats(habit, logs, fixture.today), fixture.habits[i].expected);
   assert.deepEqual(open(storage, { now }).getState(), store.getState(), 'the sample was saved');
 
   for (const habit of habits) store.deleteHabit(habit.id);
-  store.deleteRoutine(routines[0].id);
+  for (const routine of routines) store.deleteRoutine(routine.id);
   const later = open(storage, { now: noonOn(addDays(fixture.today, 1)), sample: true });
   assert.deepEqual([later.getState().habits, later.getState().routines], [[], []], 'the sample does not come back over saved data');
   const fresh = open(fakeStorage({ [STORAGE_KEY]: 'damaged' }), { now, sample: true }).getState();
-  assert.deepEqual([fresh.habits.length, fresh.routines.length], [4, 1]);
+  assert.deepEqual([fresh.habits.length, fresh.routines.length], [4, 2]);
 });

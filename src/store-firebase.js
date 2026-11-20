@@ -38,11 +38,12 @@ import {
 import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache,
   memoryLruGarbageCollector, connectFirestoreEmulator, collection, doc, onSnapshot, setDoc, updateDoc, increment, runTransaction,
-  writeBatch,
+  writeBatch, deleteField,
   waitForPendingWrites, terminate, clearIndexedDbPersistence,
 } from 'firebase/firestore';
 import {
   LIMITS, keyOf, monthId, countOn, recentDays, cleanHabit, validateHabit, sortHabits, cleanRoutine, validateRoutine, sortRoutines,
+  routineIdsOf,
 } from '../shared/logic.js';
 import { firebaseConfig, emulatorConfig } from './firebase-config.js';
 import { StoreError } from './store.js';
@@ -134,8 +135,23 @@ function readDays(data) {
   return Object.fromEntries(days.map(([day, counts]) => [day, Object.fromEntries(numbers(counts))]));
 }
 
-/** A stored habit as the app knows it. One stored before routines existed has no `routine`: it is loose. */
-const readHabit = (id, data) => ({ id, ...data, routine: typeof data.routine === 'string' ? data.routine : '' });
+/** A stored habit as the app knows it (contract v1.4): `routines` (routineIdsOf) and never `routine`, whatever
+ *  shape it was stored in. A v1.3 habit `routine: 'abc'` reads as `routines: ['abc']`, `routine: ''` and a habit
+ *  from before routines as `routines: []`. */
+function readHabit(id, data) {
+  const { routine, ...rest } = data;
+  return { id, ...rest, routines: routineIdsOf(data) };
+}
+
+/** A stored habit in an old shape (v1.3 `routine`, or from before routines): it has no `routines` list. */
+const isOldShape = (data) => !Array.isArray(data?.routines);
+
+/** The v1.4 document for a habit stored in an old shape: every field kept exactly as stored, `routines` in
+ *  place of `routine`, and a new `updatedAt`. */
+function newShape(data, updatedAt) {
+  const { routine, ...rest } = data;
+  return { ...rest, routines: routineIdsOf(data), updatedAt };
+}
 
 /** One change laid over { tz, habits: { id: habit }, routines: { id: routine }, logs }. Returns new data;
  *  nothing is mutated. An op is { kind: 'habits' | 'routines', id, patch, create? } or
@@ -219,6 +235,8 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   const newSession = (uid, email, denied = false) => ({
     uid, email, denied, stops: [], live: false, creating: false, trouble: null, offline: null,
     heard: NOTHING_HEARD, failures: 0, again: null,
+    // Habits stored in an old shape in the latest snapshot, and those whose rewrite this session has started.
+    oldShape: new Set(), rewritten: new Set(),
     has: { user: false, habits: false, routines: false, logs: false }, base: { tz, habits: {}, routines: {}, logs: {} }, ops: [],
   });
   const current = () => session.ops.reduce(applyOp, session.base);
@@ -384,6 +402,9 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     s.stops.push(onSnapshot(collection(userRef, 'habits'), { includeMetadataChanges: true }, (snap) => {
       if (session !== s) return;
       s.base = { ...s.base, habits: Object.fromEntries(snap.docs.map((d) => [d.id, readHabit(d.id, d.data())])) };
+      s.oldShape = new Set(snap.docs.filter((d) => isOldShape(d.data())).map((d) => d.id));
+      // Only the server's word counts: the cache may still hold the old shape of a habit already rewritten.
+      if (!snap.metadata.fromCache) rewrite(s, [...s.oldShape].filter((id) => !s.rewritten.has(id)));
       heard('habits', snap);
       refresh();
     }, failed));
@@ -432,7 +453,55 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     refresh(true);
   }
 
+  /** Rewrite habits stored in an old shape to the v1.4 shape (contracts section 5), each at most once per
+   *  session; a refusal by the rules sets lastError and the next load tries again, and any other failure (no
+   *  connection) is silent and tried again on the next server snapshot. The state shows the new shape already
+   *  (readHabit); the new `updatedAt` is laid over it as an op, so this adds no listener call of its own.
+   *  It is a full overwrite (tx.set, no merge) inside a transaction that reads each habit again on the server
+   *  first: only a habit that is still in an old shape there is written, built from what the server holds,
+   *  so an edit made meanwhile on another device (or here) is never overwritten and nothing is written twice. */
+  function rewrite(s, ids) {
+    for (const id of ids) {
+      s.rewritten.add(id);
+      const updatedAt = now().getTime(), mine = ++sent;
+      const op = { kind: 'habits', id, patch: { updatedAt } };
+      s.ops = [...s.ops, op];
+      const ref = doc(db, 'users', s.uid, 'habits', id);
+      // One habit per transaction, so a habit the rules refuse cannot hold the others back.
+      runTransaction(db, async (tx) => {
+        const snap = await tx.get(ref);
+        if (!snap.exists() || !isOldShape(snap.data())) return false;
+        tx.set(ref, newShape(snap.data(), updatedAt));
+        return true;
+      }).then((written) => {
+        if (session !== s) return;
+        if (written) s.base = applyOp(s.base, op);
+        s.ops = s.ops.filter((o) => o !== op);
+        if (mine > sentAtError) lastError = null;
+        refresh();
+      }, (err) => {
+        if (session !== s) return;
+        s.ops = s.ops.filter((o) => o !== op);
+        if (err && err.code === 'permission-denied') {
+          lastError = notSaved(err);
+          sentAtError = sent;
+        } else {
+          // The connection went away (or the transaction gave up): the person wrote nothing, so no "not saved".
+          // The habit stays readable in the old shape and the next server snapshot tries again.
+          s.rewritten.delete(id);
+        }
+        refresh();
+      });
+    }
+  }
+
   const recordRef = (kind, id) => doc(db, 'users', session.uid, kind, id);
+  /** What an update of a stored record sends. A habit still stored in an old shape (its rewrite has not landed
+   *  yet) gets `routines` and loses `routine` in the same write: the rules check the merged document, which must
+   *  have exactly the eleven v1.4 fields. Otherwise the patch as it is. */
+  const toServer = (kind, id, patch) => (kind === 'habits' && session.oldShape.has(id)
+    ? { ...patch, routines: patch.routines ?? current().habits[id]?.routines ?? [], routine: deleteField() }
+    : patch);
   const tooMany = (kind) => new StoreError('too-many', `You can have at most ${KINDS[kind].max} ${kind}. Delete one to add another.`);
   /** The place of a new habit or routine. Deleted ones count too, so a restored one never shares its place
    *  with a newer one. */
@@ -446,7 +515,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     if (id) {
       if (!all[id]) throw new StoreError('not-found', `This ${KINDS[kind].one} no longer exists.`);
       const patch = { ...fields, updatedAt };
-      change({ kind, id, patch }, () => updateDoc(recordRef(kind, id), patch));
+      change({ kind, id, patch }, () => updateDoc(recordRef(kind, id), toServer(kind, id, patch)));
       return id;
     }
     if (state[kind].length >= KINDS[kind].max) throw tooMany(kind);
@@ -458,10 +527,11 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
 
   function saveHabit(input) {
     if (state.status !== 'ready') throw new StoreError('not-ready', 'Sign in to change habits.');
-    // Only a live routine can be joined. Any other value (none, unknown, deleted) leaves the habit loose,
-    // and it is dropped before cleaning, because cleanHabit empties the times of a habit with a routine.
-    const routine = state.routines.some((r) => r.id === input?.routine) ? input.routine : '';
-    const fields = cleanHabit({ ...input, routine });
+    // Only live routines can be joined: unknown and deleted ids are dropped before cleaning (for good), because
+    // cleanHabit empties the times of a habit with a routine. A v1.3 caller's `routine` is read by routineIdsOf.
+    const live = new Set(state.routines.map((r) => r.id));
+    const routines = routineIdsOf(input ?? {}).filter((id) => live.has(id));
+    const fields = cleanHabit({ ...input, routines });
     const problems = validateHabit(fields);
     if (problems.length > 0) throw new StoreError('invalid', problems[0], problems);
     return saveRecord('habits', input.id, fields, { created: today(), archived: false });
@@ -476,17 +546,14 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
   }
 
   /** Soft delete (a time) or restore (null) of a habit or routine. Unknown ids and repeats are ignored.
-   *  Deleting a routine writes none of its habits: they keep naming it and are loose meanwhile (routineOf). */
+   *  Deleting a routine writes none of its habits: they keep naming it and ignore it meanwhile (routinesOf). */
   function setDeleted(kind, id, deletedAt) {
     if (state.status !== 'ready') return;
     const record = current()[kind][id];
     if (!record || (record.deletedAt === null) === (deletedAt === null)) return;
     if (deletedAt === null && state[kind].length >= KINDS[kind].max) throw tooMany(kind);
     const patch = { deletedAt, updatedAt: now().getTime() };
-    // A habit stored before routines existed has no `routine` field, and the rules check the whole merged
-    // document: write the normalised value along, so such a habit can still be deleted and restored.
-    if (kind === 'habits') patch.routine = record.routine ?? '';
-    change({ kind, id, patch }, () => updateDoc(recordRef(kind, id), patch));
+    change({ kind, id, patch }, () => updateDoc(recordRef(kind, id), toServer(kind, id, patch)));
   }
 
   /** Number the live records named in `ids` 1, 2, 3... in that sequence. Ids that name no live record and
@@ -503,10 +570,7 @@ export function createFirebaseStore({ emulator = false, now = () => new Date(), 
     const updatedAt = now().getTime();
     change({ all: moved.map(([id, order]) => ({ kind, id, patch: { order, updatedAt } })) }, () => {
       const batch = writeBatch(db);
-      // Habits carry `routine` along for the same reason as in setDeleted().
-      for (const [id, order] of moved) {
-        batch.update(recordRef(kind, id), kind === 'habits' ? { order, updatedAt, routine: live.get(id).routine ?? '' } : { order, updatedAt });
-      }
+      for (const [id, order] of moved) batch.update(recordRef(kind, id), toServer(kind, id, { order, updatedAt }));
       return batch.commit();
     });
   }

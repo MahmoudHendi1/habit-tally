@@ -184,9 +184,15 @@ export function render(state, ctx) {
   if (routines.length === 0) {
     return `${head}<ul class="progress-list" role="list" data-key="habits">${habits.map((h) => habitCard(h, logs, today)).join('')}</ul>`;
   }
-  // The sections and the order of Today. A routine without habits has nothing to show here.
-  const sections = groupHabits(habits, routines).filter((/** @type {{ habits: Habit[] }} */ entry) => entry.habits.length > 0)
-    .map((/** @type {{ routine: { id: string, name: string } | null, habits: Habit[] }} */ { routine, habits: list }) => {
+  // The sections and the order of Today, but each habit once (one count, one calendar): in the first section
+  // it is in, which is its first live routine (contract v1.4). A section left without habits is not shown.
+  const seen = new Set();
+  const sections = groupHabits(habits, routines)
+    .map((/** @type {{ routine: { id: string, name: string } | null, habits: Habit[] }} */ entry) => ({
+      ...entry, habits: entry.habits.filter((h) => !seen.has(h.id) && seen.add(h.id)),
+    }))
+    .filter((entry) => entry.habits.length > 0)
+    .map(({ routine, habits: list }) => {
       const key = routine ? `routine-${esc(routine.id)}` : 'loose';
       return `<section class="progress-group" data-key="${key}" aria-labelledby="progress-title-${key}">
         <h2 id="progress-title-${key}">${routine ? esc(routine.name) : 'Other habits'}</h2>

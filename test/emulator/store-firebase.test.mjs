@@ -13,7 +13,7 @@ import {
 import { createFirebaseStore } from '../../src/store-firebase.js';
 import { emulatorConfig } from '../../src/firebase-config.js';
 import { StoreError } from '../../src/store.js';
-import { countOn, groupHabits, routineOf } from '../../shared/logic.js';
+import { countOn, groupHabits, routinesOf, stats, streak } from '../../shared/logic.js';
 import { runStoreContract } from '../store-contract.mjs';
 
 setLogLevel('error'); // refused writes are expected here; do not print a warning for each one
@@ -27,7 +27,7 @@ assert.ok(PROJECT.startsWith('demo-') && FIRESTORE.includes('//127.0.0.1:') && A
 const TODAY = '2026-11-03';
 const NOON = new Date(`${TODAY}T12:00:00`).getTime();
 const WATER = { name: 'Water', period: 'day', target: 3, unit: 'glasses', times: ['09:00'] };
-const HABIT_FIELDS = ['archived', 'created', 'deletedAt', 'name', 'order', 'period', 'routine', 'target', 'times', 'unit', 'updatedAt'];
+const HABIT_FIELDS = ['archived', 'created', 'deletedAt', 'name', 'order', 'period', 'routines', 'target', 'times', 'unit', 'updatedAt'];
 const ROUTINE_FIELDS = ['deletedAt', 'name', 'order', 'times', 'updatedAt'];
 const SENTENCE = /^[A-Z][^/]*\.$/; // a plain sentence, not an error code like auth/wrong-password
 
@@ -346,10 +346,10 @@ test('R1 check 3: a routine saved, edited, reordered, deleted or restored in one
   await until(b.store, (state) => state.routines.length === 1, 'a new routine reaches the other store');
   assert.deepEqual(b.store.getState().routines, a.store.getState().routines);
   const evening = b.store.saveRoutine({ name: 'Evening' });
-  const pills = b.store.saveHabit({ ...WATER, name: 'Take pills', routine: morning });
-  const teeth = b.store.saveHabit({ ...WATER, name: 'Brush teeth', routine: morning });
+  const pills = b.store.saveHabit({ ...WATER, name: 'Take pills', routines: [morning] });
+  const teeth = b.store.saveHabit({ ...WATER, name: 'Brush teeth', routines: [morning] });
   await until(a.store, (state) => state.routines.length === 2 && state.habits.length === 2, 'a second routine and two members reach the first store');
-  assert.deepEqual(a.store.getState().habits.map((h) => [h.id, h.routine, h.times]), [[pills, morning, []], [teeth, morning, []]]);
+  assert.deepEqual(a.store.getState().habits.map((h) => [h.id, h.routines, h.times]), [[pills, [morning], []], [teeth, [morning], []]]);
 
   a.store.saveRoutine({ id: evening, name: 'Night', times: ['21:30'] });
   await until(b.store, (state) => state.routines[1]?.name === 'Night', 'an edit reaches the other store');
@@ -361,7 +361,7 @@ test('R1 check 3: a routine saved, edited, reordered, deleted or restored in one
 
   a.store.deleteRoutine(morning);
   const without = await until(b.store, (state) => state.routines.length === 1, 'a delete reaches the other store');
-  assert.deepEqual(without.habits.map((h) => routineOf(h, without.routines)), [null, null], 'its habits are loose meanwhile');
+  assert.deepEqual(without.habits.map((h) => routinesOf(h, without.routines)), [[], []], 'its habits are loose meanwhile');
   b.store.restoreRoutine(morning);
   const back = await until(a.store, (state) => state.routines.length === 2, 'a restore reaches the other store');
   assert.deepEqual(groupHabits(back.habits, back.routines).map((entry) => [entry.routine?.id, entry.habits.map((h) => h.id)]),
@@ -377,18 +377,158 @@ test('R1 check 3: a routine saved, edited, reordered, deleted or restored in one
   assert.deepEqual(Object.keys(docs[`users/${a.uid}/routines/${morning}`]).sort(), ROUTINE_FIELDS);
   assert.deepEqual(docs[`users/${a.uid}/routines/${morning}`], Object.fromEntries(Object.entries(routine).filter(([key]) => key !== 'id')));
   assert.deepEqual(Object.keys(docs[`users/${a.uid}/habits/${pills}`]).sort(), HABIT_FIELDS);
-  assert.deepEqual([docs[`users/${a.uid}/habits/${pills}`].routine, docs[`users/${a.uid}/habits/${pills}`].times], [morning, []]);
+  assert.deepEqual([docs[`users/${a.uid}/habits/${pills}`].routines, docs[`users/${a.uid}/habits/${pills}`].times], [[morning], []]);
 });
 
-test('a habit stored without the routine field (from before routines) is read as loose', async () => {
+test('a habit stored without the routine field (from before routines) is read as loose and rewritten with routines: []', async () => {
   const { store, uid } = await readyStore();
   const routine = store.saveRoutine({ name: 'Morning' });
-  const old = { name: 'Old', period: 'day', target: 1, unit: '', times: ['09:00'], created: TODAY, archived: false, deletedAt: null, order: 1, updatedAt: NOON };
-  await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), `users/${uid}/habits/habit000000000000001`), old));
+  const old = { name: 'Old', period: 'day', target: 1, unit: '', times: ['09:00'], created: TODAY, archived: false, deletedAt: null, order: 1, updatedAt: NOON - 1 };
+  const path = `users/${uid}/habits/habit000000000000001`;
+  await env.withSecurityRulesDisabled((ctx) => setDoc(doc(ctx.firestore(), path), old));
   const state = await until(store, (s) => s.habits.length === 1, 'the stored habit arrives');
-  assert.deepEqual(state.habits[0], { id: 'habit000000000000001', ...old, routine: '' });
-  assert.equal(routineOf(state.habits[0], state.routines), null);
+  assert.deepEqual(without(state.habits[0], 'updatedAt'), { id: 'habit000000000000001', ...without(old, 'updatedAt'), routines: [] });
+  assert.deepEqual(routinesOf(state.habits[0], state.routines), []);
   assert.equal(state.routines[0].id, routine);
+  assert.deepEqual(await eventually(() => stored(path), (data) => Array.isArray(data.routines), 'the habit is rewritten'),
+    { ...old, routines: [], updatedAt: NOON });
+});
+
+// ---------- R5: habits stored in the v1.3 shape (`routine`) are read as `routines` and rewritten once ----------
+
+const without = (obj, key) => Object.fromEntries(Object.entries(obj).filter(([k]) => k !== key));
+/** Resolves with `read()` once it passes the test; fails after `ms` (2 seconds: R5 check 2). */
+async function eventually(read, passes, what, ms = 2000) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const value = await read();
+    if (passes(value)) return value;
+    if (Date.now() > end) throw new Error(`not within ${ms} ms: ${what}`);
+    await sleep(50);
+  }
+}
+
+const MORNING = 'routineMorning000001';
+const V13 = {
+  teeth: { name: 'Brush teeth', period: 'day', target: 2, unit: '', times: [], created: '2026-10-20', archived: false, deletedAt: null, order: 1, updatedAt: NOON - 3000, routine: MORNING },
+  water: { name: 'Water', period: 'day', target: 3, unit: 'glasses', times: ['09:00', '13:30'], created: '2026-10-25', archived: false, deletedAt: null, order: 2, updatedAt: NOON - 2000, routine: '' },
+  gone: { name: 'Gone', period: 'week', target: 4, unit: '', times: [], created: '2026-10-21', archived: false, deletedAt: NOON - 1000, order: 3, updatedAt: NOON - 1000, routine: MORNING },
+};
+const V13_IDS = { teeth: 'habitTeeth0000000001', water: 'habitWater0000000002', gone: 'habitGone00000000003' };
+const V13_LOGS = {
+  '2026-10': { days: { '2026-10-29': { habitTeeth0000000001: 2 }, '2026-10-30': { habitTeeth0000000001: 2, habitWater0000000002: 3 }, '2026-10-31': { habitTeeth0000000001: 2 } } },
+  '2026-11': { days: { '2026-11-01': { habitTeeth0000000001: 2 }, '2026-11-02': { habitTeeth0000000001: 2, habitGone00000000003: 1 }, '2026-11-03': { habitTeeth0000000001: 1 } } },
+};
+
+/** An invited account whose data was written by v1.3 of the app (past the rules, as the live data was). */
+async function v13Account(extra = {}) {
+  const account = await newAccount();
+  const at = (path) => `users/${account.uid}/${path}`;
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = ctx.firestore();
+    await setDoc(doc(db, `users/${account.uid}`), { tz: 'Europe/London', createdAt: NOON - 9000, updatedAt: NOON - 9000 });
+    await setDoc(doc(db, at(`routines/${MORNING}`)), { name: 'Morning', times: ['07:00'], order: 1, deletedAt: null, updatedAt: NOON - 9000 });
+    for (const [key, data] of Object.entries(V13)) await setDoc(doc(db, at(`habits/${V13_IDS[key]}`)), { ...data, ...extra[key] });
+    for (const [month, data] of Object.entries(V13_LOGS)) await setDoc(doc(db, at(`logs/${month}`)), data);
+  });
+  return account;
+}
+const storedHabits = async (uid) => Object.fromEntries(await Promise.all(Object.entries(V13_IDS)
+  .map(async ([key, id]) => [key, await stored(`users/${uid}/habits/${id}`)])));
+const allNewShape = (docs) => Object.values(docs).every((d) => Array.isArray(d.routines) && !('routine' in d));
+
+test('R5 check 2: v1.3 habits are shown with routines at once, rewritten within 2 s to exactly the eleven v1.4 fields, counts and streak unchanged; a second load writes nothing', async () => {
+  const account = await v13Account();
+  const a = open();
+  a.advance(60_000);
+  const seen = [];
+  a.store.subscribe((state) => { if (state.status === 'ready') seen.push(state); });
+  await a.store.signIn(account.email, account.password);
+  // Shown correctly at once: every state that is ready has the new shape, the Brush teeth habit in Morning.
+  const first = seen[0];
+  assert.deepEqual(first.habits.map((h) => [h.id, h.routines, h.times, 'routine' in h]),
+    [[V13_IDS.teeth, [MORNING], [], false], [V13_IDS.water, [], ['09:00', '13:30'], false]]);
+  assert.deepEqual(groupHabits(first.habits, first.routines).map((e) => [e.routine?.id ?? null, e.habits.map((h) => h.id)]),
+    [[MORNING, [V13_IDS.teeth]], [null, [V13_IDS.water]]]);
+  const teeth = { ...V13.teeth, id: V13_IDS.teeth };
+  const numbers = (state) => state.habits.map((h) => [h.id, countOn(state.logs, h.id, TODAY), streak(h, state.logs, TODAY), stats(h, state.logs, TODAY)]);
+  const before = numbers(first);
+  assert.deepEqual(before[0].slice(1, 3), [countOn(first.logs, teeth.id, TODAY), streak(teeth, first.logs, TODAY)], 'the same as read in the v1.3 shape');
+  assert.equal(before[0][1], 1);
+
+  // Rewritten within 2 seconds: the same values, `routines` in place of `routine`, a new updatedAt; the deleted one too.
+  const docs = await eventually(() => storedHabits(account.uid), allNewShape, 'all three habits are rewritten');
+  for (const [key, data] of Object.entries(V13)) {
+    assert.deepEqual(Object.keys(docs[key]).sort(), HABIT_FIELDS, key);
+    assert.deepEqual(docs[key], { ...without(data, 'routine'), routines: data.routine ? [data.routine] : [], updatedAt: NOON + 60_000 }, key);
+  }
+  await a.settle();
+  const after = a.store.getState();
+  assert.equal(after.lastError, null);
+  assert.deepEqual(numbers(after), before, 'counts, streak and stats unchanged');
+  assert.ok(seen.every((state) => state.habits.every((h) => Array.isArray(h.routines) && !('routine' in h))));
+  assert.deepEqual(after.habits, Object.entries(docs).filter(([key]) => key !== 'gone').map(([key, data]) => ({ id: V13_IDS[key], ...data })));
+
+  // A second load (another device, later) finds nothing to rewrite and writes nothing.
+  const b = open();
+  b.advance(120_000);
+  await b.store.signIn(account.email, account.password);
+  await b.settle();
+  await sleep(500);
+  assert.deepEqual(await storedHabits(account.uid), docs);
+  assert.deepEqual(b.store.getState().habits, after.habits);
+  assert.equal(b.store.getState().lastError, null);
+});
+
+test('R5: a v1.3 habit can be edited, deleted, restored and reordered at once after loading, before or after its rewrite lands', async () => {
+  const account = await v13Account();
+  const { store, settle, advance } = open();
+  advance(60_000);
+  await store.signIn(account.email, account.password);
+  // At once: the rewrite has most likely not landed yet; the writes must be in the new shape all the same.
+  store.deleteHabit(V13_IDS.water);
+  store.restoreHabit(V13_IDS.water);
+  store.reorderHabits([V13_IDS.water, V13_IDS.teeth]);
+  await settle();
+  await eventually(() => storedHabits(account.uid), allNewShape, 'all three habits are rewritten');
+  advance(1000);
+  const edited = { ...without(V13.teeth, 'routine'), id: V13_IDS.teeth, name: 'Brush teeth well', target: 3, routines: [MORNING] };
+  store.saveHabit(edited);
+  store.deleteHabit(V13_IDS.teeth);
+  store.restoreHabit(V13_IDS.teeth);
+  store.reorderHabits([V13_IDS.teeth, V13_IDS.water]);
+  store.restoreHabit(V13_IDS.gone);
+  await settle();
+  const state = store.getState();
+  assert.equal(state.lastError, null);
+  const docs = await storedHabits(account.uid);
+  assert.ok(allNewShape(docs));
+  for (const key of Object.keys(V13)) assert.deepEqual(Object.keys(docs[key]).sort(), HABIT_FIELDS, key);
+  assert.deepEqual(state.habits.map((h) => [h.id, h.name, h.target, h.order, h.routines, h.deletedAt, h.created]), [
+    [V13_IDS.teeth, 'Brush teeth well', 3, 1, [MORNING], null, '2026-10-20'],
+    [V13_IDS.water, 'Water', 3, 2, [], null, '2026-10-25'],
+    [V13_IDS.gone, 'Gone', 4, 3, [MORNING], null, '2026-10-21'],
+  ]);
+  assert.deepEqual(docs.water.times, ['09:00', '13:30'], 'a loose habit keeps its reminder times');
+  assert.deepEqual(state.habits.map(({ id, ...data }) => data), [docs.teeth, docs.water, docs.gone]);
+});
+
+test('R5: a rewrite the rules refuse sets lastError "not-saved", changes nothing, and is tried again on the next load', async () => {
+  // An extra field the rules do not know: no overwrite that keeps every field can pass.
+  const account = await v13Account({ water: { colour: 'blue' } });
+  const a = open();
+  await a.store.signIn(account.email, account.password);
+  const refused = await until(a.store, (state) => state.lastError?.code === 'not-saved', 'the refusal is reported');
+  assert.match(refused.lastError.message, SENTENCE);
+  assert.deepEqual(refused.habits.map((h) => h.routines), [[MORNING], []], 'the state shows the new shape all the same');
+  await a.settle();
+  const docs = await storedHabits(account.uid);
+  assert.deepEqual(docs.water, { ...V13.water, colour: 'blue' }, 'the refused habit is stored exactly as before');
+  assert.deepEqual([docs.teeth.routines, docs.gone.routines, 'routine' in docs.teeth], [[MORNING], [MORNING], false], 'the others are rewritten');
+
+  const b = open();
+  await b.store.signIn(account.email, account.password);
+  await until(b.store, (state) => state.lastError?.code === 'not-saved', 'the next load tries again');
 });
 
 test('check 3: both stores add +1 at the same moment: both end at 2', async () => {

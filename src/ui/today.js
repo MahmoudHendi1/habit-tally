@@ -1,9 +1,11 @@
 // @ts-check
 // The Today screen: one card per habit, one tap to log, and a day picker for the last 7 days (R2, R3, R6).
-// Habits that belong to a routine are shown under its heading, and "Reorder" turns the + and - of every
-// card into Move up and Move down (docs/contracts.md section 10, "Routines on the screens").
+// Habits that belong to a routine are shown under its heading, a habit in several routines under each of them
+// (one count, the same + and -), and "Reorder" turns the + and - of every card into Move up and Move down
+// (docs/contracts.md section 10, "Routines on the screens", v1.4).
 // Screen contract: src/ui/common.js.
-import { countOn, periodCount, isHit, isWeekly, summary, recentDays, weekStart, groupHabits } from '../../shared/logic.js';
+import { countOn, periodCount, isHit, isWeekly, summary, recentDays, weekStart, groupHabits, routinesOf, doneIn, routineProgress,
+  moveHabitIds } from '../../shared/logic.js';
 import { esc, on, icon, tallyMarks, formatDay, emptyState, announce } from './common.js';
 
 /** @typedef {import('./common.js').State} State */
@@ -62,20 +64,6 @@ function swapped(ids, id, delta) {
   return out;
 }
 
-/** The argument of `store.reorderHabits()` that moves one habit one place inside its own section: every
- *  live habit id in the new display order (sections in order, the loose habits last).
- *  @param {{ id: string }[]} habits @param {{ id: string }[]} routines @param {string} id @param {number} delta
- *  @returns {string[] | null} null when the habit is first (or last) in its section, or unknown */
-export function movedHabits(habits, routines, id, delta) {
-  /** @type {string[][]} */
-  const sections = groupHabits(habits, routines).map((/** @type {{ habits: { id: string }[] }} */ entry) => entry.habits.map((h) => h.id));
-  const at = sections.findIndex((ids) => ids.includes(id));
-  const moved = at < 0 ? null : swapped(sections[at], id, delta);
-  if (!moved) return null;
-  sections[at] = moved;
-  return sections.flat();
-}
-
 /** The argument of `store.reorderRoutines()` that moves one routine one place.
  *  @param {{ id: string }[]} routines `state.routines` @param {string} id @param {number} delta
  *  @returns {string[] | null} */
@@ -103,30 +91,45 @@ function dayPicker(today, day, { habits, logs }) {
 
 /** Move up and Move down for one habit or routine, shown in Reorder mode.
  *  @param {'habit' | 'routine'} kind @param {string} id escaped @param {string} name escaped
- *  @param {{ first: boolean, last: boolean }} at */
-function moveButtons(kind, id, name, at) {
+ *  @param {{ first: boolean, last: boolean }} at
+ *  @param {string} [section] escaped: for a habit, the id of the routine whose section it is in ('' = the loose one) */
+function moveButtons(kind, id, name, at, section = '') {
   const button = (/** @type {number} */ delta, /** @type {boolean} */ off) => `<button type="button" class="btn-round" data-action="move" `
-    + `data-kind="${kind}" data-id="${id}" data-delta="${delta}" aria-label="Move ${delta < 0 ? 'up' : 'down'}: ${name}"${off ? ' disabled' : ''}>`
+    + `data-kind="${kind}" data-id="${id}"${kind === 'habit' ? ` data-section="${section}"` : ''} data-delta="${delta}" aria-label="Move ${delta < 0 ? 'up' : 'down'}: ${name}"${off ? ' disabled' : ''}>`
     + `${icon(delta < 0 ? 'up' : 'down', 22)}</button>`;
   return `<div class="habit-controls move-controls">${button(-1, at.first)}${button(1, at.last)}</div>`;
 }
 
+/** For a habit in several routines, shown in one of them: whether it is done there by the k-th rule
+ *  (`doneIn`), as "done for Morning" or "still to do for Evening", shown after the count with a comma. '' for a habit in one routine or none,
+ *  where the count already says it. Plain text.
+ *  @param {Habit} habit @param {State['routines'][number] | null} routine the section's routine
+ *  @param {State['routines']} routines @param {State['logs']} logs @param {string} day */
+export function shareText(habit, routine, routines, logs, day) {
+  if (!routine || routinesOf(habit, routines).length < 2) return '';
+  return `${doneIn(habit, routine, routines, logs, day) ? 'done' : 'still to do'} for ${routine.name}`;
+}
+
 /** @param {Habit} habit @param {State['logs']} logs @param {string} day @param {string} today
- *  @param {{ tag: 'h2' | 'h3', move: { first: boolean, last: boolean } | null }} how the heading level of the
- *    name (h3 under a section heading), and where the card is in its section while reordering */
-function habitCard(habit, logs, day, today, { tag, move }) {
+ *  @param {{ tag: 'h2' | 'h3', move: { first: boolean, last: boolean } | null, section: string, share: string, doneHere: boolean | null }} how
+ *    the heading level of the name (h3 under a section heading), where the card is in its section while
+ *    reordering, the section's routine id ('' for the loose one, escaped), `shareText`, and for a habit in
+ *    several routines whether it is done in this section (`doneIn`; null otherwise, when the day's target decides) */
+function habitCard(habit, logs, day, today, { tag, move, section, share, doneHere }) {
   const id = esc(habit.id), name = esc(habit.name);
-  const done = isHit(habit, logs, day);
+  // The check mark agrees with the line: in a shared habit's section it follows "done for <routine>".
+  const done = doneHere ?? isHit(habit, logs, day);
   const { main, extra } = progressText(habit, logs, day, today);
-  return `<li class="card habit${done ? ' is-done' : ''}" data-key="${id}">
+  // A habit can be in several sections: its key names the section too, so it is unique on the page.
+  return `<li class="card habit${done ? ' is-done' : ''}" data-key="${section || 'loose'}:${id}">
     <div class="habit-info">
       <${tag} class="habit-name"><button type="button" class="habit-edit" data-action="edit" data-id="${id}">
         <span>${name}<span class="sr-only">, edit habit</span></span>${icon('edit', 16)}</button></${tag}>
       ${tallyMarks(periodCount(habit, logs, day), habit.target)}
-      <p class="habit-progress num">${done ? icon('check', 18) : ''}<span>${esc(main)}</span>${done ? '<span class="sr-only">, done</span>' : ''}</p>
+      <p class="habit-progress num">${done ? icon('check', 18) : ''}<span>${esc(main)}${share ? `<span class="habit-share">, ${esc(share)}</span>` : ''}</span>${done ? '<span class="sr-only">, done</span>' : ''}</p>
       ${extra ? `<p class="muted small num">${esc(extra)}</p>` : ''}
     </div>
-    ${move ? moveButtons('habit', id, name, move) : `<div class="habit-controls">
+    ${move ? moveButtons('habit', id, name, move, section) : `<div class="habit-controls">
       <button type="button" class="btn-round" data-action="undo" data-id="${id}" aria-label="Undo one: ${name}"
         ${countOn(logs, habit.id, day) === 0 ? 'aria-disabled="true"' : ''}>${icon('minus', 20)}</button>
       <button type="button" class="btn-round btn-plus" data-action="add" data-id="${id}" aria-label="Add one: ${name}">${icon('plus', 28)}</button>
@@ -135,31 +138,36 @@ function habitCard(habit, logs, day, today, { tag, move }) {
 }
 
 /** The cards of one section. @param {Habit[]} list @param {State['logs']} logs @param {string} day
- *  @param {string} today @param {'h2' | 'h3'} tag */
-const cards = (list, logs, day, today, tag) => list.map((h, i) => habitCard(h, logs, day, today,
-  { tag, move: reordering ? { first: i === 0, last: i === list.length - 1 } : null })).join('');
+ *  @param {string} today @param {'h2' | 'h3'} tag
+ *  @param {State['routines'][number] | null} [routine] the section's routine @param {State['routines']} [routines] */
+const cards = (list, logs, day, today, tag, routine = null, routines = []) => list.map((h, i) => habitCard(h, logs, day, today, {
+  tag, move: reordering ? { first: i === 0, last: i === list.length - 1 } : null,
+  section: routine ? esc(routine.id) : '', share: shareText(h, routine, routines, logs, day),
+  doneHere: routine && routinesOf(h, routines).length > 1 ? doneIn(h, routine, routines, logs, day) : null,
+})).join('');
 
-/** One section of Today: a routine with its habits, or the loose habits under "Other habits".
+/** One section of Today: a routine with its habits, or the loose habits under "Other habits". Each is a
+ *  region named by its routine (or "Other habits"), so a habit's buttons can be found inside one section.
  *  @param {{ routine: State['routines'][number] | null, habits: Habit[] }} entry from groupHabits()
  *  @param {{ first: boolean, last: boolean }} at among the routines
- *  @param {State['logs']} logs @param {string} day @param {string} today */
-function section(entry, at, logs, day, today) {
+ *  @param {State} state @param {string} day @param {string} today */
+function section(entry, at, { habits: all, logs, routines = [] }, day, today) {
   const { routine, habits } = entry;
-  const list = `<ul class="habits" role="list">${cards(habits, logs, day, today, 'h3')}</ul>`;
+  const list = `<ul class="habits" role="list">${cards(habits, logs, day, today, 'h3', routine, routines)}</ul>`;
   if (!routine) {
     return `<section class="routine" data-key="loose" aria-labelledby="routine-title-loose">
       <div class="routine-head"><h2 id="routine-title-loose">Other habits</h2></div>${list}</section>`;
   }
   const id = esc(routine.id), name = esc(routine.name);
-  const { done, total } = summary(habits, logs, day);
-  return `<section class="routine" data-key="routine-${id}" aria-labelledby="routine-title-${id}">
+  const { done, total } = routineProgress(routine, all, routines, logs, day);
+  return `<section class="routine" data-key="routine-${id}" aria-labelledby="routine-name-${id}">
     <div class="routine-head">
       <h2 id="routine-title-${id}"><button type="button" class="habit-edit" data-action="edit-routine" data-id="${id}"
-        aria-label="${name}, edit routine"><span>${name}</span>${icon('edit', 16)}</button></h2>
+        aria-label="${name}, edit routine"><span id="routine-name-${id}">${name}</span>${icon('edit', 16)}</button></h2>
       ${total > 0 && !reordering ? `<p class="routine-count num${done === total ? ' is-all' : ''}">${done === total ? icon('check', 16) : ''}${done} of ${total} done</p>` : ''}
       ${reordering ? moveButtons('routine', id, name, at) : ''}
     </div>
-    ${total > 0 ? list : '<p class="routine-empty muted small">No habits in this routine yet. Open a habit, or add one, and choose this routine in it.</p>'}
+    ${total > 0 ? list : '<p class="routine-empty muted small">No habits in this routine yet. Open a habit, or add one, and check this routine in it.</p>'}
   </section>`;
 }
 
@@ -189,7 +197,7 @@ export function render(state, ctx) {
   const lists = routines.length === 0
     ? `<ul class="habits" role="list" data-key="habits" data-day="${day}">${cards(habits, logs, day, today, 'h2')}</ul>`
     : `<div class="routines" data-key="habits" data-day="${day}">${groups.map((entry, i) => section(entry,
-      { first: i === 0, last: i === routines.length - 1 }, logs, day, today)).join('')}</div>`;
+      { first: i === 0, last: i === routines.length - 1 }, state, day, today)).join('')}</div>`;
   return `${head}
     ${empty || `${bar}
     ${dayPicker(today, day, state)}`}
@@ -204,20 +212,21 @@ export function render(state, ctx) {
  *  goes back to the button that was pressed, or to its twin when the item has reached the end.
  *  @param {HTMLElement} root @param {Ctx} ctx @param {HTMLElement} el */
 function move(root, ctx, el) {
-  const { kind, id = '' } = el.dataset, delta = Number(el.dataset.delta);
+  const { kind, id = '', section = '' } = el.dataset, delta = Number(el.dataset.delta);
   const { habits, routines = [] } = ctx.store.getState();
   const item = (kind === 'routine' ? routines : habits).find((x) => x.id === id);
-  const ids = kind === 'routine' ? movedRoutines(routines, id, delta) : movedHabits(habits, routines, id, delta);
+  // A habit moves inside the section where the button was pressed (a shared habit is in several).
+  const ids = kind === 'routine' ? movedRoutines(routines, id, delta) : moveHabitIds(habits, routines, section || null, id, delta);
   if (!item || !ids) return;
   if (kind === 'routine') ctx.store.reorderRoutines(ids);
   else ctx.store.reorderHabits(ids);
   const twins = /** @type {HTMLButtonElement[]} */ ([...root.querySelectorAll('[data-action="move"]')])
-    .filter((b) => b.dataset.kind === kind && b.dataset.id === id);
+    .filter((b) => b.dataset.kind === kind && b.dataset.id === id && (kind === 'routine' || b.dataset.section === section));
   const same = twins.find((b) => Number(b.dataset.delta) === delta);
   (same && !same.disabled ? same : twins.find((b) => !b.disabled))?.focus();
   const after = ctx.store.getState();
   const list = kind === 'routine' ? (after.routines ?? [])
-    : groupHabits(after.habits, after.routines ?? []).map((/** @type {{ habits: Habit[] }} */ g) => g.habits).find((g) => g.some((h) => h.id === id)) ?? [];
+    : groupHabits(after.habits, after.routines ?? []).find((/** @type {{ routine: { id: string } | null }} */ g) => (g.routine?.id ?? '') === section)?.habits ?? [];
   announce(`${item.name} moved ${delta < 0 ? 'up' : 'down'}: now ${list.findIndex((x) => x.id === id) + 1} of ${list.length}`);
 }
 

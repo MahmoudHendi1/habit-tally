@@ -2,13 +2,13 @@
 // The demo store: the Store contract (docs/contracts.md section 5) kept in browser storage under one key.
 // No network and no real accounts: there is one data set per browser, whatever email is typed.
 import { LIMITS, keyOf, monthId, countOn, recentDays, cleanHabit, validateHabit, sortHabits,
-  cleanRoutine, validateRoutine, sortRoutines } from '../shared/logic.js';
+  cleanRoutine, validateRoutine, sortRoutines, routineIdsOf } from '../shared/logic.js';
 import { StoreError } from './store.js';
 import { sampleData } from './sample-data.js';
 
 /** @typedef {{ id: string, name: string, period: 'day' | 'week', target: number, unit: string, times: string[],
  *     created: string, archived: boolean, deletedAt: null | number, order: number, updatedAt: number,
- *     routine: string }} Habit */
+ *     routines: string[] }} Habit */
 /** @typedef {{ id: string, name: string, times: string[], order: number, deletedAt: null | number,
  *     updatedAt: number }} Routine */
 /** @typedef {Record<string, Record<string, Record<string, number>>>} Logs month, then day, then habit id */
@@ -86,18 +86,34 @@ const isSaved = (x) => isObject(x) && x.v === 1 && typeof x.signedIn === 'boolea
   && Array.isArray(x.habits) && x.habits.every(isHabit) && isLogs(x.logs)
   && (x.routines === undefined || (Array.isArray(x.routines) && x.routines.every(isRoutine)));
 
+/** A stored habit in the shape of contract v1.4, or null when it already has that shape. Data of v1.3 has
+ *  `routine: '' | <id>` and no `routines`; data from before v1.3 has neither and is loose. Every other field
+ *  is kept, and so is an id whose routine is deleted (routinesOf ignores it until the routine is restored).
+ *  @param {any} h @param {number} updatedAt @returns {Habit | null} */
+function newShape(h, updatedAt) {
+  if (Array.isArray(h.routines) && !('routine' in h)) return null;
+  const { routine: _, ...rest } = h;
+  return { ...rest, routines: routineIdsOf(h), updatedAt };
+}
+
 /** The saved data, or null when there is none or any part of it is damaged. Habits and routines with an
  *  unsafe id are left out. Data saved before routines existed has no `routines` and its habits no `routine`:
- *  it is read as no routines and loose habits. Never throws.
- *  @param {KeyValue} storage @returns {Saved | null} */
-function readSaved(storage) {
+ *  it is read as no routines and loose habits. Habits saved before contract v1.4 are read in the new shape
+ *  (newShape), and `rewrite` says the key must be saved again once. Never throws.
+ *  @param {KeyValue} storage @param {number} updatedAt for rewritten habits
+ *  @returns {{ saved: Saved, rewrite: boolean } | null} */
+function readSaved(storage, updatedAt) {
   try {
     const found = JSON.parse(storage.getItem(STORAGE_KEY) ?? 'null');
     if (!isSaved(found)) return null;
-    const habits = found.habits.filter((/** @type {Habit} */ h) => isSafeId(h.id))
-      .map((/** @type {Habit} */ h) => (typeof h.routine === 'string' ? h : { ...h, routine: '' }));
+    let rewrite = false;
+    const habits = found.habits.filter((/** @type {Habit} */ h) => isSafeId(h.id)).map((/** @type {Habit} */ h) => {
+      const moved = newShape(h, updatedAt);
+      rewrite ||= moved !== null;
+      return moved ?? h;
+    });
     const routines = (found.routines ?? []).filter((/** @type {Routine} */ r) => isSafeId(r.id));
-    return { signedIn: found.signedIn, user: found.user, habits, routines, logs: found.logs };
+    return { saved: { signedIn: found.signedIn, user: found.user, habits, routines, logs: found.logs }, rewrite };
   } catch {
     return null;
   }
@@ -112,15 +128,18 @@ function readSaved(storage) {
  */
 export function createLocalStore({ storage = defaultStorage(), now = () => new Date(), tz = deviceZone(), sample = false } = {}) {
   const today = () => keyOf(now());
-  const found = readSaved(storage);
+  const found = readSaved(storage, now().getTime());
   /** @type {Saved} */
-  let saved = found ?? { signedIn: true, user: { ...DEMO_USER, tz }, habits: [], routines: [], logs: {} };
+  let saved = found?.saved ?? { signedIn: true, user: { ...DEMO_USER, tz }, habits: [], routines: [], logs: {} };
   /** @type {State['lastError']} */
   let lastError = null;
   let state = view();
   /** @type {Set<(state: State) => void>} */
   const listeners = new Set();
   if (!found && sample) commit({ ...saved, ...sampleData(today()) });
+  // Old habits are saved once in the new shape. Nobody listens yet, so this is part of the load and not a
+  // change; if storage refuses, lastError says so and the next load tries again.
+  if (found?.rewrite) commit(saved);
 
   /** @returns {State} */
   function view() {
@@ -175,11 +194,12 @@ export function createLocalStore({ storage = defaultStorage(), now = () => new D
   /** @param {any} input @returns {string} */
   function saveHabit(input) {
     if (!saved.signedIn) throw new StoreError('not-ready', 'Sign in to change habits.');
-    // Only a live routine can be joined. Any other value (none, unknown, deleted) leaves the habit loose,
-    // and it must be dropped before cleaning, because cleanHabit empties the times of a habit with a routine.
-    const routine = state.routines.some((r) => r.id === input?.routine) ? input.routine : '';
-    const fields = /** @type {Pick<Habit, 'name' | 'period' | 'target' | 'unit' | 'times' | 'routine'>} */ (
-      cleanHabit({ ...input, routine }));
+    // Only live routines can be joined. Other ids (unknown, deleted) are dropped for good, and before
+    // cleaning, because cleanHabit empties the times of a habit with a routine: with none left it is loose
+    // and keeps its times. routineIdsOf also reads the `routine` string of a v1.3 caller.
+    const routines = routineIdsOf(input).filter((id) => state.routines.some((r) => r.id === id));
+    const fields = /** @type {Pick<Habit, 'name' | 'period' | 'target' | 'unit' | 'times' | 'routines'>} */ (
+      cleanHabit({ ...input, routines }));
     const problems = validateHabit(fields);
     if (problems.length > 0) throw new StoreError('invalid', problems[0], problems);
     if (input.id) {
@@ -228,8 +248,8 @@ export function createLocalStore({ storage = defaultStorage(), now = () => new D
     return routine.id;
   }
 
-  /** Soft delete. Its habits are not touched: they keep naming it, are loose meanwhile (routineOf in
-   *  shared/logic.js) and are its members again after a restore. Unknown and already deleted ids are ignored.
+  /** Soft delete. Its habits are not touched: they keep naming it, are left out of it meanwhile (routinesOf
+   *  in shared/logic.js; loose if they have no other live routine) and are its members again after a restore. Unknown and already deleted ids are ignored.
    *  @param {string} id */
   function deleteRoutine(id) {
     if (!state.routines.some((r) => r.id === id)) return; // empty when signed out; deleted routines are not in it
