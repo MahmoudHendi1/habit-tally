@@ -43,20 +43,20 @@ export function sampleData(today) {
   const rest = { created: start, archived: false, deletedAt: null, updatedAt: Date.parse(`${start}T00:00:00Z`) };
   /** @type {import('./store-local.js').Habit} */
   const water = { id: 'sampleWaterHabit0001', name: 'Drink water', period: 'day', target: 6, unit: 'glasses',
-    times: ['09:00', '13:00', '17:00'], ...rest, order: 1, routine: '' };
+    times: ['09:00', '13:00', '17:00'], ...rest, order: 1, routines: [] };
   /** @type {import('./store-local.js').Habit} */
   const run = { id: 'sampleRunHabit000001', name: 'Go for a run', period: 'week', target: 3, unit: 'runs',
-    times: ['18:00'], ...rest, order: 2, routine: '' };
+    times: ['18:00'], ...rest, order: 2, routines: [] };
   /** @type {import('./store-local.js').Routine} */
   const morning = { id: 'sampleMorningRoutine', name: 'Morning', times: ['07:00'], order: 1, deletedAt: null,
     updatedAt: rest.updatedAt };
   // A habit in a routine has no reminder times of its own: the routine reminds for both at 07:00.
   /** @type {import('./store-local.js').Habit} */
   const vitamins = { id: 'sampleVitaminsHabit1', name: 'Take vitamins', period: 'day', target: 1, unit: '',
-    times: [], ...rest, order: 3, routine: morning.id };
+    times: [], ...rest, order: 3, routines: [morning.id] };
   /** @type {import('./store-local.js').Habit} */
   const teeth = { id: 'sampleTeethHabit0001', name: 'Brush teeth', period: 'day', target: 1, unit: '',
-    times: [], ...rest, order: 4, routine: morning.id };
+    times: [], ...rest, order: 4, routines: [morning.id] };
 
   /** @type {import('./store-local.js').Logs} */
   const logs = {};

@@ -4,11 +4,12 @@
 // optimistic and must show before the call returns, and again after `settle()`, because a backend that
 // confirms a little later must not take the change back.
 import assert from 'node:assert/strict';
-import { LIMITS, addDays, countOn, groupHabits, monthId, routineOf, sortRoutines, startDay, stats } from '../shared/logic.js';
+import { LIMITS, addDays, countOn, groupHabits, monthId, moveHabitIds, routinesOf, sortRoutines, startDay, stats } from '../shared/logic.js';
 import { StoreError } from '../src/store.js';
 
 const WATER = { name: 'Water', period: 'day', target: 3, unit: 'glasses', times: ['09:00'] };
 const MORNING = { name: 'Morning', times: ['07:00'] };
+const EVENING = { name: 'Evening', times: ['21:00'] };
 const shortWait = () => new Promise((resolve) => setTimeout(resolve, 5));
 const anotherZone = (store) => (store.getState().user.tz === 'Africa/Cairo' ? 'Asia/Tokyo' : 'Africa/Cairo');
 const UNKNOWN_ID = 'noSuchHabit000000000';
@@ -65,7 +66,7 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
       const [first, next] = store.getState().habits;
       const { order, updatedAt, ...rest } = first;
       assert.deepEqual(rest, { id, name: 'Drink water', period: 'day', target: 8, unit: 'glasses', times: ['09:00', '15:00'],
-        routine: '', created: today, archived: false, deletedAt: null });
+        routines: [], created: today, archived: false, deletedAt: null });
       assert.deepEqual([typeof order, typeof updatedAt], ['number', 'number']);
       assert.deepEqual([next.id, next.period, next.order > order], [second, 'week', true]);
       assert.equal(store.getState().habits.length, 2);
@@ -92,7 +93,7 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     await holds(() => {
       assert.deepEqual(store.getState().habits.map((h) => h.id), [id]);
       const { updatedAt, ...rest } = habit(id);
-      assert.deepEqual(rest, { id, ...WATER, routine: '', created: today, archived: false, deletedAt: null, order: 1 });
+      assert.deepEqual(rest, { id, ...WATER, routines: [], created: today, archived: false, deletedAt: null, order: 1 });
       assert.ok(updatedAt > 5);
     });
   });
@@ -454,65 +455,164 @@ export function runStoreContract({ test, makeStore, label = 'store' }) {
     });
   });
 
-  check('a habit saved with a live routine has no times of its own; with an unknown or deleted routine it is loose and keeps its times', async ({ store, holds, habit }) => {
-    const live = store.saveRoutine(MORNING);
-    const member = store.saveHabit({ ...WATER, name: 'Member', routine: live }); // at once: the routine is already in the state
+  // ---------- habits in several routines (contract v1.4) ----------
+
+  const sortedIds = (ids) => [...ids].sort();
+  const sectionsOf = (store) => groupHabits(store.getState().habits, store.getState().routines)
+    .map((entry) => [entry.routine?.id ?? null, entry.habits.map((h) => h.id)]);
+
+  check('saveHabit keeps the live routine ids and empties the times; unknown and deleted ids are dropped, and with none left the habit is loose and keeps its times', async ({ store, holds, habit }) => {
+    const morning = store.saveRoutine(MORNING);
+    const evening = store.saveRoutine(EVENING); // at once: both routines are already in the state
     const gone = store.saveRoutine({ name: 'Gone' });
     store.deleteRoutine(gone);
-    const notRoutines = { unknown: UNKNOWN_ID, deleted: gone, 'a habit id': member, missing: undefined, empty: '', 'not a string': 42, 'not an id': 'Morning' };
-    const loose = Object.entries(notRoutines).map(([name, value]) => [name, store.saveHabit({ ...WATER, name, routine: value })]);
+    const both = store.saveHabit({ ...WATER, name: 'Both', routines: [evening, morning] });
+    const some = store.saveHabit({ ...WATER, name: 'Some', routines: [UNKNOWN_ID, morning, gone, both, morning] });
+    const oldCaller = store.saveHabit({ ...WATER, name: 'Old caller', routine: evening }); // a v1.3 caller's `routine`
+    const notRoutines = { unknown: [UNKNOWN_ID], deleted: [gone], 'a habit id': [both], 'not strings': [42, null],
+      'not ids': ['Morning', ' '], empty: [], missing: undefined, 'not a list': morning };
+    const loose = Object.entries(notRoutines).map(([name, value]) => [name, store.saveHabit({ ...WATER, name, routines: value })]);
     await holds(() => {
-      assert.deepEqual([habit(member).routine, habit(member).times], [live, []]);
-      assert.equal(routineOf(habit(member), store.getState().routines)?.id, live);
+      const { routines } = store.getState();
+      assert.deepEqual([sortedIds(habit(both).routines), habit(both).times], [sortedIds([morning, evening]), []]);
+      assert.deepEqual(routinesOf(habit(both), routines).map((r) => r.id), [morning, evening]);
+      assert.deepEqual([habit(some).routines, habit(some).times], [[morning], []]);
+      assert.deepEqual([habit(oldCaller).routines, habit(oldCaller).times], [[evening], []]);
       for (const [name, id] of loose) {
-        assert.deepEqual([habit(id).routine, habit(id).times], ['', WATER.times], `routine ${name}`);
-        assert.equal(routineOf(habit(id), store.getState().routines), null, `routine ${name}`);
+        assert.deepEqual([habit(id).routines, habit(id).times], [[], WATER.times], `routines ${name}`);
+        assert.deepEqual(routinesOf(habit(id), routines), [], `routines ${name}`);
+      }
+      for (const h of store.getState().habits) {
+        assert.ok(Array.isArray(h.routines) && !('routine' in h), `${h.name}: a routines list and no routine field`);
       }
     });
   });
 
-  check('saveHabit moves a habit into and out of a routine; it keeps its id, start date and order', async ({ store, holds, habit }) => {
+  check(`saveHabit: more than ${LIMITS.routinesPerHabitMax} live routines throw StoreError "invalid"; deleted ones besides do not count`, async ({ store, holds, habit }) => {
+    const ids = Array.from({ length: LIMITS.routinesPerHabitMax + 1 }, (_, i) => store.saveRoutine({ name: `Routine ${i + 1}` }));
+    const id = store.saveHabit({ ...WATER, routines: ids.slice(0, 2) });
+    const before = habit(id);
+    for (const input of [{ ...WATER, routines: ids }, { ...WATER, id, routines: ids }]) {
+      assert.throws(() => store.saveHabit(input), (err) => fails('invalid')(err) && err.message === err.details[0], JSON.stringify(input));
+    }
+    store.deleteRoutine(ids[0]);
+    const five = store.saveHabit({ ...WATER, name: 'Five', routines: ids });
+    await holds(() => {
+      assert.deepEqual(store.getState().habits.map((h) => h.id), [id, five]);
+      assert.deepEqual(habit(id), before);
+      assert.deepEqual(sortedIds(habit(five).routines), sortedIds(ids.slice(1)));
+    });
+  });
+
+  check('saveHabit moves a habit into and out of routines; it keeps its id, start date and order; a missing `routines` means none', async ({ store, holds, habit }) => {
     const id = store.saveHabit(WATER);
     store.saveHabit({ ...WATER, name: 'Other' });
     const morning = store.saveRoutine(MORNING);
+    const evening = store.saveRoutine(EVENING);
     const { updatedAt: _, ...before } = habit(id);
-    const withoutUpdatedAt = () => { const { updatedAt, ...rest } = habit(id); return rest; };
-    store.saveHabit({ ...WATER, id, routine: morning });
-    await holds(() => assert.deepEqual(withoutUpdatedAt(), { ...before, routine: morning, times: [] }));
-    store.saveHabit({ ...WATER, id }); // the whole editor data: no `routine` means none
-    await holds(() => assert.deepEqual(withoutUpdatedAt(), before));
-    store.saveHabit({ ...WATER, id, routine: morning });
+    const now = () => { const { updatedAt, ...rest } = habit(id); return { ...rest, routines: sortedIds(rest.routines) }; };
+    const inRoutines = (ids) => ({ ...before, routines: sortedIds(ids), times: [] });
+    store.saveHabit({ ...WATER, id, routines: [morning] });
+    await holds(() => assert.deepEqual(now(), inRoutines([morning])));
+    store.saveHabit({ ...WATER, id, routines: [morning, evening] });
+    await holds(() => assert.deepEqual(now(), inRoutines([morning, evening])));
+    store.saveHabit({ ...WATER, id, routines: [evening] });
+    await holds(() => assert.deepEqual(now(), inRoutines([evening])));
+    store.saveHabit({ ...WATER, id }); // the whole editor data: no `routines` means none, and its times are back
+    await holds(() => assert.deepEqual(now(), before));
+    store.saveHabit({ ...WATER, id, routines: [morning, evening] });
     store.deleteRoutine(morning);
-    store.saveHabit({ ...WATER, id, routine: morning }); // saved again while its routine is deleted: it leaves it for good
+    store.saveHabit({ ...WATER, id, routines: [morning, evening] }); // saved while Morning is deleted: it leaves Morning for good
     store.restoreRoutine(morning);
-    await holds(() => assert.deepEqual(withoutUpdatedAt(), before));
+    await holds(() => assert.deepEqual(now(), inRoutines([evening])));
+    store.deleteRoutine(evening);
+    store.saveHabit({ ...WATER, id, routines: [evening] }); // no live routine left: loose, with the times it was given
+    store.restoreRoutine(evening);
+    await holds(() => assert.deepEqual(now(), before));
   });
 
-  check('deleting a routine leaves its habits unchanged and loose; restoring it brings them back', async ({ store, today, holds, settle, routine, count }) => {
+  check('a habit in two routines is in both sections and once in the list, with one count that every tap adds to', async ({ store, today, holds, habit, count }) => {
     const morning = store.saveRoutine(MORNING);
-    const [pills, teeth] = ['Pills', 'Teeth'].map((name) => store.saveHabit({ ...WATER, name, routine: morning }));
+    const evening = store.saveRoutine(EVENING);
+    const teeth = store.saveHabit({ ...WATER, name: 'Teeth', target: 2, routines: [morning, evening] });
+    const pills = store.saveHabit({ ...WATER, name: 'Pills', routines: [morning] });
+    const alone = store.saveHabit({ ...WATER, name: 'Alone' });
+    await holds(() => {
+      assert.deepEqual(sectionsOf(store), [[morning, [teeth, pills]], [evening, [teeth]], [null, [alone]]]);
+      assert.deepEqual(store.getState().habits.map((h) => h.id), [teeth, pills, alone]);
+      const [inMorning, inEvening] = groupHabits(store.getState().habits, store.getState().routines);
+      assert.equal(inMorning.habits[0], inEvening.habits[0], 'the same habit object in both sections');
+    });
+    store.addCount(today, teeth, 1); // the tap in Morning
+    await holds(() => assert.equal(count(teeth), 1));
+    store.addCount(today, teeth, 1); // the tap in Evening: a count is per habit, whatever section it was made in
+    await holds(() => {
+      assert.equal(count(teeth), 2);
+      assert.deepEqual(store.getState().logs, { [monthId(today)]: { [today]: { [teeth]: 2 } } });
+      assert.equal(stats(habit(teeth), store.getState().logs, today).total, 2);
+    });
+  });
+
+  check('deleting one of two routines leaves the habit unchanged and in the other; deleting the last makes it loose; restoring brings it back', async ({ store, today, holds, settle, habit, routine, count }) => {
+    const morning = store.saveRoutine(MORNING);
+    const evening = store.saveRoutine(EVENING);
+    const teeth = store.saveHabit({ ...WATER, name: 'Teeth', routines: [morning, evening] });
+    const pills = store.saveHabit({ ...WATER, name: 'Pills', routines: [morning] });
     const alone = store.saveHabit({ ...WATER, name: 'Alone' });
     await settle();
     const habitsBefore = store.getState().habits;
-    const sections = () => groupHabits(store.getState().habits, store.getState().routines)
-      .map((entry) => [entry.routine?.id ?? null, entry.habits.map((h) => h.id)]);
-    await holds(() => assert.deepEqual(sections(), [[morning, [pills, teeth]], [null, [alone]]]));
+    await holds(() => assert.deepEqual(sectionsOf(store), [[morning, [teeth, pills]], [evening, [teeth]], [null, [alone]]]));
 
+    store.deleteRoutine(evening);
+    await holds(() => {
+      assert.deepEqual(store.getState().routines.map((r) => r.id), [morning]);
+      assert.deepEqual(store.getState().habits, habitsBefore, 'no habit was written: same routines, no times, same updatedAt');
+      assert.deepEqual(sectionsOf(store), [[morning, [teeth, pills]], [null, [alone]]], 'still in Morning, not loose');
+    });
     store.deleteRoutine(morning);
     await holds(() => {
-      assert.deepEqual(store.getState().routines, []);
-      assert.deepEqual(store.getState().habits, habitsBefore, 'no habit was written: same routine value, no times, same updatedAt');
-      assert.deepEqual(sections(), [[null, [pills, teeth, alone]]]);
+      assert.deepEqual(store.getState().habits, habitsBefore);
+      assert.deepEqual(sectionsOf(store), [[null, [teeth, pills, alone]]]);
+      assert.deepEqual([habit(teeth).times, habit(pills).times], [[], []], 'loose, with no reminder times');
     });
-    store.addCount(today, pills, 1); // counting does not look at routines
-    await holds(() => assert.equal(count(pills), 1));
+    store.addCount(today, teeth, 1); // counting does not look at routines
+    await holds(() => assert.equal(count(teeth), 1));
 
+    store.restoreRoutine(evening);
+    await holds(() => assert.deepEqual(sectionsOf(store), [[evening, [teeth]], [null, [pills, alone]]]));
     store.restoreRoutine(morning);
     await holds(() => {
-      assert.equal(routine(morning).deletedAt, null);
+      assert.deepEqual([routine(morning).deletedAt, routine(evening).deletedAt], [null, null]);
       assert.deepEqual(store.getState().habits, habitsBefore);
-      assert.deepEqual(sections(), [[morning, [pills, teeth]], [null, [alone]]]);
-      assert.equal(count(pills), 1);
+      assert.deepEqual(sectionsOf(store), [[morning, [teeth, pills]], [evening, [teeth]], [null, [alone]]]);
+      assert.equal(count(teeth), 1);
+    });
+  });
+
+  check('reorderHabits(moveHabitIds(...)) moves a habit one place in its section and numbers the habits 1..n', async ({ store, holds }) => {
+    const morning = store.saveRoutine(MORNING);
+    const evening = store.saveRoutine(EVENING);
+    const a = store.saveHabit({ ...WATER, name: 'A' });
+    const b = store.saveHabit({ ...WATER, name: 'B', routines: [morning, evening] });
+    const c = store.saveHabit({ ...WATER, name: 'C', routines: [morning] });
+    const d = store.saveHabit({ ...WATER, name: 'D', routines: [evening] });
+    const e = store.saveHabit({ ...WATER, name: 'E' });
+    store.deleteHabit(store.saveHabit({ ...WATER, name: 'Gone' }));
+    const ids = (routineId, id, delta) => moveHabitIds(store.getState().habits, store.getState().routines, routineId, id, delta);
+    const orders = () => store.getState().habits.map((h) => [h.id, h.order]);
+    await holds(() => assert.deepEqual(sectionsOf(store), [[morning, [b, c]], [evening, [b, d]], [null, [a, e]]]));
+    assert.equal(ids(morning, a, 1), null, 'A is not in Morning');
+    assert.equal(ids(morning, b, -1), null, 'B is first in Morning');
+
+    store.reorderHabits(ids(morning, c, -1));
+    await holds(() => {
+      assert.deepEqual(orders(), [[a, 1], [c, 2], [b, 3], [d, 4], [e, 5]]);
+      assert.deepEqual(sectionsOf(store), [[morning, [c, b]], [evening, [b, d]], [null, [a, e]]]);
+    });
+    store.reorderHabits(ids(evening, b, 1));
+    await holds(() => {
+      assert.deepEqual(orders(), [[a, 1], [c, 2], [d, 3], [b, 4], [e, 5]]);
+      assert.deepEqual(sectionsOf(store), [[morning, [c, b]], [evening, [d, b]], [null, [a, e]]]);
     });
   });
 
