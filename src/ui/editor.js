@@ -2,7 +2,7 @@
 // The habit editor: a bottom sheet to add, change or delete a habit and to choose its reminder times
 // (R1, R4). Not a screen: screens open it with ctx.openEditor(). Contract: src/ui/common.js, rules 1 to 6.
 // Styles: editor.css. The first half of this file is pure (no DOM) and is tested by test/editor.test.mjs.
-import { LIMITS, cleanHabit, validateHabit, cleanTimes, everyHours, cleanRoutine, validateRoutine, routineOf } from '../../shared/logic.js';
+import { LIMITS, cleanHabit, validateHabit, cleanTimes, everyHours, cleanRoutine, validateRoutine, routinesOf } from '../../shared/logic.js';
 import { StoreError } from '../store.js';
 import { esc, patch, on, icon, openSheet } from './common.js';
 
@@ -10,11 +10,12 @@ import { esc, patch, on, icon, openSheet } from './common.js';
 /** @typedef {import('./common.js').Habit} Habit */
 /** @typedef {import('./common.js').PushStatus} PushStatus */
 /** What the form holds. `target` is the text in the box, so "2.5" or "abc" can be refused rather than rounded.
- *  `routine` is '' (None), the id of a routine, or NEW_ROUTINE, and then `routineName` is the name typed for it.
- *  `times` keeps the habit's own reminder times while a routine is chosen, so going back to None shows them again.
- *  @typedef {{ name: string, period: string, target: string, unit: string, times: string[], routine: string,
+ *  `routines` holds the checked boxes of the "Routines" group, in their order: routine ids, and NEW_ROUTINE when
+ *  "New routine..." is checked, and then `routineName` is the name typed for it (contract v1.4, section 10).
+ *  `times` keeps the habit's own reminder times while a routine is checked, so unchecking them all shows them again.
+ *  @typedef {{ name: string, period: string, target: string, unit: string, times: string[], routines: string[],
  *    routineName: string }} FormValues */
-/** @typedef {'name' | 'period' | 'target' | 'unit' | 'times' | 'routine' | 'routineName' | 'form'} Field */
+/** @typedef {'name' | 'period' | 'target' | 'unit' | 'times' | 'routines' | 'routineName' | 'form'} Field */
 /** @typedef {{ field: Field, message: string }} Problem */
 
 // ================================ pure parts ================================
@@ -25,32 +26,32 @@ export const HALF_HOURS = everyHours('00:00', '23:30', 0.5);
 /** The choices of "Every N hours" in the quick fill. */
 export const EVERY_CHOICES = [0.5, 1, 2, 3, 4, 6];
 
-/** The value of the "Routine" choice that stands for "New routine...". Never a routine id (those are 20 characters). */
+/** The value of the "New routine..." checkbox in the "Routines" group. Never a routine id (those are 20 characters). */
 export const NEW_ROUTINE = 'new';
 
 /** The form of a new habit. @returns {FormValues} */
-export const blankForm = () => ({ name: '', period: 'day', target: '1', unit: '', times: [], routine: '', routineName: '' });
+export const blankForm = () => ({ name: '', period: 'day', target: '1', unit: '', times: [], routines: [], routineName: '' });
 
-/** The form filled from a stored habit. Its routine is the live one it is in (`routineOf`), so a habit of a
- *  deleted routine shows None.
- *  @param {Pick<Habit, 'name' | 'period' | 'target' | 'unit' | 'times'> & { routine?: string }} habit
+/** The form filled from a stored habit. Its boxes are the live routines it is in (`routinesOf`), so the id of a
+ *  deleted routine checks nothing (and is dropped on Save).
+ *  @param {Pick<Habit, 'name' | 'period' | 'target' | 'unit' | 'times'> & { routines?: string[], routine?: string }} habit
  *  @param {{ id: string }[]} [routines] `state.routines` @returns {FormValues} */
 export const formOf = (habit, routines = []) => ({
   name: habit.name, period: habit.period, target: String(habit.target), unit: habit.unit, times: cleanTimes(habit.times),
-  routine: routineOf(habit, routines)?.id ?? '', routineName: '',
+  routines: routinesOf(habit, routines).map((/** @type {{ id: string }} */ r) => r.id), routineName: '',
 });
 
 /** Form values as the input of `store.saveHabit()`: with `id` to change a habit, without to add one.
  *  The target becomes a number as typed (NaN when it is not one); tidying is left to `cleanHabit`.
- *  `routine` is always there ('' for None). A habit in a routine has no reminder times of its own. For
- *  "New routine..." the routine is '' here: the editor saves the routine first and then puts its id in.
+ *  `routines` is always there ([] for none) and `routine` never is. A habit in a routine has no reminder times
+ *  of its own. "New routine..." is left out here: the editor saves the routine first and then adds its id.
  *  @param {FormValues} form @param {string | null} [id] */
 export function toInput(form, id = null) {
   const target = form.target.trim();
   return {
     ...(id ? { id } : {}),
     name: form.name, period: form.period, target: target === '' ? NaN : Number(target), unit: form.unit,
-    times: form.routine ? [] : [...form.times], routine: form.routine === NEW_ROUTINE ? '' : form.routine,
+    times: form.routines.length > 0 ? [] : [...form.times], routines: form.routines.filter((r) => r !== NEW_ROUTINE),
   };
 }
 
@@ -65,7 +66,7 @@ export function checkRoutineName(name) {
 /** Which field a sentence from `validateHabit` is about ('form' when it is about none of them).
  *  @param {string} message @returns {Field} */
 export function fieldOf(message) {
-  if (/\broutine\b/i.test(message)) return 'routine';
+  if (/\broutines?\b/i.test(message)) return 'routines';
   if (/\bname\b/i.test(message)) return 'name';
   if (/\bper day\b|\bper week\b/i.test(message)) return 'period';
   if (/\btarget\b/i.test(message)) return 'target';
@@ -90,7 +91,8 @@ export function checkForm(form, id = null) {
  *  @param {FormValues} form @param {FormValues} opened @returns {boolean} */
 export function formChanged(form, opened) {
   const key = (/** @type {FormValues} */ f) => JSON.stringify([f.name.trim(), f.period, f.target.trim(), f.unit.trim(),
-    f.routine ? [] : cleanTimes(f.times), f.routine, f.routine === NEW_ROUTINE ? f.routineName.trim() : '']);
+    f.routines.length > 0 ? [] : cleanTimes(f.times), [...new Set(f.routines)].sort(),
+    f.routines.includes(NEW_ROUTINE) ? f.routineName.trim() : '']);
   return key(form) !== key(opened);
 }
 
@@ -324,38 +326,54 @@ export function footView(s, { save, goneText }) {
     </div>`;
 }
 
-/** The "Routine" choice and what follows from it: the name of a new routine, or the sentence that takes
- *  the place of the reminder times. @param {Session} s */
-function routineView(s) {
-  const { routine, routineName } = s.form;
+/** When a routine reminds, in a few words: "“Morning” reminds at 07:00, 07:30." (plain text)
+ *  @param {{ name: string, times: string[] }} routine */
+function remindsAt(routine) {
+  const times = cleanTimes(routine.times);
+  if (times.length === 0) return `“${routine.name}” has no reminder times yet.`;
+  return `“${routine.name}” reminds at ${times.length > 4 ? `${times.slice(0, 4).join(', ')} and ${times.length - 4} more` : times.join(', ')}.`;
+}
+
+/** The "Routines" group (a checkbox per routine, in routine order, and "New routine..." with its name field in
+ *  place) and what follows from it: the sentence that takes the place of the reminder times while any routine
+ *  is checked (contract v1.4, section 10). @param {Session} s */
+function routinesView(s) {
+  const { routines: checked, routineName } = s.form;
   const routines = s.ctx.store.getState().routines ?? [];
-  const chosen = routines.find((r) => r.id === routine);
+  const max = LIMITS.routinesPerHabitMax;
+  const full = checked.length >= max;
   const limit = limitNote(routineName, LIMITS.routineNameMax);
-  const times = chosen ? cleanTimes(chosen.times) : [];
-  const from = routine === NEW_ROUTINE ? 'Once it is saved, tap its name on Today to choose its reminder times.'
-    : !chosen ? '' : times.length === 0 ? `“${chosen.name}” has no reminder times yet. Tap its name on Today to choose them.`
-      : `“${chosen.name}” reminds at ${times.length > 4 ? `${times.slice(0, 4).join(', ')} and ${times.length - 4} more` : times.join(', ')}, `
-        + 'with one reminder for all of its habits that are still to do.';
+  const isNew = checked.includes(NEW_ROUTINE);
+  const box = (/** @type {string} */ value, /** @type {string} */ label, /** @type {string} */ key) => {
+    const on = checked.includes(value);
+    return `<label class="editor-check" data-key="${key}"><input type="checkbox" name="routines" value="${esc(value)}"${
+      on ? ' checked' : ''}${!on && full ? ' disabled' : ''}><span>${esc(label)}</span></label>`;
+  };
+  const bad = s.problem?.field === 'routines';
+  const chosen = routines.filter((r) => checked.includes(r.id));
   // Saving into a routine drops the habit's own times (contracts section 3): say so before Save, not after.
-  const own = cleanTimes(s.opened.routine ? [] : s.form.times).length;
+  const own = cleanTimes(s.opened.routines.length > 0 ? [] : s.form.times).length;
   const lost = own > 0 ? ` This habit’s own ${own === 1 ? 'reminder time is' : `${own} reminder times are`} removed when you save.` : '';
-  return `<div class="field">
-      <label for="editor-routine">Routine</label>
-      <select class="input" id="editor-routine" name="routine"${describe(s, 'routine', ['editor-routine-hint'])}>
-        <option value="" data-key="none"${routine === '' ? ' selected' : ''}>None</option>
-        ${routines.map((r) => `<option value="${esc(r.id)}" data-key="r-${esc(r.id)}"${r.id === routine ? ' selected' : ''}>${esc(r.name)}</option>`).join('')}
-        <option value="${NEW_ROUTINE}" data-key="new"${routine === NEW_ROUTINE ? ' selected' : ''}>New routine...</option>
-      </select>
-      ${errorOf(s, 'routine')}
-      <p class="field-hint" id="editor-routine-hint">A routine is a list of habits you do together, like your morning, with one reminder for all of them.</p>
-    </div>
-    ${routine === NEW_ROUTINE ? `<div class="field" id="editor-new-routine">
-      <label for="editor-routine-name">Name of the new routine</label>
-      <input class="input" id="editor-routine-name" name="routineName" type="text" value="${esc(routineName)}" placeholder="Morning"
-        autocomplete="off" autocapitalize="sentences" enterkeyhint="done"${describe(s, 'routineName', limit.text ? ['editor-routineName-count'] : [])}>
-      ${errorOf(s, 'routineName')}${countView('routineName', limit)}
-    </div>` : ''}
-    ${routine ? `<div class="notice editor-from-routine" id="editor-from-routine"><p><strong>Reminders come from the routine.</strong> ${esc(from + lost)}</p></div>` : ''}`;
+  const from = [...chosen.map(remindsAt), ...(isNew ? ['Once the new routine is saved, tap its name on Today to choose its reminder times.'] : []),
+    'Each routine sends one reminder for all of its habits that are still to do.'].join(' ');
+  return `<fieldset class="editor-routines" aria-describedby="${bad ? 'editor-routines-error ' : ''}editor-routines-hint editor-routines-limit">
+      <legend>Routines</legend>
+      <p class="field-hint" id="editor-routines-hint">A routine is a list of habits you do together, like your morning, with one reminder for all of them. A habit can be in up to ${max}.</p>
+      <div class="editor-checks">
+        ${routines.map((r) => box(r.id, r.name, `r-${esc(r.id)}`)).join('')}
+        ${box(NEW_ROUTINE, 'New routine...', 'new')}
+        ${isNew ? `<div class="field editor-new-routine" id="editor-new-routine">
+          <label for="editor-routine-name">Name of the new routine</label>
+          <input class="input" id="editor-routine-name" name="routineName" type="text" value="${esc(routineName)}" placeholder="Evening"
+            autocomplete="off" autocapitalize="sentences" enterkeyhint="done"${describe(s, 'routineName', limit.text ? ['editor-routineName-count'] : [])}>
+          ${errorOf(s, 'routineName')}${countView('routineName', limit)}
+        </div>` : ''}
+      </div>
+      <p class="field-hint editor-routines-limit" id="editor-routines-limit" role="status">${full ? `That is ${max}, the most for one habit. Uncheck one to choose another.` : ''}</p>
+      ${errorOf(s, 'routines')}
+    </fieldset>
+    ${checked.length > 0 ? `<div class="notice editor-from-routine" id="editor-from-routine"><p><strong>Reminders come from the ${
+  checked.length > 1 ? 'routines' : 'routine'}.</strong> ${esc(from + lost)}</p></div>` : ''}`;
 }
 
 /** The whole content of the sheet for a session. @param {Session} s @returns {string} HTML */
@@ -401,8 +419,8 @@ function view(s) {
       ${errorOf(s, 'unit')}${count('unit', unitLimit)}
       <p class="field-hint" id="editor-unit-hint">${esc(unitHint(form))}</p>
     </div>
-    ${routineView(s)}
-    ${form.routine ? '' : remindersView({
+    ${routinesView(s)}
+    ${form.routines.length > 0 ? '' : remindersView({
     times: form.times, picks: s.picks, problem: s.problem, note: s.note, status: s.ctx.push.getStatus(),
     hint: `Reminders arrive at about the chosen time (they can be up to 20 minutes late), stop for the ${
       form.period === 'week' ? 'week' : 'day'} once the target is reached, and need “Turn on reminders” in Settings.`,
@@ -435,7 +453,8 @@ function sync(s) {
   };
   s.form = {
     ...s.form, name: text('name', s.form.name), period: text('period', s.form.period), target: text('target', s.form.target),
-    unit: text('unit', s.form.unit), routine: text('routine', s.form.routine), routineName: text('routineName', s.form.routineName),
+    unit: text('unit', s.form.unit), routineName: text('routineName', s.form.routineName),
+    routines: data.getAll('routines').filter((v) => typeof v === 'string').map(String),
   };
   s.picks = readPicks(data, s.picks);
 }
@@ -455,7 +474,7 @@ export function draw(s, fallback = '#editor-time') {
 
 const FOCUS = {
   name: '#editor-name', period: 'input[name="period"]:checked', target: '#editor-target', unit: '#editor-unit', times: '#editor-time',
-  routine: '#editor-routine', routineName: '#editor-routine-name', form: '',
+  routines: 'input[name="routines"]:not(:disabled)', routineName: '#editor-routine-name', form: '',
 };
 
 /** Show a problem at its field and put the cursor there. @param {Draft} s @param {Problem} problem */
@@ -467,15 +486,14 @@ export function fail(s, problem) {
   s.body?.querySelector(`#editor-${problem.field}-error`)?.scrollIntoView({ block: 'nearest' });
 }
 
-/** Set the "Routine" choice from code (contract rule 2b: the DOM owns the live value). A routine that is
- *  not in the list (deleted meanwhile) becomes None. @param {Session} s @param {string} routine */
-function choose(s, routine) {
-  const choice = s.body?.querySelector('#editor-routine');
-  if (!(choice instanceof HTMLSelectElement)) return;
-  choice.value = [...choice.options].some((o) => o.value === routine) ? routine : '';
-  if (s.form.routine !== choice.value) {
-    s.form.routine = choice.value;
-    draw(s);
+/** Make the "Routines" boxes match the draft (contract rule 2b: the DOM owns live values), after dropping the
+ *  routines that are no longer in the store (deleted meanwhile). @param {Session} s */
+function applyChecks(s) {
+  const live = new Set((s.ctx.store.getState().routines ?? []).map((r) => r.id));
+  s.form.routines = s.form.routines.filter((id) => id === NEW_ROUTINE || live.has(id));
+  draw(s);
+  for (const box of s.body?.querySelectorAll('input[name="routines"]') ?? []) {
+    if (box instanceof HTMLInputElement) box.checked = s.form.routines.includes(box.value);
   }
 }
 
@@ -485,33 +503,35 @@ function save(s) {
   if (s.gone) return;
   const { input, problem } = checkForm(s.form, s.id);
   if (problem) return fail(s, problem);
-  let { routine } = input;
+  let { routines } = input;
   /** The routine this Save made, and the name typed for it: taken back if the habit is then refused. */
   let created = null;
-  if (s.form.routine === NEW_ROUTINE) {
+  if (s.form.routines.includes(NEW_ROUTINE)) {
     const named = checkRoutineName(s.form.routineName);
     if (named.problem) return fail(s, named.problem);
+    let id = '';
     try {
-      routine = s.ctx.store.saveRoutine(named.input);
+      id = s.ctx.store.saveRoutine(named.input);
     } catch (err) {
       if (!(err instanceof StoreError)) throw err;
       return fail(s, { field: 'routineName', message: err.message });
     }
-    created = { id: routine, name: s.form.routineName };
-    s.form = { ...s.form, routine, routineName: '' };
-    draw(s);
-    choose(s, routine);
+    created = { id, name: s.form.routineName };
+    routines = [...routines, id];
+    s.form = { ...s.form, routines: s.form.routines.map((r) => (r === NEW_ROUTINE ? id : r)), routineName: '' };
+    applyChecks(s);
   }
   try {
-    s.ctx.store.saveHabit({ ...input, routine });
+    s.ctx.store.saveHabit({ ...input, routines });
   } catch (err) {
     if (!(err instanceof StoreError)) throw err;
     if (created) {
       // The habit was refused (for example the habit limit): leave no empty routine behind, and put the form
-      // back to "New routine..." with the typed name, so the next Save starts over cleanly.
+      // back to "New routine..." with the typed name, so the next Save starts over cleanly. The store's
+      // listener below drops the deleted id from the draft first.
       s.ctx.store.deleteRoutine(created.id);
-      s.form = { ...s.form, routine: NEW_ROUTINE, routineName: created.name };
-      draw(s);
+      s.form = { ...s.form, routines: [...s.form.routines.filter((r) => r !== created?.id), NEW_ROUTINE], routineName: created.name };
+      applyChecks(s);
     }
     return fail(s, { field: err.code === 'invalid' ? fieldOf(err.message) : 'form', message: err.message });
   }
@@ -657,7 +677,7 @@ export function openEditor(habitId, ctx) {
       if (type === 'input') s.confirming = false;
       draw(s);
       // "New routine..." asks for the name right here, in the same sheet.
-      if (type === 'change' && name === 'routine' && s.form.routine === NEW_ROUTINE) {
+      if (type === 'change' && name === 'routines' && el instanceof HTMLInputElement && el.value === NEW_ROUTINE && el.checked) {
         /** @type {HTMLElement | null | undefined} */ (s.body?.querySelector('#editor-routine-name'))?.focus();
       }
     });
@@ -672,7 +692,7 @@ export function openEditor(habitId, ctx) {
   });
 
   // A habit can be deleted on another device while it is open here: say so instead of saving into it.
-  // The same goes for the routine that is chosen: the choice falls back to None.
+  // The same goes for a routine that is checked: its box goes, and so does the check.
   let routineIds = (ctx.store.getState().routines ?? []).map((r) => r.id).join();
   unsubscribe = ctx.store.subscribe((state) => {
     const ids = (state.routines ?? []).map((r) => r.id).join();
@@ -685,6 +705,6 @@ export function openEditor(habitId, ctx) {
       s.confirming = false;
     }
     draw(s);
-    choose(s, s.form.routine); // a routine that is no longer in the list is no longer chosen
+    applyChecks(s); // a routine that is no longer in the list is no longer checked
   });
 }

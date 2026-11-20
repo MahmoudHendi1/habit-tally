@@ -73,5 +73,29 @@
   .editor-foot .btn-primary { flex: 0 1 200px; }
 }
 
-/* ---------- the Routine choice (habit editor) ---------- */
+/* ---------- the Routines checkboxes (habit editor) ---------- */
+.editor-routines { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.editor-routines legend { margin-bottom: 6px; padding: 0; font-size: 14px; font-weight: 600; color: var(--muted); }
+.editor-checks { display: grid; gap: 8px; min-width: 0; }
+.editor-check {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  min-height: var(--tap);
+  padding: 6px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-weight: 600;
+  cursor: pointer;
+}
+.editor-check span { min-width: 0; overflow-wrap: anywhere; }
+.editor-check input { flex: none; width: 22px; height: 22px; margin: 0; accent-color: var(--accent); cursor: inherit; }
+.editor-check:has(input:checked) { border-color: var(--accent-text); background: var(--accent-soft); color: var(--accent-text); }
+.editor-check:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
+.editor-check:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 2px; }
+.editor-new-routine { padding-left: 12px; border-left: 3px solid var(--accent-soft); }
+.editor-routines-limit:empty { position: absolute; } /* out of the layout, still a live region */
+.editor-routines-limit { font-weight: 600; color: var(--warn); }
 .editor-from-routine { overflow-wrap: anywhere; }
