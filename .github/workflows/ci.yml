@@ -3,8 +3,11 @@
 
 name: CI
 
+# Only main and pull requests: work-in-progress branches are pushed as backups while a change is half done,
+# and their expected test failures must not send failure emails.
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
