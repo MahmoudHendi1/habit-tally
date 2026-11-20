@@ -1,6 +1,6 @@
 // @ts-check
 // Sample data for the demo (?demo=sample) and for tests: 16 weeks of one daily and one weekly habit, and of
-// the "Morning" routine with its two daily habits.
+// the "Morning" and "Evening" routines with their two daily habits, one of which ("Brush teeth") is in both.
 // Nothing is random: the same `today` always gives the same data. The numbers the Progress screen should
 // show for one fixed day are written down in test/fixtures/sample-16-weeks.json.
 import { addDays, weekStart, monthId } from '../shared/logic.js';
@@ -17,19 +17,22 @@ const RUNS = [ // target: 3 a week
   '1000100', '1010100', '0100110', '1000000', '1010010', '1011010', '0101001', '0000000',
   '0010010', '1010100', '1010001', '0100100', '1010100', '1011000', '0110010', '1010100',
 ];
-// The two habits of the Morning routine: target 1 a day, so a digit is 1 (done) or 0 (missed).
+// "Take vitamins" (Morning only): target 1 a day, so a digit is 1 (done) or 0 (missed).
 const VITAMINS = [
   '1111100', '1111110', '1010101', '1111111', '1101100', '1111111', '1111011', '0000000',
   '0011110', '1111101', '1111111', '1101101', '1111110', '0111111', '1111111', '1111111',
 ];
+// "Brush teeth" (Morning and Evening): target 2 a day, so 2 is both done, 1 only one, 0 none.
 const TEETH = [
-  '1111100', '1111011', '1101110', '1111110', '0111101', '1111111', '1110110', '1001011',
-  '1111101', '1011110', '1111111', '1110011', '0111111', '1111101', '1101100', '1111111',
+  '2222110', '2212022', '2212221', '2222220', '1222212', '2222122', '2221221', '2112022',
+  '2222212', '2122221', '2222222', '2221022', '1222222', '2222212', '2212122', '2222222',
 ];
-// Today is still in progress, so the Today screen has something left to tap: some water, no run yet, and
-// the Morning routine half done ("1 of 2 done": the vitamins taken, the teeth not brushed yet).
+// Today is still in progress, so the Today screen has something left to tap: some water, no run yet, the
+// Morning routine done ("2 of 2 done": the vitamins taken, the teeth brushed once) and the Evening routine
+// not ("0 of 1 done": the teeth not brushed a second time).
 const GLASSES_TODAY = 2;
 const VITAMINS_TODAY = 1;
+const TEETH_TODAY = 1;
 
 /**
  * Habits, routines and logs for the 16 Monday-to-Sunday weeks that end with the week containing `today`.
@@ -50,13 +53,16 @@ export function sampleData(today) {
   /** @type {import('./store-local.js').Routine} */
   const morning = { id: 'sampleMorningRoutine', name: 'Morning', times: ['07:00'], order: 1, deletedAt: null,
     updatedAt: rest.updatedAt };
-  // A habit in a routine has no reminder times of its own: the routine reminds for both at 07:00.
+  /** @type {import('./store-local.js').Routine} */
+  const evening = { id: 'sampleEveningRoutine', name: 'Evening', times: ['21:00'], order: 2, deletedAt: null,
+    updatedAt: rest.updatedAt };
+  // A habit in a routine has no reminder times of its own: the routines remind at 07:00 and 21:00.
   /** @type {import('./store-local.js').Habit} */
   const vitamins = { id: 'sampleVitaminsHabit1', name: 'Take vitamins', period: 'day', target: 1, unit: '',
     times: [], ...rest, order: 3, routines: [morning.id] };
   /** @type {import('./store-local.js').Habit} */
-  const teeth = { id: 'sampleTeethHabit0001', name: 'Brush teeth', period: 'day', target: 1, unit: '',
-    times: [], ...rest, order: 4, routines: [morning.id] };
+  const teeth = { id: 'sampleTeethHabit0001', name: 'Brush teeth', period: 'day', target: 2, unit: '',
+    times: [], ...rest, order: 4, routines: [morning.id, evening.id] };
 
   /** @type {import('./store-local.js').Logs} */
   const logs = {};
@@ -64,12 +70,12 @@ export function sampleData(today) {
     const week = Math.floor(i / 7), weekday = i % 7;
     /** @type {[string, number][]} */
     const counts = day === today
-      ? [[water.id, GLASSES_TODAY], [vitamins.id, VITAMINS_TODAY]]
+      ? [[water.id, GLASSES_TODAY], [vitamins.id, VITAMINS_TODAY], [teeth.id, TEETH_TODAY]]
       : [[water.id, Number(GLASSES[week][weekday])], [run.id, Number(RUNS[week][weekday])],
         [vitamins.id, Number(VITAMINS[week][weekday])], [teeth.id, Number(TEETH[week][weekday])]];
     for (const [id, count] of counts) {
       if (count > 0) ((logs[monthId(day)] ??= {})[day] ??= {})[id] = count;
     }
   }
-  return { habits: [water, run, vitamins, teeth], routines: [morning], logs };
+  return { habits: [water, run, vitamins, teeth], routines: [morning, evening], logs };
 }
