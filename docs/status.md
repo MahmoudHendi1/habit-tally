@@ -25,3 +25,5 @@ One line per package. States: not started, in progress, in review, changes reque
 
 16 Nov 2026: the real app (sign-in, invite-only) and the new rules are deployed; the demo stays at https://habit-tally.web.app/?demo=sample. Invite list still empty until the owner signs up.
 Routines R0 to R3 merged on 16 Nov 2026 (reviewed, 5 fixes). Open follow-up: soft-deleted habits and routines are never purged, so after many deletions the job's read limits (300 habits, 50 routines) could hide live ones.
+17 Nov 2026: the owner's account is on the invite list (rules deployed). L2 is done apart from the owner's own check on the phone.
+20 Nov 2026: v1.4, one habit in several routines (R4 to R8), reviewed (safe to deploy, 2 small notes fixed); `npm test` 214 of 214, `npm run test:emulator` and `npm run test:e2e:emulator` 7 of 7 pass. Rules and app deployed together. The owner's data was backed up first to the project files (`habit-tally/backup/before-v1.4-2026-11-20.json`); the app rewrites old habits to the new shape when it first loads. CI now runs on main and pull requests only. Follow-up: remove the deprecated `routineOf`.
